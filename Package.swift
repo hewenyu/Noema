@@ -11,6 +11,7 @@ let package = Package(
     platforms: [.macOS(.v26)],
     products: [
         .executable(name: "noema-cli", targets: ["noema-cli"]),
+        .executable(name: "NoemaIME", targets: ["NoemaIME"]),
     ],
     targets: [
         // C bridge to the vendored librime built by scripts/build/librime.sh.
@@ -34,6 +35,8 @@ let package = Package(
         .target(name: "NoemaIPC"),
         .target(name: "NoemaEngine", dependencies: ["CRime", "NoemaCore"]),
         .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine"]),
+        // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
+        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine"]),
         .testTarget(name: "NoemaCoreTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaText"]),
         .testTarget(name: "CRimeTests", dependencies: ["CRime", "NoemaEngine"]),
     ],

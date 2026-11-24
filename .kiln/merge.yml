@@ -1,0 +1,8 @@
+method: squash
+required:
+  - ci/governance
+  - ci/rime-deps
+  - ci/test
+  - ci/bundle
+  - ai-review
+auto: true

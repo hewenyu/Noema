@@ -1,0 +1,12 @@
+# Public-repo Kiln boundary (AGENTS.md rule #6):
+# Issue auto-development (`development:`) is intentionally omitted and banned.
+version: 1
+review:
+  agent: codex
+  instructions: .kiln/agent/review.md
+  max_concurrency: 1
+  timeout: 45m
+  required_platforms:
+    - { os: macos, arch: arm64 }
+  triggers: { pull_request: true, manual: true }
+  publish: { review_comments: true }
