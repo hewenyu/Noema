@@ -104,6 +104,27 @@ import Testing
         #expect(Self.map(Self.key(code, control, .control, ignoring: letter), composing: false) == .passthrough)
     }
 
+    /// ⌃Backspace types U+0008, the same C0 code as ⌃H; on the Delete key it is a client
+    /// shortcut (delete word), never the Emacs BackSpace letter.
+    @Test func controlOnEditingOrFunctionKeysPassesThrough() {
+        let backspace = KeyEvent(keyCode: VirtualKeyCode.delete, characters: "\u{08}", modifiers: .control)
+        #expect(Self.map(backspace) == .passthrough)
+        #expect(Self.map(backspace, composing: false) == .passthrough)
+        #expect(Self.map(Self.key(VirtualKeyCode.delete, "\u{08}", .control, ignoring: "\u{7F}")) == .passthrough)
+        // Every editing key and F-key under ⌃, even with a C0 code that decodes to a whitelisted letter.
+        let codes = [VirtualKeyCode.return, VirtualKeyCode.keypadEnter, VirtualKeyCode.tab, VirtualKeyCode.space,
+                     VirtualKeyCode.delete, VirtualKeyCode.forwardDelete, VirtualKeyCode.escape,
+                     VirtualKeyCode.leftArrow, VirtualKeyCode.rightArrow, VirtualKeyCode.upArrow,
+                     VirtualKeyCode.downArrow, VirtualKeyCode.pageUp, VirtualKeyCode.pageDown,
+                     VirtualKeyCode.home, VirtualKeyCode.end] + Array(VirtualKeyCode.functionKeys)
+        for code in codes {
+            #expect(Self.map(Self.key(code, "\u{08}", .control)) == .passthrough, "key code \(code)")
+            #expect(Self.map(Self.key(code, "\u{1}", [.control, .function], ignoring: "a")) == .passthrough, "key code \(code)")
+        }
+        // The letter key H under ⌃ still edits.
+        #expect(Self.map(Self.key(0x04, "\u{08}", .control, ignoring: "h")) == .rime(keycode: K.backSpace, mask: 0))
+    }
+
     @Test func unknownModifierBitsPassThrough() {
         let unknown = KeyModifiers(rawValue: 1 << 9)
         #expect(Self.map(Self.key(0x00, "a", unknown)) == .passthrough)

@@ -109,6 +109,37 @@ public struct CompositionState: Sendable, Hashable, Codable {
         self.safeModeReason = safeModeReason
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case preedit, caretUTF8Offset, caretUTF16Offset, selectionUTF8Range, selectionUTF16Range
+        case commitTextPreview, candidates, highlightedIndex, pageIndex, pageSize, isLastPage
+        case isComposing, isASCIIMode, schemaID, generationID, isSafeMode, safeModeReason
+    }
+
+    /// Decodes through the normalizing initializer, so a decoded state holds the same
+    /// invariants as a constructed one, whatever the JSON says.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            preedit: try container.decode(String.self, forKey: .preedit),
+            caretUTF8Offset: try container.decode(Int.self, forKey: .caretUTF8Offset),
+            caretUTF16Offset: try container.decode(Int.self, forKey: .caretUTF16Offset),
+            selectionUTF8Range: try container.decode(Range<Int>.self, forKey: .selectionUTF8Range),
+            selectionUTF16Range: try container.decode(Range<Int>.self, forKey: .selectionUTF16Range),
+            commitTextPreview: try container.decodeIfPresent(String.self, forKey: .commitTextPreview),
+            candidates: try container.decode([CandidateItem].self, forKey: .candidates),
+            highlightedIndex: try container.decodeIfPresent(Int.self, forKey: .highlightedIndex),
+            pageIndex: try container.decode(Int.self, forKey: .pageIndex),
+            pageSize: try container.decode(Int.self, forKey: .pageSize),
+            isLastPage: try container.decode(Bool.self, forKey: .isLastPage),
+            isComposing: try container.decode(Bool.self, forKey: .isComposing),
+            isASCIIMode: try container.decode(Bool.self, forKey: .isASCIIMode),
+            schemaID: try container.decodeIfPresent(String.self, forKey: .schemaID),
+            generationID: try container.decode(UInt64.self, forKey: .generationID),
+            isSafeMode: try container.decode(Bool.self, forKey: .isSafeMode),
+            safeModeReason: try container.decodeIfPresent(SafeModeReason.self, forKey: .safeModeReason)
+        )
+    }
+
     /// No composition, no candidates.
     public static func empty(
         generationID: UInt64 = 0,

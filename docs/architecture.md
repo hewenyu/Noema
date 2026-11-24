@@ -26,14 +26,14 @@ NoemaIME ───┤        │
 NoemaText, NoemaIPC: standalone libraries
 ```
 
-Tests use Swift Testing only. `NoemaCoreTests` cover `NoemaCore`, `NoemaIPC`, and `NoemaText`; `NoemaEngineTests` cover `RimeKeyMapper` and `BootGuard` without librime. `CRimeTests` holds every test that initializes librime, nested under the one serialized suite `LibrimeSerializedTests`: the raw bridge (Lua and table translators on an inline schema) and `RimeEngine` end to end on `Resources/rime-default`, including every Safe Mode reason and a single-key latency benchmark (P95 under 2 ms).
+Tests use Swift Testing only. `NoemaCoreTests` cover `NoemaCore`, `NoemaIPC`, and `NoemaText`; `NoemaEngineTests` cover `RimeKeyMapper`, `BootGuard`, and candidate-label resolution without librime. `CRimeTests` holds every test that initializes librime, nested under the one serialized suite `LibrimeSerializedTests`: the raw bridge (Lua and table translators on an inline schema) and `RimeEngine` end to end on `Resources/rime-default`, including every Safe Mode reason and a single-key latency benchmark (P95 under 2 ms).
 
 ## Typing engine
 
 `TypingEngine` is the synchronous, `@MainActor` boundary between the IMKit shell and an engine: `processKey(_:)` returns a `KeyHandlingResult` whose `handled: false` means pass the key through. `RimeEngine` implements it:
 
 - **Key mapping** — `RimeKeyMapper` turns a `KeyEvent` into an X11 keysym and mask or `.passthrough`; its header lists the pass-through rules.
-- **Boot** — claim the process-wide librime (one live `RimeEngine` per process; `RimeApi.setup` runs once), take the `user_data_dir` lock and arm the sentinel through `BootGuard`, deploy per `DeployPolicy` into `user_data_dir/build`, initialize, open a session on `schemaID`, then disarm.
+- **Boot** — claim the process-wide librime (one live `RimeEngine` per process; `RimeApi.setup` runs once), take the `user_data_dir` lock and arm the sentinel through `BootGuard`, deploy per `DeployPolicy` into `user_data_dir/build` (`deployIfNeeded` redeploys when any file under `sharedDataDir`, recursively, or a top-level `*.custom.yaml` in `userDataDir` is not older than the `build/.noema-deploy-stamp` written after the last successful deployment), initialize, open a session on `schemaID`, then disarm.
 - **Safe Mode** — any refusal or failure on the boot path sets `SafeModeReason` (`bootCrashLoop`, `bootGuardCorrupted`, `userDataDirLocked`, `userDataDirUnwritable`, `engineInitFailed`), releases librime, and answers every key with `handled: false` and `.safeMode`. `recoverFromSafeMode()` clears the sentinel under the lock and boots again.
 - **State** — after every call the engine drains `RimeCommit` and rebuilds `CompositionState` from `RimeContext` and `RimeStatus`, freeing each; caret and selection are converted from librime's UTF-8 byte offsets to UTF-16 by `UTF8OffsetConverter`, and `generationID` strictly increases.
 

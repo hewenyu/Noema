@@ -10,7 +10,8 @@ import NoemaCore
 ///    dropping the `fn` bit, which arrow, paging, Home/End and forward-delete keys carry on
 ///    Mac keyboards;
 /// 3. `⌃` chords, except a bare `⌃` plus one of the Emacs editing letters
-///    (a e b f n p h g) while composing, which become Home/End/arrows/BackSpace/Escape;
+///    (a e b f n p h g) on a letter key while composing, which become
+///    Home/End/arrows/BackSpace/Escape (`⌃` on an editing or function key passes through);
 /// 4. everything while idle in ASCII mode;
 /// 5. editing, navigation, and whitespace keys while idle (they belong to the client);
 /// 6. keys that type no single printable ASCII character.
@@ -96,7 +97,11 @@ public enum RimeKeyMapper {
         if !chord.isEmpty && chord != .control { return .passthrough }
 
         if chord == .control {
+            // Editing and function keys are never Emacs letters, even when their C0
+            // character decodes to one (⌃Backspace types U+0008, which would read as h).
             guard isComposing, modifiers == .control,
+                  editingKeys[event.keyCode] == nil,
+                  !VirtualKeyCode.functionKeys.contains(event.keyCode),
                   let letter = controlLetter(of: event),
                   let keysym = controlEditing[letter]
             else { return .passthrough }

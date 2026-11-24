@@ -82,12 +82,14 @@ public final class BootGuard {
     /// Non-blocking exclusive `flock` on the lock file. Idempotent while held.
     public func acquireLock() -> LockOutcome {
         if holdsLock { return .acquired }
-        let descriptor = lockURL.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return -1 }
-            return open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        let (descriptor, openErrno) = lockURL.withUnsafeFileSystemRepresentation { path in
+            Self.openCapturingErrno(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         }
         guard descriptor >= 0 else {
-            return .failed(errno == ELOOP ? .bootGuardCorrupted : .userDataDirUnwritable)
+            // A symlink (ELOOP) or a directory (EISDIR) squatting on the lock path is the
+            // same corruption fstat reports for any other non-regular file.
+            let squatted = openErrno == ELOOP || openErrno == EISDIR
+            return .failed(squatted ? .bootGuardCorrupted : .userDataDirUnwritable)
         }
         var status = stat()
         guard fstat(descriptor, &status) == 0, (status.st_mode & S_IFMT) == S_IFREG else {
@@ -126,30 +128,42 @@ public final class BootGuard {
         return .proceed(attempt: next.consecutiveFailures)
     }
 
-    /// Marks the boot successful by removing the sentinel.
+    /// Marks the boot successful by removing the sentinel. Requires the lock; without
+    /// it, returns false and leaves the holder's sentinel alone.
     @discardableResult
     public func disarm() -> Bool {
-        removeSentinel()
+        guard holdsLock else { return false }
+        return removeSentinel()
     }
 
     /// Recovery: removes the sentinel whatever it is (a regular file, a symlink, an empty
-    /// directory), so the next `arm()` starts from zero.
+    /// directory), so the next `arm()` starts from zero. Requires the lock; without it,
+    /// returns false and leaves the holder's sentinel alone.
     @discardableResult
     public func clear() -> Bool {
-        removeSentinel()
+        guard holdsLock else { return false }
+        return removeSentinel()
     }
 
     struct CorruptedSentinel: Error {}
 
+    /// `open(2)` on a file-system path, with `errno` captured right after the call and
+    /// inside the path's lifetime, so nothing in between can clobber it. A URL with no
+    /// file-system representation (`path == nil`) reports `EINVAL`, never a stale errno.
+    static func openCapturingErrno(_ path: UnsafePointer<CChar>?, _ flags: Int32, _ mode: mode_t = 0) -> (descriptor: Int32, error: Int32) {
+        guard let path else { return (-1, EINVAL) }
+        let descriptor = Darwin.open(path, flags, mode)
+        return (descriptor, descriptor < 0 ? errno : 0)
+    }
+
     /// `nil` when there is no sentinel; failure when it is unreadable, not a regular file
     /// (including a symlink), oversized, or not a valid record.
     func readRecord() -> Result<Record?, CorruptedSentinel> {
-        let descriptor = sentinelURL.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return -1 }
-            return open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        let (descriptor, openErrno) = sentinelURL.withUnsafeFileSystemRepresentation { path in
+            Self.openCapturingErrno(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         }
         if descriptor < 0 {
-            return errno == ENOENT ? .success(nil) : .failure(CorruptedSentinel())
+            return openErrno == ENOENT ? .success(nil) : .failure(CorruptedSentinel())
         }
         defer { close(descriptor) }
         var status = stat()
@@ -194,6 +208,8 @@ public final class BootGuard {
                         if errno == EINTR { continue }
                         return false
                     }
+                    // A zero-byte write makes no progress; retrying could spin forever.
+                    if count == 0 { return false }
                     offset += count
                 }
                 return true
@@ -223,12 +239,19 @@ public final class BootGuard {
         }
     }
 
+    /// Removes the sentinel and, when something was removed, fsyncs the directory so the
+    /// removal survives a crash.
     private func removeSentinel() -> Bool {
-        sentinelURL.withUnsafeFileSystemRepresentation { path -> Bool in
-            guard let path else { return false }
-            if unlink(path) == 0 || errno == ENOENT { return true }
-            if errno == EPERM || errno == EISDIR { return rmdir(path) == 0 }
-            return false
+        enum Removal { case removed, absent, failed }
+        let removal = sentinelURL.withUnsafeFileSystemRepresentation { path -> Removal in
+            guard let path else { return .failed }
+            if unlink(path) == 0 { return .removed }
+            let code = errno
+            if code == ENOENT { return .absent }
+            if code == EPERM || code == EISDIR { return rmdir(path) == 0 ? .removed : .failed }
+            return .failed
         }
+        if removal == .removed { syncDirectory() }
+        return removal != .failed
     }
 }

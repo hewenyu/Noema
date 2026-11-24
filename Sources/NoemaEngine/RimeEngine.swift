@@ -5,7 +5,8 @@ import NoemaCore
 /// Where an engine finds its schemas and keeps its user data.
 public struct RimeEngineConfiguration: Sendable, Hashable {
     public enum DeployPolicy: String, Sendable, Hashable, Codable {
-        /// Deploy when the staged build is missing or older than any shared YAML file.
+        /// Deploy when the staged build or its deploy stamp is missing, or any shared data
+        /// file (recursively) or top-level user `*.custom.yaml` is not older than the stamp.
         case deployIfNeeded
         /// Always run a workspace deployment before loading.
         case forceDeploy
@@ -218,11 +219,13 @@ public final class RimeEngine: TypingEngine {
         let loaded = withTraits { traits -> Bool in
             RimeProcessLifecycle.setupIfNeeded(owner: resources.owner, api: api, traits: &traits)
             api.pointee.deployer_initialize(&traits)
-            if needsDeploy(), configuration.deployPolicy != .neverDeploy {
-                guard api.pointee.deploy() != 0 else {
+            if configuration.deployPolicy != .neverDeploy, needsDeploy() {
+                removeDeployStamp()
+                guard api.pointee.deploy() != 0, isBuildComplete() else {
                     api.pointee.finalize()
                     return false
                 }
+                writeDeployStamp()
             }
             guard isBuildComplete() else {
                 api.pointee.finalize()
@@ -265,24 +268,64 @@ public final class RimeEngine: TypingEngine {
 
     private func isBuildComplete() -> Bool {
         let build = configuration.userDataDir.appending(path: "build")
-        return stagedFiles.allSatisfy { FileManager.default.fileExists(atPath: build.appending(path: $0).path) }
+        return stagedFiles.allSatisfy { name in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: build.appending(path: name).path, isDirectory: &isDirectory)
+                && !isDirectory.boolValue
+        }
     }
 
+    /// Written into `build/` after every successful deployment. Its modification time,
+    /// not the staged YAML files' (librime leaves those untouched when only a non-YAML
+    /// input such as `lua/*.lua` changes), is the reference `deployIfNeeded` compares
+    /// inputs against, so a changed input triggers exactly one redeployment.
+    public nonisolated static let deployStampFileName = ".noema-deploy-stamp"
+
+    private var deployStampURL: URL {
+        configuration.userDataDir.appending(path: "build").appending(path: Self.deployStampFileName)
+    }
+
+    private func writeDeployStamp() {
+        try? Data().write(to: deployStampURL, options: .atomic)
+    }
+
+    private func removeDeployStamp() {
+        try? FileManager.default.removeItem(at: deployStampURL)
+    }
+
+    /// True when the staged build or the deploy stamp is missing, or any deploy input is
+    /// at least as new as the stamp: every non-directory entry under `sharedDataDir`
+    /// (including `dicts/`, `lua/`, `opencc/`) and every top-level `*.custom.yaml` in
+    /// `userDataDir`. Any stat or enumeration error answers true, so a doubtful build is
+    /// redeployed, never trusted.
     private func needsDeploy() -> Bool {
         if configuration.deployPolicy == .forceDeploy || !isBuildComplete() { return true }
         let fileManager = FileManager.default
-        let build = configuration.userDataDir.appending(path: "build")
         func modified(_ url: URL) -> Date? {
-            (try? fileManager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+            // Resolve symlinks so a linked input is judged by its target's time.
+            (try? fileManager.attributesOfItem(atPath: url.resolvingSymlinksInPath().path))?[.modificationDate] as? Date
         }
-        let staged = stagedFiles.compactMap { modified(build.appending(path: $0)) }
-        guard staged.count == stagedFiles.count, let oldestStaged = staged.min() else { return true }
-        let sources = (try? fileManager.contentsOfDirectory(
-            at: configuration.sharedDataDir, includingPropertiesForKeys: [.contentModificationDateKey]
-        )) ?? []
-        return sources.contains { url in
-            url.pathExtension == "yaml" && (modified(url).map { $0 > oldestStaged } ?? true)
+        guard let deployed = modified(deployStampURL) else { return true }
+        func isStale(_ url: URL) -> Bool { modified(url).map { $0 >= deployed } ?? true }
+
+        var enumerationFailed = false
+        guard let sharedEntries = fileManager.enumerator(
+            at: configuration.sharedDataDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            errorHandler: { _, _ in
+                enumerationFailed = true
+                return false
+            }
+        ) else { return true }
+        for case let url as URL in sharedEntries {
+            guard let isDirectory = try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory else { return true }
+            if !isDirectory, isStale(url) { return true }
         }
+        if enumerationFailed { return true }
+
+        guard let userEntries = try? fileManager.contentsOfDirectory(at: configuration.userDataDir, includingPropertiesForKeys: nil)
+        else { return true }
+        return userEntries.contains { $0.lastPathComponent.hasSuffix(".custom.yaml") && isStale($0) }
     }
 
     /// Runs `body` with traits whose C strings live exactly as long as the call.
@@ -359,6 +402,23 @@ public final class RimeEngine: TypingEngine {
         )
     }
 
+    /// The label of candidate `index`: the schema's `alternative_select_labels` slot,
+    /// else its select key, else its 1-based number (the tenth shows as 0). librime allocates
+    /// `select_labels` with `page_size` slots, not `num_candidates`, so a slot at or past
+    /// `pageSize` (clamped at 0) is never read.
+    nonisolated static func candidateLabel(
+        at index: Int,
+        selectLabels: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+        pageSize: Int,
+        selectKeys: [Character]
+    ) -> String {
+        if let selectLabels, index >= 0, index < max(pageSize, 0), let text = selectLabels[index] {
+            return String(cString: text)
+        }
+        if selectKeys.indices.contains(index) { return String(selectKeys[index]) }
+        return String(index + 1 == 10 ? 0 : index + 1)
+    }
+
     @discardableResult
     private func refreshState() -> CompositionState {
         let status = readStatus()
@@ -383,22 +443,16 @@ public final class RimeEngine: TypingEngine {
         var candidates: [CandidateItem] = []
         if menu.num_candidates > 0, let items = menu.candidates {
             let count = Int(menu.num_candidates)
+            let pageSize = Int(menu.page_size)
             let selectKeys = menu.select_keys.map { Array(String(cString: $0)) } ?? []
             candidates.reserveCapacity(count)
             for index in 0..<count {
                 let item = items[index]
-                var label: String?
-                if let labels = context.select_labels, let text = labels[index] {
-                    label = String(cString: text)
-                } else if index < selectKeys.count {
-                    label = String(selectKeys[index])
-                } else {
-                    label = String(index + 1 == 10 ? 0 : index + 1)
-                }
                 candidates.append(CandidateItem(
                     text: item.text.map { String(cString: $0) } ?? "",
                     comment: item.comment.map { String(cString: $0) }.flatMap { $0.isEmpty ? nil : $0 },
-                    label: label
+                    label: Self.candidateLabel(
+                        at: index, selectLabels: context.select_labels, pageSize: pageSize, selectKeys: selectKeys)
                 ))
             }
         }

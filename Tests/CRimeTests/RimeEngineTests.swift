@@ -133,6 +133,18 @@ extension LibrimeSerializedTests {
             #expect(state.preedit == "你hao" && state.isComposing)
             #expect(state.caretUTF8Offset == 6 && state.caretUTF16Offset == 4)
             #expect(state.selectionUTF8Range == 3..<6 && state.selectionUTF16Range == 1..<4)
+            // Left walks the caret back one character at a time to between 你 and h. Each
+            // step differs in UTF-8 bytes and UTF-16 units (你 is 3 vs 1), so a byte offset
+            // passed off as a UTF-16 offset cannot survive.
+            for (utf8, utf16) in [(5, 3), (4, 2), (3, 1)] {
+                state = engine.processKey(.key(VirtualKeyCode.leftArrow, "", .function)).state
+                #expect(state.preedit == "你hao" && state.isComposing)
+                #expect(state.caretUTF8Offset == utf8 && state.caretUTF16Offset == utf16)
+            }
+            for (utf8, utf16) in [(4, 2), (5, 3), (6, 4)] {
+                state = engine.processKey(.key(VirtualKeyCode.rightArrow, "", .function)).state
+                #expect(state.preedit == "你hao" && state.caretUTF8Offset == utf8 && state.caretUTF16Offset == utf16)
+            }
 
             // librime's Escape drops the unconfirmed segment first, then the rest.
             let dropSegment = engine.processKey(.key(VirtualKeyCode.escape, "\u{1B}"))
@@ -201,13 +213,111 @@ extension LibrimeSerializedTests {
             let first = try workspace.engine()
             first.shutdown()
             let stamp = try #require(try FileManager.default.attributesOfItem(atPath: staged.path)[.modificationDate] as? Date)
+            let deployed = try workspace.deployStampDate()
             #expect(FileManager.default.fileExists(atPath: workspace.user.appending(path: "build/noema_pinyin.table.bin").path))
             let second = try workspace.engine()
             defer { second.shutdown() }
             #expect(!second.isSafeMode)
             #expect(try FileManager.default.attributesOfItem(atPath: staged.path)[.modificationDate] as? Date == stamp)
+            #expect(try workspace.deployStampDate() == deployed, "unchanged inputs must not redeploy")
             second.type("nihao")
             #expect(second.currentState.candidates.first?.text == "你好")
+        }
+
+        /// `select_labels` is the one C array librime sizes by `page_size`, not
+        /// `num_candidates`. librime fills it only when the schema lists at least
+        /// `page_size` `alternative_select_labels`; a shorter list leaves it NULL and the
+        /// engine falls back to numeric labels for every slot.
+        @Test(arguments: [
+            ("[甲, 乙, 丙, 丁, 戊, 己, 庚]", ["甲", "乙", "丙", "丁", "戊"]),
+            ("[甲, 乙, 丙]", ["1", "2", "3", "4", "5"]),
+        ])
+        func alternativeSelectLabels(_ list: String, _ expected: [String]) throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.appendToSharedFile("noema_pinyin.schema.yaml", """
+
+            menu:
+              page_size: 5
+              alternative_select_labels: \(list)
+
+            """)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+            engine.type("shi")
+            let state = engine.currentState
+            try #require(state.candidates.count == 5 && state.pageSize == 5, "shi must fill a page")
+            #expect(state.candidates.map(\.label) == expected)
+            // Every page reads the labels afresh; the last page may hold fewer candidates.
+            let last = engine.processKey(.key(VirtualKeyCode.pageDown, "", .function)).state
+            let further = engine.processKey(.key(VirtualKeyCode.pageDown, "", .function)).state
+            for page in [last, further] {
+                #expect(page.candidates.map(\.label) == Array(expected.prefix(page.candidates.count)))
+            }
+            #expect(engine.selectCandidate(at: 0).committedText != nil)
+        }
+
+        /// A changed input under a shared-data subdirectory (one librime does not stage as
+        /// YAML) triggers one redeployment, and only one.
+        @Test func deployIfNeededRedeploysWhenASharedSubdirectoryFileChanges() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.engine().shutdown()
+            let firstDeploy = try workspace.deployStampDate()
+
+            let lua = workspace.shared.appending(path: "lua")
+            try FileManager.default.createDirectory(at: lua, withIntermediateDirectories: true)
+            try "-- extra\n".write(to: lua.appending(path: "extra.lua"), atomically: true, encoding: .utf8)
+            try workspace.engine().shutdown()
+            let secondDeploy = try workspace.deployStampDate()
+            #expect(secondDeploy > firstDeploy, "a new lua/extra.lua must redeploy")
+
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(try workspace.deployStampDate() == secondDeploy, "nothing changed since: no redeploy")
+            engine.type("nihao")
+            #expect(engine.currentState.candidates.first?.text == "你好")
+        }
+
+        /// A user `*.custom.yaml` patch triggers a redeployment that librime really applies.
+        @Test func deployIfNeededRedeploysWhenAUserCustomPatchChanges() throws {
+            let workspace = try EngineWorkspace()
+            let first = try workspace.engine()
+            first.type("shi")
+            #expect(first.currentState.pageSize == 5 && first.currentState.candidates.count == 5)
+            first.shutdown()
+            let firstDeploy = try workspace.deployStampDate()
+
+            try "patch:\n  menu/page_size: 3\n".write(
+                to: workspace.user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+            #expect(try workspace.deployStampDate() > firstDeploy)
+            engine.type("shi")
+            #expect(engine.currentState.pageSize == 3 && engine.currentState.candidates.count == 3,
+                    "the patched page size must be live: \(engine.currentState.candidates.map(\.text))")
+        }
+
+        @Test func neverDeployLoadsAnExistingBuildWithoutDeploying() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.engine().shutdown()
+            let deployed = try workspace.deployStampDate()
+            try "-- extra\n".write(to: workspace.shared.appending(path: "extra.lua"), atomically: true, encoding: .utf8)
+            let engine = try workspace.engine(policy: .neverDeploy)
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+            #expect(try workspace.deployStampDate() == deployed, "neverDeploy must not deploy")
+        }
+
+        @Test func directoryPosingAsAStagedFileIsNotABuild() throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let staged = workspace.user.appending(path: "build/noema_pinyin.schema.yaml")
+            try FileManager.default.removeItem(at: staged)
+            try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: false)
+            let engine = try workspace.engine(policy: .neverDeploy)
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == .engineInitFailed)
         }
 
         // MARK: Lifecycle
@@ -441,6 +551,7 @@ extension RimeEngine {
 /// A throwaway user/log directory pair over the shipped `Resources/rime-default`
 /// (or a copy holding only `sharedFiles`). Removed on deinit.
 final class EngineWorkspace {
+    static let shippedFiles = ["default.yaml", "noema_pinyin.schema.yaml", "noema_pinyin.dict.yaml"]
     static let shippedSharedData = URL(filePath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         .appending(path: "Resources/rime-default")
@@ -480,6 +591,18 @@ final class EngineWorkspace {
     func writeSentinel(_ contents: String) throws {
         try FileManager.default.createDirectory(at: user, withIntermediateDirectories: true)
         try contents.write(to: sentinel, atomically: true, encoding: .utf8)
+    }
+
+    /// Appends YAML to a copied shared file; only for workspaces built with `sharedFiles`.
+    func appendToSharedFile(_ name: String, _ text: String) throws {
+        precondition(shared != Self.shippedSharedData, "never edit the shipped schema")
+        let url = shared.appending(path: name)
+        try (String(contentsOf: url, encoding: .utf8) + text).write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func deployStampDate() throws -> Date {
+        let stamp = user.appending(path: "build").appending(path: RimeEngine.deployStampFileName)
+        return try #require(try FileManager.default.attributesOfItem(atPath: stamp.path)[.modificationDate] as? Date)
     }
 
     func sentinelFailures() throws -> Int {

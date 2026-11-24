@@ -113,6 +113,37 @@ import Testing
             == #"["bootCrashLoop","userDataDirUnwritable","bootGuardCorrupted","userDataDirLocked","engineInitFailed"]"#)
     }
 
+    /// Decoding goes through the normalizing initializer: out-of-range JSON cannot
+    /// smuggle a highlight past the menu, offsets past the preedit, or negative pages.
+    @Test func decodingNormalizesOutOfRangeJSON() throws {
+        let json = #"""
+        {"preedit":"你hao","caretUTF8Offset":40,"caretUTF16Offset":-3,
+         "selectionUTF8Range":[2,90],"selectionUTF16Range":[-1,9],"commitTextPreview":"你好",
+         "candidates":[{"text":"你好"},{"text":"拟好","comment":"~","label":"2"}],
+         "highlightedIndex":7,"pageIndex":-4,"pageSize":-5,"isLastPage":false,"isComposing":true,
+         "isASCIIMode":false,"schemaID":"noema_pinyin","generationID":9,"isSafeMode":false,
+         "safeModeReason":"bootCrashLoop"}
+        """#
+        let state = try JSONDecoder().decode(CompositionState.self, from: Data(json.utf8))
+        #expect(state.caretUTF8Offset == 6 && state.caretUTF16Offset == 0)
+        #expect(state.selectionUTF8Range == 2..<6 && state.selectionUTF16Range == 0..<4)
+        #expect(state.highlightedIndex == 1)
+        #expect(state.pageIndex == 0 && state.pageSize == 0)
+        #expect(state.isSafeMode && state.safeModeReason == .bootCrashLoop, "a reason implies Safe Mode")
+        #expect(state.candidates.count == 2 && state.commitTextPreview == "你好" && state.generationID == 9)
+
+        let emptyMenu = #"""
+        {"preedit":"","caretUTF8Offset":0,"caretUTF16Offset":0,"selectionUTF8Range":[0,0],
+         "selectionUTF16Range":[0,0],"candidates":[],"highlightedIndex":0,"pageIndex":0,"pageSize":5,
+         "isLastPage":true,"isComposing":false,"isASCIIMode":false,"generationID":1,"isSafeMode":false}
+        """#
+        let empty = try JSONDecoder().decode(CompositionState.self, from: Data(emptyMenu.utf8))
+        #expect(empty.highlightedIndex == nil, "an empty menu has no highlight")
+        #expect(empty.schemaID == nil && empty.commitTextPreview == nil && !empty.isSafeMode)
+        // A decoded state re-encodes to the shape it was built from.
+        #expect(try JSONDecoder().decode(CompositionState.self, from: JSONEncoder().encode(state)) == state)
+    }
+
     @Test func keyEventKeepsBackwardCompatibleShape() throws {
         let legacy = #"{"keyCode":0,"characters":"a","modifiers":0,"isKeyDown":true}"#
         let decoded = try JSONDecoder().decode(KeyEvent.self, from: Data(legacy.utf8))
