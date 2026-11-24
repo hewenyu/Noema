@@ -1,6 +1,9 @@
 // NoemaIME: the input method executable inside NoemaIME.app.
 // It only links NoemaCore and NoemaEngine; `--check-rime` lets bundle
 // verification prove that dyld resolves Contents/Frameworks/librime.1.dylib.
+// Foundation is used only for Bundle.main: `--version` reports the version
+// bundle.sh wrote into Contents/Info.plist.
+import Foundation
 import NoemaCore
 import NoemaEngine
 
@@ -15,6 +18,16 @@ let usage = """
       --version      print the NoemaIME version
       --check-rime   print the bundled librime version and required module status
     """
+
+/// The packaged CFBundleShortVersionString, or NoemaVersion.current when run unbundled.
+func bundleVersion() -> String {
+    if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+        !version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+        return version
+    }
+    return NoemaVersion.current.description
+}
 
 func checkRime() -> Int32 {
     do {
@@ -37,7 +50,7 @@ func checkRime() -> Int32 {
 
 switch Array(CommandLine.arguments.dropFirst()) {
 case ["--version"]:
-    print("NoemaIME \(NoemaVersion.current)")
+    print("NoemaIME \(bundleVersion())")
     exit(0)
 case ["--check-rime"]:
     exit(checkRime())

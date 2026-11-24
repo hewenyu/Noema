@@ -90,7 +90,7 @@ elif [[ -d "${OUT_DIR}" ]] \
   die "refusing to use ${OUT_DIR}: it is not empty and holds no previous ${APP_NAME}"
 fi
 
-for tool in swift codesign plutil xattr ditto otool lipo shasum /usr/bin/iconutil; do
+for tool in swift codesign plutil xattr ditto otool lipo shasum /usr/bin/iconutil /usr/bin/python3; do
   command -v "${tool}" >/dev/null || die "required tool not found: ${tool}"
 done
 [[ -f "${IME_RESOURCES}/Info.plist.in" && -f "${ENTITLEMENTS}" && -f "${IME_RESOURCES}/generate-icons.swift" ]] \
@@ -116,6 +116,120 @@ BIN_DIR="$("${SWIFT_BUILD[@]}" --show-bin-path)"
 [[ -f "${BIN_DIR}/NoemaIME" ]] || die "release build produced no ${BIN_DIR}/NoemaIME"
 
 # ---------------------------------------------------------------------------
+# Locked publish. Every run that publishes into the same --out holds one flock(2)
+# on ${TMPDIR:-/tmp}/noema-bundle-publish-<sha256 of the real --out path>.lock, so
+# concurrent runs publish one after another. The kernel drops the lock when the
+# holder dies (even on SIGKILL), so a lock is never stale, and nothing extra lands
+# in --out. Under the lock it re-checks --out and TARGET_APP, moves a previous
+# bundle aside to .NoemaIME.app.old.<pid>, and os.rename()s the stage in: unlike
+# mv, rename(2) fails on an existing non-empty directory instead of nesting
+# NoemaIME.app/NoemaIME.app inside it. A failed rename restores the previous bundle.
+#   publish_locked publish   move ${stage_app} to TARGET_APP
+#   publish_locked recover   after an interruption, put OLD_APP back (or drop it)
+# ---------------------------------------------------------------------------
+
+publish_locked() {
+  /usr/bin/python3 -I - "$1" "${OUT_DIR}" "${APP_NAME}" "${BUNDLE_ID}" "${stage_app:-}" "${OLD_APP}" <<'PY'
+import fcntl, hashlib, os, plistlib, shutil, signal, sys
+
+mode, out_dir, app_name, bundle_id, stage_app, old = sys.argv[1:7]
+target = os.path.join(out_dir, app_name)
+
+def log(message):
+    print(f"[bundle] {message}", file=sys.stderr)
+
+def die(message):
+    print(f"[bundle] error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+def exists(path):
+    return os.path.lexists(path)
+
+def remove(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif exists(path):
+        os.unlink(path)
+
+def is_previous_bundle(path):
+    info = os.path.join(path, "Contents", "Info.plist")
+    if os.path.islink(path) or not os.path.isdir(path) or os.path.islink(info) or not os.path.isfile(info):
+        return False
+    try:
+        with open(info, "rb") as handle:
+            return plistlib.load(handle).get("CFBundleIdentifier") == bundle_id
+    except Exception:
+        return False
+
+def check_out_dir():
+    if os.path.islink(out_dir) or not os.path.isdir(out_dir):
+        die(f"--out is no longer a directory: {out_dir}")
+    if exists(target):
+        if not is_previous_bundle(target):
+            die(f"refusing to replace {target}: it is not a previous {app_name} output")
+        return
+    # Only leftovers of this script (.NoemaIME.app.staging.*, .NoemaIME.app.old.<pid>) may sit beside it.
+    foreign = sorted(name for name in os.listdir(out_dir) if not name.startswith(f".{app_name}."))
+    if foreign:
+        die(f"refusing to use {out_dir}: it is not empty and holds no previous {app_name} ({', '.join(foreign[:3])})")
+
+# A signal must not split the two renames; the caller's trap runs once this returns.
+for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(number, signal.SIG_IGN)
+
+if os.path.islink(out_dir) or not os.path.isdir(out_dir):
+    die(f"--out is not a directory: {out_dir}")
+digest = hashlib.sha256(os.path.realpath(out_dir).encode()).hexdigest()
+lock_path = os.path.join(os.environ.get("TMPDIR") or "/tmp", f"noema-bundle-publish-{digest}.lock")
+lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    log(f"waiting for another bundle.sh publishing into {out_dir}")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+if mode == "recover":
+    if exists(old):
+        if exists(target):
+            remove(old)
+        else:
+            os.rename(old, target)
+            log(f"restored previous bundle at {target}")
+    sys.exit(0)
+
+check_out_dir()
+if os.path.islink(stage_app) or not os.path.isdir(stage_app):
+    die(f"staged bundle is missing: {stage_app}")
+if exists(old):
+    remove(old)
+moved_aside = False
+if exists(target):
+    try:
+        os.rename(target, old)
+    except OSError as error:
+        die(f"cannot move previous bundle {target} aside: {error}")
+    moved_aside = True
+if exists(target):
+    die(f"{target} reappeared while the publish lock was held")
+try:
+    os.rename(stage_app, target)
+except OSError as error:
+    if moved_aside:
+        try:
+            os.rename(old, target)
+        except OSError as restore_error:
+            die(f"cannot move the staged bundle to {target} ({error}) nor restore the previous one ({restore_error})")
+        die(f"cannot move the staged bundle to {target} ({error}); previous bundle kept")
+    die(f"cannot move the staged bundle to {target}: {error}")
+if moved_aside:
+    try:
+        remove(old)
+    except OSError as error:
+        die(f"published {target} but cannot remove {old}: {error}")
+PY
+}
+
+# ---------------------------------------------------------------------------
 # Temporary paths owned by this run; on_exit removes them and restores the
 # previous bundle if a publish was interrupted.
 # ---------------------------------------------------------------------------
@@ -126,12 +240,8 @@ STAGE_DIR=""
 OLD_APP=""
 on_exit() {
   local status=$?
-  if [[ -n "${OLD_APP}" && -d "${OLD_APP}" ]]; then
-    if [[ ! -e "${TARGET_APP}" ]]; then
-      mv "${OLD_APP}" "${TARGET_APP}" && log "restored previous bundle at ${TARGET_APP}" || true
-    else
-      rm -rf "${OLD_APP}" || true
-    fi
+  if [[ -n "${OLD_APP}" ]] && [[ -e "${OLD_APP}" || -L "${OLD_APP}" ]]; then
+    publish_locked recover || true
   fi
   if [[ -n "${STAGE_DIR}" ]]; then rm -rf "${STAGE_DIR}" || true; fi
   if [[ -n "${ICON_DIR}" ]]; then rm -rf "${ICON_DIR}" || true; fi
@@ -196,23 +306,12 @@ sign --entitlements "${ENTITLEMENTS}" "${stage_app}"
 codesign --verify --strict "${stage_app}" || die "codesign --verify failed for the staged bundle"
 
 # ---------------------------------------------------------------------------
-# Publish: move any previous bundle aside, move the stage in, then drop the old
-# copy. A failed second step rolls back (on_exit also restores after a signal).
+# Publish under the --out lock (see publish_locked); on_exit recovers OLD_APP
+# if this run is interrupted between moving the old bundle aside and the stage in.
 # ---------------------------------------------------------------------------
 
 # The PID keeps concurrent runs publishing into one --out from sharing an aside path.
-old="${OUT_DIR}/.${APP_NAME}.old.$$"
-rm -rf "${old}"
-if [[ -e "${TARGET_APP}" ]]; then
-  OLD_APP="${old}"
-  mv "${TARGET_APP}" "${old}" || die "cannot move previous bundle ${TARGET_APP} aside"
-fi
-if ! mv "${stage_app}" "${TARGET_APP}"; then
-  if [[ -n "${OLD_APP}" ]]; then
-    mv "${old}" "${TARGET_APP}" && OLD_APP="" || true
-  fi
-  die "cannot move the staged bundle to ${TARGET_APP}; previous bundle kept"
-fi
-rm -rf "${old}"
+OLD_APP="${OUT_DIR}/.${APP_NAME}.old.$$"
+publish_locked publish || die "publishing ${TARGET_APP} failed"
 OLD_APP=""
 log "done: ${TARGET_APP} (version ${VERSION}, build ${BUILD}, ${SIGN_MODE} signature)"

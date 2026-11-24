@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Verify an assembled NoemaIME.app: layout, IMKit Info.plist keys, Mach-O linkage,
-# code signatures and empty signed entitlements, and a real launch that loads librime.
+# code signatures and empty signed entitlements, and a real launch that reports the
+# packaged version and loads librime.
 #
 # Usage: scripts/build/verify-bundle.sh [--require-signed] [bundle_path]
 #   bundle_path       default dist/NoemaIME.app (relative to the repository root)
@@ -215,8 +216,19 @@ if not isinstance(entitlements, dict) or entitlements:
 done
 
 # ---------------------------------------------------------------------------
-# 6. Real launch: dyld must resolve the bundled librime and every module must register
+# 6. Real launch: --version must report the packaged version, dyld must resolve the
+#    bundled librime, and every module must register
 # ---------------------------------------------------------------------------
+
+expected_version="$(plutil -extract CFBundleShortVersionString raw -o - "${INFO}" 2>/dev/null || true)"
+if version_output="$(env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH -u DYLD_INSERT_LIBRARIES \
+  "${EXE}" --version 2>&1)"; then
+  [[ -n "${expected_version}" && "${version_output}" == "NoemaIME ${expected_version}" ]] \
+    || bad "MacOS/NoemaIME --version printed '${version_output}', expected 'NoemaIME ${expected_version}' from CFBundleShortVersionString"
+else
+  status=$?
+  bad "MacOS/NoemaIME --version exited ${status}: ${version_output}"
+fi
 
 if probe="$(env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH -u DYLD_INSERT_LIBRARIES \
   "${EXE}" --check-rime 2>&1)"; then
