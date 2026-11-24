@@ -38,7 +38,10 @@ let package = Package(
         // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
         .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine"]),
         .testTarget(name: "NoemaCoreTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaText"]),
-        .testTarget(name: "CRimeTests", dependencies: ["CRime", "NoemaEngine"]),
+        // Pure engine logic (key mapping, boot guard); never initializes librime.
+        .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine"]),
+        // Every test that initializes librime: one top-level serialized suite.
+        .testTarget(name: "CRimeTests", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
     ],
     // Swift 6 language mode: complete strict-concurrency checking for every Swift target.
     swiftLanguageModes: [.v6]

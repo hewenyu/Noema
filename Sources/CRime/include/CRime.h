@@ -3,6 +3,7 @@
 
 // Relative include: lets downstream Swift targets `import CRime` without extra -I flags.
 // vendor-out/librime is produced by scripts/build/librime.sh.
+#include <stdbool.h>
 #include "../../../vendor-out/librime/include/rime_api.h"
 
 #ifdef __cplusplus
@@ -27,6 +28,11 @@ RimeApi *_Nullable noema_rime_get_api(void);
 
 // Returns 1 when noema_rime_get_api() yields a table that provides the members Noema calls.
 int noema_rime_api_available(void);
+
+// True when the API table provides every member RimeEngine calls: setup, deployment,
+// session lifecycle, key processing, candidate selection/paging, commit/context/status
+// readers with their free functions, and option get/set.
+bool noema_rime_engine_api_available(void);
 
 #pragma clang assume_nonnull end
 

@@ -45,3 +45,20 @@ int noema_rime_api_available(void) {
   return api && RIME_PROVIDED(api, get_version) && RIME_PROVIDED(api, find_module) &&
          RIME_PROVIDED(api, setup) && RIME_PROVIDED(api, process_key);
 }
+
+bool noema_rime_engine_api_available(void) {
+  RimeApi *api = noema_rime_get_api();
+  return api && RIME_PROVIDED(api, setup) && RIME_PROVIDED(api, deployer_initialize) &&
+         RIME_PROVIDED(api, deploy) && RIME_PROVIDED(api, initialize) &&
+         RIME_PROVIDED(api, finalize) && RIME_PROVIDED(api, create_session) &&
+         RIME_PROVIDED(api, find_session) && RIME_PROVIDED(api, destroy_session) &&
+         RIME_PROVIDED(api, select_schema) && RIME_PROVIDED(api, process_key) &&
+         RIME_PROVIDED(api, commit_composition) && RIME_PROVIDED(api, clear_composition) &&
+         RIME_PROVIDED(api, select_candidate_on_current_page) &&
+         RIME_PROVIDED(api, highlight_candidate_on_current_page) &&
+         RIME_PROVIDED(api, change_page) && RIME_PROVIDED(api, get_commit) &&
+         RIME_PROVIDED(api, free_commit) && RIME_PROVIDED(api, get_context) &&
+         RIME_PROVIDED(api, free_context) && RIME_PROVIDED(api, get_status) &&
+         RIME_PROVIDED(api, free_status) && RIME_PROVIDED(api, set_option) &&
+         RIME_PROVIDED(api, get_option);
+}
