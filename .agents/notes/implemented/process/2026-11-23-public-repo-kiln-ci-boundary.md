@@ -25,4 +25,5 @@ Status: implemented
 - 公开仓库可以安全使用 Kiln 的 CI 与 AI 评审，签名证书与机密只在 owner 推送 `v*` tag 时被触及。
 - 放弃了由 Issue 自动驱动开发的便利，所有代码变更都需要 owner 或其授权的本地代理发起 PR。
 - 若 Runner 改为具备容器或虚拟机隔离的执行环境，可以重新评估是否开放 Issue 自动开发。
+- `scripts/governance/check-imports.sh` 机械守住这一边界：剥离 BOM 与 YAML 注释后，`.kiln/agent/config.yml` 顶层只允许 `version` 与 `review`，任何形式的 `development`（缩进、flow-style、`? development` 显式键、大小写变体）都会失败。
 - `AGENTS.md` 的 Standing rules 第 6 条固定了这一边界；修改 `.kiln/agent/config.yml` 或发布工作流时必须遵守本笔记。

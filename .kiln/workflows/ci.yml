@@ -55,6 +55,7 @@ jobs:
     inputs:
       - Package.swift
       - Sources/
+      - Tests/
       - Resources/
       - vendor/librime.lock
       - scripts/build/librime.sh

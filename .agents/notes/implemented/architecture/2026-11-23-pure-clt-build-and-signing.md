@@ -16,7 +16,7 @@ Status: implemented
 - **打包**：`scripts/build/bundle.sh` 构建 `NoemaIME` 可执行目标（只链接 `NoemaCore`、`NoemaEngine`，提供 `--version` 与 `--check-rime`），在临时 staging 中组装 `NoemaIME.app`：`MacOS/NoemaIME`、`Frameworks/librime.1.dylib`、`Resources/{NoemaIME.icns,menu-icon.pdf,opencc/}`，`Info.plist` 由 `Resources/IME/Info.plist.in` 注入版本号并拒绝残留占位符；先 `xattr -cr`，签名后原子发布到 `<out>/NoemaIME.app`（旧包先移到 `.old`，失败时由 `trap` 回滚）。
 - **签名**：`bundle.sh --sign` 必填，只接受 40 位十六进制证书 SHA-1 或 `-`，拒绝证书名称（同名证书会使 `codesign -s <name>` 产生歧义）。由内到外逐层签名、从不使用 `--deep`：`librime.1.dylib` → `MacOS/NoemaIME`（带 `Resources/IME/NoemaIME.entitlements`，空字典，零 TCC 与零网络权限）→ `NoemaIME.app`（同一 entitlements）。证书签名加 `--options runtime --timestamp`。
 - **ad-hoc 仅限 CI 校验**：Kiln `ci/bundle` 用 `--sign -` 只为验证组装与加载，不加 `--options runtime` 与 `--timestamp`：ad-hoc 签名没有 Team ID，Hardened Runtime 的库验证会让 dyld 拒载 `Frameworks/librime.1.dylib`（进程 `SIGABRT`，退出码 134）。日常开发与发布构建使用固定证书 SHA-1，CI 从不接触签名证书。
-- **产物校验**：`scripts/build/verify-bundle.sh [--require-signed] [bundle]` 校验文件布局、全部 IMKit `Info.plist` 键与其引用的资源、零 `NS*UsageDescription` 与 `NSMainNibFile`、两个 Mach-O 仅 arm64 且通过 `librime.sh --check-linkage-stdin` 白名单、dylib 的 `@rpath` 安装名与零 `LC_RPATH`、可执行文件 rpath 恰为 `@executable_path/../Frameworks`、全包无 `/opt/homebrew` 字符串、逐层 `codesign --verify --strict`；`--require-signed` 另要求非 ad-hoc、Hardened Runtime、Authority 与 Team ID。最后真实执行 `Contents/MacOS/NoemaIME --check-rime`，证明 dyld 从 bundle 解析 librime 且 7 个必选模块全部注册。
+- **产物校验**：`scripts/build/verify-bundle.sh [--require-signed] [bundle]` 校验文件布局、全部 IMKit `Info.plist` 键与其引用的资源、零 `NS*UsageDescription` 与 `NSMainNibFile`、两个 Mach-O 仅 arm64 且通过 `librime.sh --check-linkage-stdin` 白名单、dylib 的 `@rpath` 安装名与零 `LC_RPATH`、可执行文件 rpath 恰为 `@executable_path/../Frameworks`、全包无 `/opt/homebrew` 字符串、逐层 `codesign --verify --strict`、可执行文件显式链接 `@rpath/librime.1.dylib`、bundle 与可执行文件实际签入的 entitlements 为空（`codesign -d --entitlements - --xml`）、`Info.plist` 引用的资源不得为绝对路径或经 `..` 逃出 `Contents/Resources`；`--require-signed` 另要求非 ad-hoc、Hardened Runtime、Authority 与 Team ID。最后真实执行 `Contents/MacOS/NoemaIME --check-rime`，证明 dyld 从 bundle 解析 librime 且 7 个必选模块全部注册。
 
 ## Alternatives considered
 
@@ -31,9 +31,9 @@ Status: implemented
 
 ## Consequences
 
-- 仅安装 CommandLineTools 的机器即可构建、测试、打包并验证 `NoemaIME.app`；`scripts/governance/check-imports.sh` 机械拒绝 `.xcassets`、`.xib`、`.storyboard`、`.xcodeproj`、`.xcworkspace`、`import XCTest` 与 `xcodebuild` 调用（负控：引入任一项时检查失败）。
+- 仅安装 CommandLineTools 的机器即可构建、测试、打包并验证 `NoemaIME.app`；`scripts/governance/check-imports.sh` 机械拒绝 `.xcassets`、`.xib`、`.storyboard`、`.xcodeproj`、`.xcworkspace`、`import XCTest` 与 `xcodebuild` 调用（扫描 `Sources`、`Tests`、`Resources`、`scripts`、`.kiln` 与 `Package.swift`，跳过 Markdown 散文）；匹配前先做词法级剥注释（Swift 块注释可嵌套、字符串字面量保留），因此 Swift 6 访问级别 `import`、`@_spi` 等属性、`;` 拼接、跨行与反引号模块名都无法绕过（负控：引入任一项时检查失败，`import Carbon.HIToolbox` 仍放行）。
 - `librime.sh` 门禁的负控：注入 `/opt/homebrew` 依赖或篡改 `BOOST_SHA256` 时脚本失败；`vendor-out/librime` 缺失或 `.lock-sha256` 与锁文件不符时 `test.sh` 与 `bundle.sh` 立即失败；末行无换行的 `/opt/homebrew` 依赖、`/usr/lib/../local/...` 路径穿越、`--out /` 均使脚本 exit 1。
-- `bundle.sh` 的负控：`--sign` 传证书名称时 exit 1。`verify-bundle.sh` 的负控：ad-hoc 产物加 `--require-signed`、移除 `CFBundleIdentifier` 中的 `.inputmethod.`、注入 `NSMicrophoneUsageDescription` 均 exit 1。
+- `bundle.sh` 的负控：`--sign` 传证书名称时 exit 1；`--version` 接受 SemVer 预发布与构建元数据（如 `1.2.3-rc.1+meta`）。`verify-bundle.sh` 的负控：ad-hoc 产物加 `--require-signed`、移除 `CFBundleIdentifier` 中的 `.inputmethod.`、注入 `NSMicrophoneUsageDescription`、签入 `com.apple.security.network.client`、`tsInputMethodIconFileKey` 指向 `../Info.plist` 均 exit 1；空字符串 bundle 路径 exit 2。
 - CI 的 ad-hoc 包不可分发也不可安装为日常输入法；可分发产物只来自本地以证书 SHA-1 签名的构建，公证（`notarytool`）与 `spctl --assess` 属于发布流程。
 - 无 Xcode 意味着没有 Instruments、Interface Builder 等工具，性能分析与 UI 调试成本更高。
 - 自行用 cmake 构建 `librime` 及其依赖的维护成本较高，上游升级需要手动跟进；CMake 4.x 已移除 `FindBoost`，依赖 `CMAKE_POLICY_VERSION_MINIMUM=3.5` 回退到旧策略。

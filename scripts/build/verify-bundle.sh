@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Verify an assembled NoemaIME.app: layout, IMKit Info.plist keys, Mach-O linkage,
-# code signatures, and a real launch that loads the bundled librime.
+# code signatures and empty signed entitlements, and a real launch that loads librime.
 #
 # Usage: scripts/build/verify-bundle.sh [--require-signed] [bundle_path]
 #   bundle_path       default dist/NoemaIME.app (relative to the repository root)
@@ -21,16 +21,21 @@ usage_error() { printf '[verify-bundle] error: %s\n' "$*" >&2; exit 2; }
 
 REQUIRE_SIGNED=0
 APP=""
+APP_GIVEN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --require-signed) REQUIRE_SIGNED=1; shift ;;
     -h | --help) sed -n '2,11p' "$0"; exit 0 ;;
     -*) usage_error "unknown option: $1" ;;
-    *) [[ -z "${APP}" ]] || usage_error "only one bundle path is accepted"; APP="$1"; shift ;;
+    *)
+      (( ! APP_GIVEN )) || usage_error "only one bundle path is accepted"
+      [[ -n "$1" ]] || usage_error "bundle path must not be empty"
+      APP_GIVEN=1; APP="$1"; shift ;;
   esac
 done
-APP="${APP:-${REPO_ROOT}/dist/NoemaIME.app}"
-APP="${APP%/}"
+(( APP_GIVEN )) || APP="${REPO_ROOT}/dist/NoemaIME.app"
+while [[ "${APP}" != "/" && "${APP}" == */ ]]; do APP="${APP%/}"; done
+[[ "${APP}" != "/" ]] || usage_error "bundle path must not be /"
 [[ -d "${APP}" && ! -L "${APP}" ]] || { bad "bundle not found (or a symlink): ${APP}"; exit 1; }
 
 CONTENTS="${APP}/Contents"
@@ -108,7 +113,15 @@ def resource_exists(key, name, default_extension=""):
         return
     if default_extension and not os.path.splitext(name)[1]:
         name += default_extension
+    # A bare relative name inside Contents/Resources: no absolute path, no `..`, no escape.
+    if os.path.isabs(name) or ".." in name.replace("\\", "/").split("/"):
+        problems.append(f"{key} must be a relative path inside Contents/Resources, got {name!r}")
+        return
     path = os.path.join(resources, name)
+    root = os.path.realpath(resources)
+    if os.path.commonpath([root, os.path.realpath(path)]) != root:
+        problems.append(f"{key} resolves outside Contents/Resources: {name!r}")
+        return
     expect(os.path.isfile(path) and not os.path.islink(path), f"{key} names Contents/Resources/{name}, which does not exist")
 
 resource_exists("tsInputMethodIconFileKey", info.get("tsInputMethodIconFileKey"))
@@ -141,6 +154,8 @@ for macho in "${EXE}" "${DYLIB}"; do
   [[ "${archs}" == "arm64" ]] || bad "${name}: architectures are '${archs}', expected arm64 only"
   otool -L "${macho}" | "${SCRIPT_DIR}/librime.sh" --check-linkage-stdin || bad "${name}: otool -L linkage gate failed"
 done
+otool -L "${EXE}" | grep -Fq '@rpath/librime.1.dylib' \
+  || bad "MacOS/NoemaIME does not link @rpath/librime.1.dylib"
 dylib_id="$(otool -D "${DYLIB}" | sed -n '2p')"
 [[ "${dylib_id}" == "@rpath/librime.1.dylib" ]] || bad "Frameworks/librime.1.dylib install_name is '${dylib_id}', expected @rpath/librime.1.dylib"
 dylib_rpaths="$(rpaths_of "${DYLIB}")"
@@ -176,6 +191,27 @@ for target in "${APP}" "${EXE}" "${DYLIB}"; do
     # Without a Team ID, library validation makes dyld refuse the bundled librime.
     bad "${name}: ad-hoc signature with Hardened Runtime cannot load Frameworks/librime.1.dylib; sign ad-hoc without --options runtime"
   fi
+done
+# The entitlements actually signed in, not the repository file: zero network, zero TCC,
+# no library-validation opt-out. Absent or an empty dictionary passes; any key fails.
+for target in "${APP}" "${EXE}"; do
+  name="${target#"${APP}"}"; name="${name#/Contents/}"; name="${name:-NoemaIME.app}"
+  if ! signed_entitlements="$(codesign -d --entitlements - --xml "${target}" 2>/dev/null)"; then
+    bad "${name}: cannot read the signed entitlements"
+    continue
+  fi
+  printf '%s' "${signed_entitlements}" | "${PYTHON3}" -I -c '
+import plistlib, sys
+data = sys.stdin.buffer.read()
+if not data.strip():
+    sys.exit(0)
+try:
+    entitlements = plistlib.loads(data)
+except Exception as error:
+    sys.exit(f"[verify-bundle] FAIL: signed entitlements are not a plist: {error}")
+if not isinstance(entitlements, dict) or entitlements:
+    sys.exit(f"[verify-bundle] FAIL: signed entitlements must be an empty dictionary, got {entitlements!r}")
+' || bad "${name}: signed entitlements are not empty (zero network, zero TCC, no disable-library-validation)"
 done
 
 # ---------------------------------------------------------------------------

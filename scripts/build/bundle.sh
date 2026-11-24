@@ -9,7 +9,7 @@
 #                      ad-hoc CI signature (no runtime flag: dyld would refuse to load the
 #                      bundled librime without a Team ID). Certificate names are rejected.
 #   --out <dir>        output directory (default dist); the bundle lands at <dir>/NoemaIME.app
-#   --version <ver>    CFBundleShortVersionString (default ${NOEMA_VERSION:-0.0.0-dev})
+#   --version <ver>    SemVer CFBundleShortVersionString (default ${NOEMA_VERSION:-0.0.0-dev})
 #   --build <n>        CFBundleVersion (default ${NOEMA_BUILD:-1})
 #
 # Never reads this repository's .git, so it also works in exported (git-less) trees.
@@ -54,8 +54,8 @@ elif [[ "${IDENTITY}" =~ ^[0-9A-Fa-f]{40}$ ]]; then
 else
   die "--sign accepts only - or a 40-hex certificate SHA-1, not '${IDENTITY}' (names are ambiguous; see security find-identity -v -p codesigning)"
 fi
-[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
-  || die "--version must look like 1.2.3 or 1.2.3-tag, got '${VERSION}'"
+[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] \
+  || die "--version must be SemVer like 1.2.3, 1.2.3-rc.1, or 1.2.3-rc.1+meta, got '${VERSION}'"
 [[ "${BUILD}" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || die "--build must be numeric like 42 or 1.2.3, got '${BUILD}'"
 
 [[ -n "${OUT_DIR}" ]] || die "--out needs a non-empty directory"
@@ -86,7 +86,7 @@ if [[ -e "${TARGET_APP}" || -L "${TARGET_APP}" ]]; then
   is_previous_bundle "${TARGET_APP}" || die "refusing to replace ${TARGET_APP}: it is not a previous ${APP_NAME} output"
 elif [[ -d "${OUT_DIR}" ]] \
   && [[ -n "$(find "${OUT_DIR}" -mindepth 1 -maxdepth 1 ! -name ".${APP_NAME}.*" -print -quit)" ]]; then
-  # Only leftovers of an interrupted run (.NoemaIME.app.staging.*, .NoemaIME.app.old) are ours.
+  # Only leftovers of an interrupted run (.NoemaIME.app.staging.*, .NoemaIME.app.old.<pid>) are ours.
   die "refusing to use ${OUT_DIR}: it is not empty and holds no previous ${APP_NAME}"
 fi
 
@@ -200,7 +200,8 @@ codesign --verify --strict "${stage_app}" || die "codesign --verify failed for t
 # copy. A failed second step rolls back (on_exit also restores after a signal).
 # ---------------------------------------------------------------------------
 
-old="${OUT_DIR}/.${APP_NAME}.old"
+# The PID keeps concurrent runs publishing into one --out from sharing an aside path.
+old="${OUT_DIR}/.${APP_NAME}.old.$$"
 rm -rf "${old}"
 if [[ -e "${TARGET_APP}" ]]; then
   OLD_APP="${old}"
@@ -212,6 +213,6 @@ if ! mv "${stage_app}" "${TARGET_APP}"; then
   fi
   die "cannot move the staged bundle to ${TARGET_APP}; previous bundle kept"
 fi
-OLD_APP=""
 rm -rf "${old}"
+OLD_APP=""
 log "done: ${TARGET_APP} (version ${VERSION}, build ${BUILD}, ${SIGN_MODE} signature)"

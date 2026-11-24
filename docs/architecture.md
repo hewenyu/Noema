@@ -32,22 +32,9 @@ Tests use Swift Testing only. `NoemaCoreTests` cover `NoemaCore`, `NoemaIPC`, an
 1. **librime** — `scripts/build/librime.sh` builds `vendor-out/librime/` (`lib/librime.1.dylib`, `include/`, `share/opencc/`, `.lock-sha256`) from the exact commits and Boost SHA256 pinned in `vendor/librime.lock`. Its self-check gate (`--verify`) requires the `@rpath` install name, an `otool -L` allow-list of `/usr/lib/` and `/System/Library/`, no `LC_RPATH`, and arm64 only. `--check-linkage-stdin` exposes the same allow-list to other scripts.
 2. **Swift** — `Package.swift` links `CRime` against `vendor-out/librime/lib`. Debug builds carry an rpath into `vendor-out/librime/lib`; release builds carry only `@executable_path/../Frameworks`.
 3. **Tests** — `scripts/dev/test.sh` refuses to run unless `vendor-out/librime/.lock-sha256` matches `vendor/librime.lock` and the self-check gate passes, then runs `swift test` with the CommandLineTools `Testing.framework` search paths.
-4. **Bundle** — `scripts/build/bundle.sh --sign <identity>` builds the release `NoemaIME` product (`--disable-local-rpath`), assembles the bundle in a staging directory, signs it, and publishes it atomically to `<out>/NoemaIME.app`:
-
-```
-NoemaIME.app/Contents/
-  Info.plist                 Resources/IME/Info.plist.in with version and build injected
-  MacOS/NoemaIME
-  Frameworks/librime.1.dylib
-  Resources/NoemaIME.icns    Resources/IME/generate-icons.swift + iconutil
-  Resources/menu-icon.pdf    template image for the input menu
-  Resources/opencc/          from vendor-out/librime/share/opencc
-```
-
-The icons are drawn in code with CoreGraphics and ImageIO; the repository holds no image files and no asset catalogs. `Info.plist.in` declares the IMKit keys (`InputMethodConnectionName`, `InputMethodServerControllerClass`, `ComponentInputModeDict`) and no `NS*UsageDescription` key.
-
-5. **Signing** — `bundle.sh` signs inside-out, never with `--deep`: `Frameworks/librime.1.dylib`, then `MacOS/NoemaIME` with `Resources/IME/NoemaIME.entitlements` (an empty dictionary), then the bundle with the same entitlements. A 40-hex certificate SHA-1 signs with `--options runtime --timestamp`. `-` signs ad-hoc without the runtime flag, because Hardened Runtime library validation needs a Team ID to load the bundled dylib. Certificate names are rejected.
-6. **Bundle verification** — `scripts/build/verify-bundle.sh [--require-signed] [bundle]` checks the layout, every required Info.plist key and the resources it names, arm64-only Mach-O files that pass the librime linkage allow-list, the dylib's `@rpath` install name and absence of `LC_RPATH`, an executable rpath of exactly `@executable_path/../Frameworks`, no `/opt/homebrew` string anywhere in the bundle, and `codesign --verify --strict` on each signed part. `--require-signed` additionally demands a certificate signature with Hardened Runtime, an Authority chain, and a Team ID. The last check launches `Contents/MacOS/NoemaIME --check-rime`, proving that dyld resolves the bundled librime and that every required module registers.
+4. **Bundle** — [`scripts/build/bundle.sh`](../scripts/build/bundle.sh) builds the release `NoemaIME` product, assembles `NoemaIME.app` in a staging directory next to the output, signs it, and publishes it atomically to `<out>/NoemaIME.app`. The bundle holds the executable, the bundled `librime.1.dylib` under `Contents/Frameworks`, the OpenCC data, and icons drawn in code by `Resources/IME/generate-icons.swift`; the repository holds no image files and no asset catalogs. `Contents/Info.plist` is [`Resources/IME/Info.plist.in`](../Resources/IME/Info.plist.in) with version and build injected; it declares the IMKit keys and no privacy usage description. `bundle.sh` owns the exact file inventory.
+5. **Signing** — `bundle.sh` signs inside-out, never with `--deep`, using the empty [`Resources/IME/NoemaIME.entitlements`](../Resources/IME/NoemaIME.entitlements). A certificate SHA-1 signs with Hardened Runtime and a secure timestamp; `-` signs ad-hoc without the runtime flag, because library validation needs a Team ID to load the bundled dylib.
+6. **Bundle verification** — [`scripts/build/verify-bundle.sh`](../scripts/build/verify-bundle.sh) checks the assembled bundle against the IMKit, zero-TCC, linkage, and signing contracts, including the entitlements actually signed in, and finishes by launching `Contents/MacOS/NoemaIME --check-rime` to prove that dyld resolves the bundled librime and every required module registers. Its header lists the checks.
 
 ## Governance gates
 
@@ -55,10 +42,10 @@ The icons are drawn in code with CoreGraphics and ImageIO; the repository holds 
 
 | Gate | Enforces |
 |---|---|
-| `verify-doc-budgets.mjs` | Word ceilings from `doc-budgets.manifest.json` for `AGENTS.md`, `.agents/notes/README.md`, `docs/AGENTS.md`, and this page; with `--base`, no raised ceiling. |
+| `verify-doc-budgets.mjs` | Word ceilings for the documents listed in [`doc-budgets.manifest.json`](../scripts/governance/doc-budgets.manifest.json); with `--base`, no raised ceiling. |
 | `verify-agent-notes.mjs` | Note paths `{lifecycle}/{class}/yyyy-mm-dd-topic.md`, the Status line, and the required sections per lifecycle; with `--base`, frozen `archived/` and `rejected/` notes. |
 | `verify-md-links.mjs` | Every relative Markdown link and anchor resolves. |
-| `check-imports.sh` | `Sources/NoemaIME` imports no networking, audio, speech, AX, event-tap, pasteboard, or screen-capture API; no Xcode-only artifact, `import XCTest`, or `xcodebuild` call; `CLAUDE.md` and `docs/CLAUDE.md` link to their `AGENTS.md`; `.kiln/agent/config.yml` has no `development:` key. |
+| `check-imports.sh` | Comment-aware scan: `Sources/NoemaIME` imports no networking, audio, speech, AX, event-tap, pasteboard, or screen-capture API; no Xcode-only artifact, `import XCTest`, or `xcodebuild` call; `CLAUDE.md` and `docs/CLAUDE.md` link to their `AGENTS.md`; `.kiln/agent/config.yml` holds only `version` and `review` and no `development` key. |
 
 None of the gates or build scripts read `.git` except for the optional `--base` comparison, so they run in git-less Kiln workspaces.
 
