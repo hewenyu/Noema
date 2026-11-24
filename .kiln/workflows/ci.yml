@@ -10,6 +10,7 @@ on:
 jobs:
   governance:
     runs-on: darwin/arm64
+    runtimes: [node]
     inputs: ["**"]
     resources: { cpu: 1, memory: 1Gi }
     timeout-minutes: 5
