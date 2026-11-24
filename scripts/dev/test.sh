@@ -22,6 +22,13 @@ fail() {
   || fail "lib_TestingInterop.dylib not found under ${INTEROP_LIB}" "softwareupdate --install the latest Command Line Tools for Xcode"
 [[ -f "${LIBRIME_DIR}/lib/librime.1.dylib" ]] \
   || fail "librime not built: ${LIBRIME_DIR}/lib/librime.1.dylib is missing" "scripts/build/librime.sh"
+# A stale build would let tests pass against the wrong librime inputs.
+LOCK_SHA256="$(shasum -a 256 "${REPO_ROOT}/vendor/librime.lock" | awk '{print $1}')"
+BUILT_SHA256="$(cat "${LIBRIME_DIR}/.lock-sha256" 2>/dev/null || true)"
+[[ "${BUILT_SHA256}" == "${LOCK_SHA256}" ]] \
+  || fail "vendor-out/librime was built from a different vendor/librime.lock (built ${BUILT_SHA256:-<none>}, lock ${LOCK_SHA256})" "scripts/build/librime.sh"
+"${REPO_ROOT}/scripts/build/librime.sh" --verify --out "${LIBRIME_DIR}" \
+  || fail "vendor-out/librime fails the self-check gate" "scripts/build/librime.sh --force"
 
 cd "${REPO_ROOT}"
 exec swift test \

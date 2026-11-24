@@ -9,7 +9,7 @@ import Testing
 @Suite(.serialized)
 struct CRimeTests {
     @Test func apiTableIsAvailable() throws {
-        let api = try #require(rime_get_api())
+        let api = try #require(noema_rime_get_api())
         #expect(noema_rime_api_available() == 1)
         #expect(RimeRuntime.isAvailable)
         let version = String(cString: try #require(api.pointee.get_version?()))
@@ -17,15 +17,52 @@ struct CRimeTests {
         #expect(try RimeRuntime.version() == version)
     }
 
+    /// Many tasks query the runtime at once (on a cold process this includes the
+    /// first rime_get_api() call, which noema_rime_get_api() serializes); every
+    /// task must see the same table and the same answers.
+    @Test func concurrentQueriesAgree() async throws {
+        let expected = try RimeRuntime.info()
+        let tableAddress = Int(bitPattern: try #require(noema_rime_get_api()))
+        let results = await withTaskGroup(of: (Bool, RimeRuntimeInfo?, Int?).self) { group in
+            for _ in 0..<64 {
+                group.addTask {
+                    (RimeRuntime.isAvailable, try? RimeRuntime.info(), noema_rime_get_api().map { Int(bitPattern: $0) })
+                }
+            }
+            var results: [(Bool, RimeRuntimeInfo?, Int?)] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+        #expect(results.count == 64)
+        for (available, info, address) in results {
+            #expect(available)
+            #expect(info == expected)
+            #expect(address == tableAddress)
+        }
+        #expect(expected.version == "1.17.0")
+        #expect(expected.allModulesRegistered)
+    }
+
+    /// The struct initializers ignore NULL instead of crashing.
+    @Test func structInitializersIgnoreNull() {
+        noema_rime_traits_init(nil)
+        noema_rime_context_init(nil)
+        noema_rime_status_init(nil)
+        noema_rime_commit_init(nil)
+        var status = RimeStatus()
+        noema_rime_status_init(&status)
+        #expect(status.data_size == Int32(MemoryLayout<RimeStatus>.stride - MemoryLayout<Int32>.size))
+    }
+
     @Test(arguments: ["core", "dict", "gears", "levers", "deployer", "lua", "octagram", "grammar"])
     func mergedModuleIsRegistered(_ name: String) throws {
-        let findModule = try #require(rime_get_api()?.pointee.find_module)
+        let findModule = try #require(noema_rime_get_api()?.pointee.find_module)
         #expect(findModule(name) != nil, "module \(name) is not registered in librime.1.dylib")
         #expect(try RimeRuntime.hasModule(name))
     }
 
     @Test func unknownModuleIsNotRegistered() throws {
-        let findModule = try #require(rime_get_api()?.pointee.find_module)
+        let findModule = try #require(noema_rime_get_api()?.pointee.find_module)
         #expect(findModule("noema_nonexistent_module") == nil)
         #expect(try !RimeRuntime.hasModule("noema_nonexistent_module"))
         #expect(try RimeRuntime.info().allModulesRegistered)
@@ -37,7 +74,7 @@ struct CRimeTests {
     @Test func deploysSchemaAndCommitsLuaAndTableCandidates() throws {
         let workspace = try RimeWorkspace()
         defer { workspace.remove() }
-        let api = try #require(rime_get_api()).pointee
+        let api = try #require(noema_rime_get_api()).pointee
 
         var traits = RimeTraits()
         noema_rime_traits_init(&traits)
@@ -103,7 +140,7 @@ private func candidates(in session: RimeSessionId, api: RimeApi) throws -> [Stri
     defer { _ = api.free_context(&context) }
     let count = Int(context.menu.num_candidates)
     guard count > 0, let items = context.menu.candidates else { return [] }
-    return (0..<count).map { String(cString: items[$0].text) }
+    return (0..<count).compactMap { items[$0].text.map { String(cString: $0) } }
 }
 
 private func commit(from session: RimeSessionId, api: RimeApi) throws -> String? {
@@ -128,6 +165,8 @@ private final class CStrings {
         pointers.forEach { Foundation.free($0) }
         pointers.removeAll()
     }
+
+    deinit { free() }
 }
 
 /// A throwaway shared/user data directory pair holding the inline test schema.

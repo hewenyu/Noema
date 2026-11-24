@@ -20,7 +20,10 @@ public struct RimeRuntimeInfo: Sendable, Hashable, Codable {
 /// Read-only access to the process-global librime API table.
 ///
 /// librime is a process-wide singleton; this type never calls setup/initialize,
-/// so it is safe to query from any thread. The raw `RimeApi` pointer stays internal.
+/// and fetches the API table only through `noema_rime_get_api()` (whose first
+/// call is serialized with `pthread_once`), so it is safe to query from any
+/// thread, including concurrently on a cold start. The raw `RimeApi` pointer
+/// stays internal.
 public enum RimeRuntime {
     /// Modules Noema requires from the merged librime build.
     public static let requiredModules = ["core", "dict", "gears", "levers", "lua", "octagram", "grammar"]
@@ -54,7 +57,7 @@ public enum RimeRuntime {
     }
 
     private static func api() throws(NoemaError) -> UnsafeMutablePointer<RimeApi> {
-        guard isAvailable, let api = rime_get_api() else {
+        guard isAvailable, let api = noema_rime_get_api() else {
             throw .engineUnavailable(reason: "rime_get_api() returned an incomplete API table")
         }
         return api

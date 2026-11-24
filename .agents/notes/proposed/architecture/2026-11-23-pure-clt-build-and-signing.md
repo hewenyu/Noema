@@ -10,9 +10,9 @@ Status: proposed
 
 - **目标平台**：macOS 26+，仅 arm64；SwiftPM 清单使用 `swift-tools-version: 6.2`，用 Swift 6.3.3 工具链构建，零 `Xcode.app` 依赖。
 - **纯代码 UI**：100% 纯代码 SwiftUI/AppKit，不使用 `.xib`、`.storyboard`、`.xcassets`；应用图标通过 `iconutil` 从 `.iconset` 生成 `.icns`。
-- **测试**：使用 Swift Testing（`import Testing`），由 `scripts/dev/test.sh` 以 `--disable-xctest` 加显式 `-F`/`-rpath` 封装 CLT 中 `Testing.framework` 与 `lib_TestingInterop.dylib` 的搜索路径，替代不可用的 `XCTest`。
-- **librime 自包含单动态库**：`scripts/build/librime.sh` 按 `vendor/librime.lock` 中的精确 commit 与 Boost SHA256，用 cmake（`Unix Makefiles`、`CMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local`）从源码构建 `librime`、`librime-lua`、`librime-octagram`；Boost 仅用头文件，leveldb、marisa、OpenCC、yaml-cpp、spdlog 与 in-tree Lua 5.4 全部静态合并进唯一的 `librime.1.dylib`，`install_name` 固定为 `@rpath/librime.1.dylib`，运行时只依赖 `/usr/lib` 与 `/System/Library`。脚本末尾的自检门禁校验 `otool -D`、`otool -L` 白名单、无 `LC_RPATH`、仅 arm64；产物与 `.lock-sha256` 一致时幂等跳过。
-- **SwiftPM 链接**：`CRime` 以相对路径包含 `vendor-out/librime/include/rime_api.h`，链接 `-lrime`；debug 配置的 rpath 指向 `vendor-out/librime/lib`，release 配置只有 `@executable_path/../Frameworks`，发布产物不含开发机绝对路径。打包时将 `librime.1.dylib` 放入 bundle 的 `Contents/Frameworks/` 并按 SHA-1 重签；构建脚本留下的 ad-hoc 签名仅用于本地加载。
+- **测试**：使用 Swift Testing（`import Testing`），由 `scripts/dev/test.sh` 以 `--disable-xctest` 加显式 `-F`/`-rpath` 封装 CLT 中 `Testing.framework` 与 `lib_TestingInterop.dylib` 的搜索路径，替代不可用的 `XCTest`；运行前要求 `vendor-out/librime/.lock-sha256` 等于当前 `vendor/librime.lock` 的 SHA256 并通过 `librime.sh --verify`，拒绝用过期产物跑绿测试。
+- **librime 自包含单动态库**：`scripts/build/librime.sh` 按 `vendor/librime.lock` 中的精确 commit 与 Boost SHA256，用 cmake（`Unix Makefiles`、`CMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local`）从源码构建 `librime`、`librime-lua`、`librime-octagram`；Boost 仅用头文件，leveldb、marisa、OpenCC、yaml-cpp、spdlog 与 in-tree Lua 5.4 全部静态合并进唯一的 `librime.1.dylib`，`install_name` 固定为 `@rpath/librime.1.dylib`，运行时只依赖 `/usr/lib` 与 `/System/Library`。脚本末尾的自检门禁校验 `otool -D`、`otool -L` 白名单（含 `..` 的路径与无结尾换行的末行同样受检）、无 `LC_RPATH`（含空格的路径整段删除，失败即报错）、仅 arm64；产物与 `.lock-sha256` 一致时幂等跳过。Boost 下载先在 `.part` 上校验 SHA256 再进入缓存；`--out` 去除尾部 `/` 与 `.` 分量并拒绝 `/`、`..` 与非本脚本产物的非空目录；发布时先把旧产物移到 `.old` 再换入 staging，失败或收到信号时回滚，`trap` 清理临时文件。
+- **SwiftPM 链接**：`CRime` 以相对路径包含 `vendor-out/librime/include/rime_api.h`，链接 `-lrime`；debug 配置的 rpath 指向 `vendor-out/librime/lib`，release 配置只有 `@executable_path/../Frameworks`，发布产物不含开发机绝对路径。上游 `rime_get_api()` 首次调用无同步地填充静态函数表，并发冷启动存在数据竞争，所以 Noema 一律经 `noema_rime_get_api()`（`pthread_once` 包装）取表。打包时将 `librime.1.dylib` 放入 bundle 的 `Contents/Frameworks/` 并按 SHA-1 重签；构建脚本留下的 ad-hoc 签名仅用于本地加载。
 - **签名**：显式按证书 SHA-1 选择签名身份，由内到外（嵌入的 framework/helper → 子进程 `noema-rime-deployer` → App bundle）逐层签名，启用 Hardened Runtime；发布产物使用 `notarytool` 公证并 staple。
 - **禁止 ad-hoc 签名用于日常开发**：开发构建同样使用固定的证书 SHA-1，保证 TCC 授权在重建后不漂移。
 
@@ -28,7 +28,7 @@ Status: proposed
 - 在仅安装 CommandLineTools 的机器上，`swift build` 与 Swift Testing 测试全部通过。
 - 仓库中不存在 `.xcassets`、`.xib`、`.storyboard`、`.xcodeproj`，构建脚本不调用 `xcodebuild`，测试不 `import XCTest`（负控：引入任一项时检查失败）。
 - 对打包产物中每个 Mach-O 运行 `otool -L`，输出中不出现 `/opt/homebrew`。
-- `scripts/build/librime.sh` 的自检门禁要求 `otool -D` 精确为 `@rpath/librime.1.dylib`、`otool -L` 仅含白名单路径；`CRimeTests` 在真实 librime 中确认 `lua`、`octagram`、`grammar` 模块已注册，并用内联 schema 经 Lua 与表翻译器真实上屏（负控：注入 `/opt/homebrew` 依赖或篡改 `BOOST_SHA256` 时脚本失败，`vendor-out/librime` 缺失时 `test.sh` 立即失败）。
+- `scripts/build/librime.sh` 的自检门禁要求 `otool -D` 精确为 `@rpath/librime.1.dylib`、`otool -L` 仅含白名单路径；`CRimeTests` 在真实 librime 中确认 `lua`、`octagram`、`grammar` 模块已注册，并用内联 schema 经 Lua 与表翻译器真实上屏（负控：注入 `/opt/homebrew` 依赖或篡改 `BOOST_SHA256` 时脚本失败，`vendor-out/librime` 缺失或 `.lock-sha256` 与锁文件不符时 `test.sh` 立即失败；末行无换行的 `/opt/homebrew` 依赖、`/usr/lib/../local/...` 路径穿越、`--out /` 均使脚本 exit 1）。
 - release 构建的可执行文件 `LC_RPATH` 不含 `/Users/` 等开发机绝对路径。
 - `codesign --verify --deep --strict` 通过，`codesign -d` 显示 Hardened Runtime 标志与预期证书；发布产物 `spctl --assess` 通过。
 

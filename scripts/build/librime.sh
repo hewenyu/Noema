@@ -33,15 +33,20 @@ die() { printf '[librime] error: %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 
 # Reads `otool -L` output on stdin. Fails if any load command points outside
-# @rpath/librime.1.dylib, /usr/lib/, or /System/Library/.
+# @rpath/librime.1.dylib, /usr/lib/, or /System/Library/, or contains a `..`
+# component (which could walk out of an allow-listed prefix).
 check_linkage_stream() {
   local line dep bad=0 seen=0
-  while IFS= read -r line; do
+  # `|| [[ -n ... ]]` also checks a final line that has no trailing newline.
+  while IFS= read -r line || [[ -n "${line}" ]]; do
     # Dependency lines are indented; the first, unindented line names the file.
     [[ "${line}" =~ ^[[:space:]]+([^[:space:]].*)\ \(compatibility ]] || continue
     dep="${BASH_REMATCH[1]}"
     seen=1
     case "${dep}" in
+      */../* | */.. | ../* | ..)
+        printf '[librime] linkage: path traversal in dependency: %s\n' "${dep}" >&2
+        bad=1 ;;
       /opt/homebrew/* | /usr/local/*)
         printf '[librime] linkage: forbidden Homebrew/local dependency: %s\n' "${dep}" >&2
         bad=1 ;;
@@ -77,6 +82,17 @@ verify_output() {
   log "verify: ok (${dylib})"
 }
 
+# Deletes every LC_RPATH from a Mach-O. Paths may contain spaces, so take the
+# whole `path ... (offset N)` field rather than an awk word.
+strip_rpaths() {
+  local macho="$1" rpath output
+  while IFS= read -r rpath; do
+    [[ -n "${rpath}" ]] || continue
+    output="$(install_name_tool -delete_rpath "${rpath}" "${macho}" 2>&1)" \
+      || die "install_name_tool -delete_rpath '${rpath}' failed for ${macho}: ${output}"
+  done < <(otool -l "${macho}" | awk '/cmd LC_RPATH/ {getline; getline; sub(/^[[:space:]]+path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print}')
+}
+
 # ---------------------------------------------------------------------------
 # Arguments and lock
 # ---------------------------------------------------------------------------
@@ -93,7 +109,20 @@ while [[ $# -gt 0 ]]; do
     *) die "unknown argument: $1" ;;
   esac
 done
+[[ -n "${OUT_DIR}" ]] || die "--out needs a non-empty directory"
 [[ "${OUT_DIR}" == /* ]] || OUT_DIR="$(pwd)/${OUT_DIR}"
+# Canonicalize textually (the directory may not exist yet): drop ./ and repeated /.
+slash=/
+while [[ "${OUT_DIR}" == */./* || "${OUT_DIR}" == *//* ]]; do
+  OUT_DIR="${OUT_DIR//\/.\//${slash}}"
+  OUT_DIR="${OUT_DIR//\/\//${slash}}"
+done
+# Trailing slashes would turn "${OUT_DIR}.staging" into a child of OUT_DIR.
+while [[ "${OUT_DIR}" != "/" && "${OUT_DIR}" == */ ]]; do OUT_DIR="${OUT_DIR%/}"; done
+[[ "${OUT_DIR}" != "/" ]] || die "refusing to use / as --out"
+case "${OUT_DIR}/" in
+  */../* | */./*) die "--out must not contain . or .. components: ${OUT_DIR}" ;;
+esac
 
 if [[ "${MODE}" == linkage ]]; then
   check_linkage_stream
@@ -122,6 +151,16 @@ BOOST_VERSION="$(lock_get BOOST_VERSION)"
 BOOST_URL="$(lock_get BOOST_URL)"
 BOOST_SHA256="$(lock_get BOOST_SHA256)"
 LOCK_SHA256="$(shasum -a 256 "${LOCK_FILE}" | awk '{print $1}')"
+
+# Publishing replaces OUT_DIR, so refuse to clobber a directory that is neither
+# empty nor a previous output of this script.
+if [[ -L "${OUT_DIR}" || ( -e "${OUT_DIR}" && ! -d "${OUT_DIR}" ) ]]; then
+  die "--out exists and is not a directory: ${OUT_DIR}"
+fi
+if [[ -d "${OUT_DIR}" && -n "$(ls -A "${OUT_DIR}")" && ! -f "${OUT_DIR}/.lock-sha256" \
+  && ! -f "${OUT_DIR}/lib/librime.1.dylib" ]]; then
+  die "refusing to replace ${OUT_DIR}: it is not empty and not a previous librime output"
+fi
 
 if [[ "${FORCE}" -eq 0 && -f "${OUT_DIR}/.lock-sha256" ]] \
   && [[ "$(cat "${OUT_DIR}/.lock-sha256")" == "${LOCK_SHA256}" ]]; then
@@ -171,19 +210,48 @@ if [[ "${FORCE}" -eq 1 ]]; then
 fi
 mkdir -p "${WORK_DIR}/downloads" "${WORK_DIR}/build" "${PREFIX}"
 
+# Temporary paths owned by this run; on_exit removes whatever is left of them and
+# restores the previous output if a publish was interrupted.
+PART_FILE=""
+STAGE_DIR=""
+OLD_DIR=""
+on_exit() {
+  local status=$?
+  if [[ -n "${PART_FILE}" ]]; then rm -f "${PART_FILE}" || true; fi
+  if [[ -n "${OLD_DIR}" && -d "${OLD_DIR}" ]]; then
+    if [[ ! -e "${OUT_DIR}" ]]; then
+      mv "${OLD_DIR}" "${OUT_DIR}" && log "restored previous output at ${OUT_DIR}" || true
+    else
+      rm -rf "${OLD_DIR}" || true
+    fi
+  fi
+  if [[ -n "${STAGE_DIR}" ]]; then rm -rf "${STAGE_DIR}" || true; fi
+  exit "${status}"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # ---------------------------------------------------------------------------
 # Boost (header-only)
 # ---------------------------------------------------------------------------
 
 boost_tarball="${WORK_DIR}/downloads/$(basename "${BOOST_URL}")"
 if [[ ! -f "${boost_tarball}" ]]; then
+  # Verify before the tarball enters the cache, so a bad download never sticks.
+  PART_FILE="${boost_tarball}.part"
   log "downloading ${BOOST_URL}"
-  curl -fsSL --retry 3 -o "${boost_tarball}.part" "${BOOST_URL}"
-  mv "${boost_tarball}.part" "${boost_tarball}"
+  curl -fsSL --retry 3 -o "${PART_FILE}" "${BOOST_URL}" || die "download failed: ${BOOST_URL}"
+  actual_sha="$(shasum -a 256 "${PART_FILE}" | awk '{print $1}')"
+  [[ "${actual_sha}" == "${BOOST_SHA256}" ]] \
+    || die "Boost SHA256 mismatch for ${BOOST_URL}: expected ${BOOST_SHA256}, got ${actual_sha}; download discarded"
+  mv "${PART_FILE}" "${boost_tarball}"
+  PART_FILE=""
 fi
 actual_sha="$(shasum -a 256 "${boost_tarball}" | awk '{print $1}')"
 if [[ "${actual_sha}" != "${BOOST_SHA256}" ]]; then
-  die "Boost SHA256 mismatch for ${boost_tarball}: expected ${BOOST_SHA256}, got ${actual_sha}"
+  rm -f "${boost_tarball}"
+  die "Boost SHA256 mismatch for cached ${boost_tarball}: expected ${BOOST_SHA256}, got ${actual_sha}; removed it, re-run to download again"
 fi
 log "Boost SHA256 verified (${actual_sha})"
 if [[ "$(cat "${BOOST_DIR}/.noema-headers" 2>/dev/null)" != "${BOOST_SHA256}" ]]; then
@@ -279,6 +347,7 @@ opencc_share="${PREFIX}/share/opencc"
 
 stage="${OUT_DIR}.staging"
 rm -rf "${stage}"
+STAGE_DIR="${stage}"
 mkdir -p "${stage}/lib" "${stage}/include" "${stage}/share"
 cp "${built_dylib}" "${stage}/lib/librime.1.dylib"
 chmod u+w "${stage}/lib/librime.1.dylib"
@@ -289,17 +358,34 @@ done
 cp -R "${opencc_share}" "${stage}/share/opencc"
 
 dylib="${stage}/lib/librime.1.dylib"
-install_name_tool -id "${INSTALL_ID}" "${dylib}" 2>/dev/null
-while read -r rpath; do
-  install_name_tool -delete_rpath "${rpath}" "${dylib}" 2>/dev/null
-done < <(otool -l "${dylib}" | awk '/cmd LC_RPATH/ {getline; getline; print $2}')
+tool_output="$(install_name_tool -id "${INSTALL_ID}" "${dylib}" 2>&1)" \
+  || die "install_name_tool -id ${INSTALL_ID} failed for ${dylib}: ${tool_output}"
+strip_rpaths "${dylib}"
 # install_name_tool invalidates the linker signature; restore a loadable one.
 # Distribution signing by certificate SHA-1 happens when the dylib is bundled.
-codesign --force --sign - "${dylib}" 2>/dev/null
+tool_output="$(codesign --force --sign - "${dylib}" 2>&1)" \
+  || die "ad-hoc codesign failed for ${dylib}: ${tool_output}"
 
-verify_output "${stage}" || die "self-check gate failed; output left in ${stage}"
+verify_output "${stage}" || die "self-check gate failed for ${stage} (removed on exit)"
 printf '%s\n' "${LOCK_SHA256}" > "${stage}/.lock-sha256"
-rm -rf "${OUT_DIR}"
+
+# Publish: move any previous output aside, move the stage in, then drop the old
+# copy. A failed second step rolls back (on_exit also restores after a signal).
+old="${OUT_DIR}.old"
+rm -rf "${old}"
 mkdir -p "$(dirname "${OUT_DIR}")"
-mv "${stage}" "${OUT_DIR}"
+if [[ -e "${OUT_DIR}" ]]; then
+  # Mark before moving, so a signal between the two moves still restores it.
+  OLD_DIR="${old}"
+  mv "${OUT_DIR}" "${old}" || die "cannot move previous output ${OUT_DIR} aside"
+fi
+if ! mv "${stage}" "${OUT_DIR}"; then
+  if [[ -n "${OLD_DIR}" ]]; then
+    mv "${old}" "${OUT_DIR}" && OLD_DIR="" || true
+  fi
+  die "cannot move ${stage} to ${OUT_DIR}; previous output kept"
+fi
+STAGE_DIR=""
+OLD_DIR=""
+rm -rf "${old}"
 log "done: ${OUT_DIR} ($(lipo -archs "${OUT_DIR}/lib/librime.1.dylib"), $(du -h "${OUT_DIR}/lib/librime.1.dylib" | awk '{print $1}'))"

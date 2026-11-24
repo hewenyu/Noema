@@ -12,7 +12,7 @@ Noema 是一个自用的原生中文输入法，基于 `librime`，由轻量的 
 ```sh
 scripts/dev/doctor.sh           # 检查工具链、Swift Testing 与 librime 状态
 scripts/build/librime.sh        # 按 vendor/librime.lock 构建 vendor-out/librime（首次约 5 分钟，之后幂等跳过）
-scripts/dev/test.sh             # 运行全部 Swift Testing 测试（含真实 librime 集成测试）
+scripts/dev/test.sh             # 运行全部 Swift Testing 测试（含真实 librime 集成测试）；librime 产物过期时拒跑
 swift build && .build/debug/noema-cli check-rime   # 打印 librime 版本与模块注册状态
 ```
 

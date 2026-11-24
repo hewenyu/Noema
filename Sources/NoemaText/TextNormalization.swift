@@ -28,17 +28,25 @@ public enum TextNormalization {
         }))
     }
 
-    /// True when every scalar is in a CJK Unified Ideographs block (basic or extensions A–H).
+    /// Han ideograph blocks: CJK Unified Ideographs (basic and Extensions A–J) and
+    /// CJK Compatibility Ideographs (and their Supplement).
+    static let hanIdeographRanges: [ClosedRange<UInt32>] = [
+        0x3400...0x4DBF,   // Extension A
+        0x4E00...0x9FFF,   // CJK Unified Ideographs
+        0xF900...0xFAFF,   // CJK Compatibility Ideographs
+        0x20000...0x2A6DF, // Extension B
+        0x2A700...0x2EBEF, // Extensions C, D, E, F
+        0x2EBF0...0x2EE5F, // Extension I
+        0x2F800...0x2FA1F, // CJK Compatibility Ideographs Supplement
+        0x30000...0x3134F, // Extension G
+        0x31350...0x323AF, // Extension H
+        0x323B0...0x3347F, // Extension J
+    ]
+
+    /// True when every scalar lies in one of `hanIdeographRanges`.
     public static func isAllHanIdeographs(_ text: String) -> Bool {
         !text.isEmpty && text.unicodeScalars.allSatisfy { scalar in
-            switch scalar.value {
-            case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF,
-                 0x20000...0x2A6DF, 0x2A700...0x2EBEF, 0x2EBF0...0x2EE5F,
-                 0x30000...0x3134F, 0x31350...0x323AF:
-                true
-            default:
-                false
-            }
+            hanIdeographRanges.contains { $0.contains(scalar.value) }
         }
     }
 }

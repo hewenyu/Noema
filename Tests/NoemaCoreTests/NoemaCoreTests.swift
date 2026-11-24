@@ -92,8 +92,28 @@ import Testing
     @Test(arguments: [0, 2, -1])
     func rejectsUnsupportedVersion(_ raw: Int) throws {
         let json = #"{"version":\#(raw),"sequence":1,"kind":"test.ping","payload":{"text":"x"}}"#
-        #expect(throws: IPCEnvelope<Ping>.UnsupportedVersion(found: raw)) {
+        #expect(throws: IPCError.unsupportedVersion(found: raw)) {
             try JSONDecoder().decode(IPCEnvelope<Ping>.self, from: Data(json.utf8))
+        }
+    }
+
+    /// The version error does not depend on the payload type, so one catch serves
+    /// every envelope.
+    @Test func unsupportedVersionErrorIsPayloadIndependent() {
+        let json = #"{"version":9,"sequence":1,"kind":"test.ping","payload":{"text":"x"}}"#
+        let errors: [IPCError?] = [
+            decodeError { try JSONDecoder().decode(IPCEnvelope<Ping>.self, from: Data(json.utf8)) },
+            decodeError { try JSONDecoder().decode(IPCEnvelope<[String: String]>.self, from: Data(json.utf8)) },
+        ]
+        #expect(errors == [.unsupportedVersion(found: 9), .unsupportedVersion(found: 9)])
+    }
+
+    private func decodeError(_ body: () throws -> some Any) -> IPCError? {
+        do {
+            _ = try body()
+            return nil
+        } catch {
+            return error as? IPCError
         }
     }
 
@@ -124,5 +144,26 @@ import Testing
         #expect(!TextNormalization.isAllHanIdeographs("你好!"))
         #expect(!TextNormalization.isAllHanIdeographs("かな"))
         #expect(!TextNormalization.isAllHanIdeographs(""))
+    }
+
+    /// First and last code point of every accepted block, plus the gaps around them.
+    @Test(arguments: [
+        0x3400, 0x4DBF, 0x4E00, 0x9FFF, 0xF900, 0xFAFF,
+        0x20000, 0x2A6DF, 0x2A700, 0x2B73F, 0x2B740, 0x2B820, 0x2CEB0, 0x2EBEF,
+        0x2EBF0, 0x2EE5F, 0x2F800, 0x2FA1F, 0x30000, 0x3134F, 0x31350, 0x323AF,
+        0x323B0, 0x3347F,
+    ] as [UInt32])
+    func hanIdeographBlockBoundaries(_ value: UInt32) throws {
+        let scalar = try #require(Unicode.Scalar(value))
+        #expect(TextNormalization.isAllHanIdeographs(String(scalar)), "U+\(String(value, radix: 16, uppercase: true))")
+    }
+
+    @Test(arguments: [
+        0x33FF, 0x4DC0, 0x4DFF, 0xA000, 0xF8FF, 0xFB00,
+        0x1FFFF, 0x2A6E0, 0x2A6FF, 0x2EE60, 0x2F7FF, 0x2FA20, 0x2FFFF, 0x33480,
+    ] as [UInt32])
+    func nonHanNeighboursAreRejected(_ value: UInt32) throws {
+        let scalar = try #require(Unicode.Scalar(value))
+        #expect(!TextNormalization.isAllHanIdeographs(String(scalar)), "U+\(String(value, radix: 16, uppercase: true))")
     }
 }

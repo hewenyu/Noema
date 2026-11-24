@@ -16,6 +16,13 @@ public struct IPCProtocolVersion: Sendable, Hashable, Codable, Comparable, RawRe
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
+/// Errors raised while reading IPC messages. One type for every payload, so callers
+/// can match it without knowing the envelope's `Payload`.
+public enum IPCError: Error, Sendable, Hashable {
+    /// The envelope declares a protocol version outside `IPCProtocolVersion.supported`.
+    case unsupportedVersion(found: Int)
+}
+
 /// A versioned, correlated message between Noema processes.
 public struct IPCEnvelope<Payload: Codable & Sendable>: Codable, Sendable {
     public let version: IPCProtocolVersion
@@ -32,15 +39,6 @@ public struct IPCEnvelope<Payload: Codable & Sendable>: Codable, Sendable {
         self.payload = payload
     }
 
-    /// Thrown when decoding an envelope whose version this build does not support.
-    public struct UnsupportedVersion: Error, Sendable, Equatable {
-        public let found: Int
-
-        public init(found: Int) {
-            self.found = found
-        }
-    }
-
     private enum CodingKeys: String, CodingKey {
         case version, sequence, kind, payload
     }
@@ -48,7 +46,7 @@ public struct IPCEnvelope<Payload: Codable & Sendable>: Codable, Sendable {
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let version = try container.decode(IPCProtocolVersion.self, forKey: .version)
-        guard version.isSupported else { throw UnsupportedVersion(found: version.rawValue) }
+        guard version.isSupported else { throw IPCError.unsupportedVersion(found: version.rawValue) }
         self.version = version
         sequence = try container.decode(UInt64.self, forKey: .sequence)
         kind = try container.decode(String.self, forKey: .kind)

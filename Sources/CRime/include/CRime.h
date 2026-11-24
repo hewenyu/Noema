@@ -9,15 +9,26 @@
 extern "C" {
 #endif
 
+#pragma clang assume_nonnull begin
+
 // Function-like macros in rime_api.h (RIME_STRUCT_INIT, RIME_STRUCT_CLEAR) are not
 // importable into Swift; these helpers zero a struct and set its data_size.
-void noema_rime_traits_init(RimeTraits *traits);
-void noema_rime_context_init(RimeContext *context);
-void noema_rime_status_init(RimeStatus *status);
-void noema_rime_commit_init(RimeCommit *commit);
+// A NULL argument is ignored.
+void noema_rime_traits_init(RimeTraits *_Nullable traits);
+void noema_rime_context_init(RimeContext *_Nullable context);
+void noema_rime_status_init(RimeStatus *_Nullable status);
+void noema_rime_commit_init(RimeCommit *_Nullable commit);
 
-// Returns 1 when rime_get_api() yields a table that provides the members Noema calls.
+// Thread-safe rime_get_api(). Upstream fills a function-local static table on first
+// call without synchronization, so concurrent first calls race; this wrapper runs
+// that first call exactly once (pthread_once) and returns the same table afterwards.
+// Every Noema caller goes through this, never rime_get_api() directly.
+RimeApi *_Nullable noema_rime_get_api(void);
+
+// Returns 1 when noema_rime_get_api() yields a table that provides the members Noema calls.
 int noema_rime_api_available(void);
+
+#pragma clang assume_nonnull end
 
 #ifdef __cplusplus
 }
