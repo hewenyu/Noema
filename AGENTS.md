@@ -9,6 +9,12 @@ AGENTS.md       standing orders for every agent and contributor (this file)
 CLAUDE.md       symlink to AGENTS.md
 README.md       what Noema is and where to start
 .agents/notes/  decision records: why, and what was given up (.agents/notes/README.md)
+Package.swift   SwiftPM manifest (tools 6.2, macOS 26, Swift 6 mode)
+Sources/        CRime (C bridge), NoemaCore, NoemaEngine, NoemaText, NoemaIPC, noema-cli
+Tests/          Swift Testing suites; CRimeTests drive the real librime
+vendor/         librime.lock: pinned librime, plugin, and Boost inputs
+scripts/build/  librime.sh: builds vendor-out/librime (ignored)
+scripts/dev/    doctor.sh (toolchain check), test.sh (CLT Swift Testing wrapper)
 ```
 
 ## Commands
@@ -16,10 +22,12 @@ README.md       what Noema is and where to start
 ```sh
 # Search decision memory (ripgrep is not installed here; use grep)
 grep -rli "<term>" .agents/notes/implemented .agents/notes/rejected .agents/notes/proposed | xargs head -n 3
+scripts/dev/doctor.sh                    # toolchain and librime readiness
+scripts/build/librime.sh                 # build librime once; skips when up to date
+scripts/dev/test.sh [--filter CRimeTests]  # never bare `swift test`
+swift build -c release --arch arm64
 git status --short
 ```
-
-No build or test commands exist yet.
 
 ## Before designing a change
 
