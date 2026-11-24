@@ -1,0 +1,74 @@
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch: {}
+
+jobs:
+  governance:
+    runs-on: darwin/arm64
+    inputs: ["**"]
+    resources: { cpu: 1, memory: 1Gi }
+    timeout-minutes: 5
+    steps:
+      - name: Governance and boundary checks
+        run: scripts/governance/check.sh
+
+  rime-deps:
+    runs-on: darwin/arm64
+    inputs:
+      - vendor/librime.lock
+      - scripts/build/librime.sh
+    network: true
+    resources: { cpu: 2, memory: 4Gi }
+    timeout-minutes: 30
+    steps:
+      - name: Build self-contained librime
+        run: scripts/build/librime.sh --out vendor-out/librime
+    outputs:
+      librime: vendor-out/librime/
+
+  test:
+    runs-on: darwin/arm64
+    needs: [rime-deps]
+    inputs:
+      - Package.swift
+      - Sources/
+      - Tests/
+      - vendor/librime.lock
+      - scripts/build/librime.sh
+      - scripts/dev/test.sh
+    fetch:
+      - { from: rime-deps.librime, to: vendor-out/librime/ }
+    resources: { cpu: 2, memory: 4Gi }
+    timeout-minutes: 15
+    steps:
+      - name: Run Swift Testing and headless librime suites
+        run: scripts/dev/test.sh
+
+  bundle:
+    runs-on: darwin/arm64
+    needs: [rime-deps]
+    inputs:
+      - Package.swift
+      - Sources/
+      - Resources/
+      - vendor/librime.lock
+      - scripts/build/librime.sh
+      - scripts/build/bundle.sh
+      - scripts/build/verify-bundle.sh
+    fetch:
+      - { from: rime-deps.librime, to: vendor-out/librime/ }
+    env:
+      NOEMA_VERSION: "0.0.0-ci"
+      NOEMA_BUILD: "1"
+    resources: { cpu: 2, memory: 4Gi }
+    timeout-minutes: 15
+    steps:
+      - name: Assemble and verify NoemaIME.app
+        run: |
+          scripts/build/bundle.sh --sign - --out dist
+          scripts/build/verify-bundle.sh dist/NoemaIME.app

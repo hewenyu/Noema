@@ -1,0 +1,7 @@
+{
+  "//": "Word ceilings for standing documents, checked by scripts/governance/verify-doc-budgets.mjs.",
+  "AGENTS.md": 800,
+  ".agents/notes/README.md": 750,
+  "docs/AGENTS.md": 600,
+  "docs/architecture.md": 1600
+}
