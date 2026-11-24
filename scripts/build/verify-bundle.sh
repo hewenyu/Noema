@@ -58,6 +58,11 @@ done
 if [[ ! -d "${CONTENTS}/Resources/opencc" || -z "$(ls -A "${CONTENTS}/Resources/opencc" 2>/dev/null)" ]]; then
   bad "Contents/Resources/opencc is missing or empty"
 fi
+# The built-in Rime schema that RimeEngine loads as shared_data_dir.
+for file in default.yaml noema_pinyin.schema.yaml noema_pinyin.dict.yaml; do
+  [[ -f "${CONTENTS}/Resources/rime-default/${file}" && ! -L "${CONTENTS}/Resources/rime-default/${file}" ]] \
+    || bad "missing regular file: Contents/Resources/rime-default/${file}"
+done
 if (( failures > 0 )); then
   log "${failures} check(s) failed; layout is incomplete, skipping the remaining checks"
   exit 1

@@ -14,6 +14,7 @@ Package.swift   SwiftPM manifest (tools 6.2, macOS 26, Swift 6 mode)
 Sources/        CRime (C bridge), NoemaCore, NoemaEngine, NoemaText, NoemaIPC, noema-cli, NoemaIME
 Tests/          Swift Testing suites; CRimeTests drive the real librime
 Resources/IME/  NoemaIME.app Info.plist template, entitlements, icon generator
+Resources/rime-default/  built-in minimal pinyin schema (Rime shared_data_dir)
 vendor/         librime.lock: pinned librime, plugin, and Boost inputs
 scripts/build/  librime.sh (vendor-out/librime), bundle.sh + verify-bundle.sh (dist/NoemaIME.app)
 scripts/dev/    doctor.sh (toolchain check), test.sh (CLT Swift Testing wrapper)

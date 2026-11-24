@@ -20,6 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 LIBRIME_DIR="${REPO_ROOT}/vendor-out/librime"
 IME_RESOURCES="${REPO_ROOT}/Resources/IME"
+RIME_DEFAULT="${REPO_ROOT}/Resources/rime-default"
+RIME_DEFAULT_FILES=(default.yaml noema_pinyin.schema.yaml noema_pinyin.dict.yaml)
 ENTITLEMENTS="${IME_RESOURCES}/NoemaIME.entitlements"
 APP_NAME="NoemaIME.app"
 BUNDLE_ID="dev.noema.inputmethod.NoemaIME"
@@ -96,6 +98,9 @@ done
 [[ -f "${IME_RESOURCES}/Info.plist.in" && -f "${ENTITLEMENTS}" && -f "${IME_RESOURCES}/generate-icons.swift" ]] \
   || die "Resources/IME is incomplete (Info.plist.in, NoemaIME.entitlements, generate-icons.swift)"
 plutil -lint -s "${ENTITLEMENTS}" || die "invalid entitlements plist: ${ENTITLEMENTS}"
+for file in "${RIME_DEFAULT_FILES[@]}"; do
+  [[ -f "${RIME_DEFAULT}/${file}" && ! -L "${RIME_DEFAULT}/${file}" ]] || die "Resources/rime-default is incomplete: missing ${file}"
+done
 
 # ---------------------------------------------------------------------------
 # Inputs: a current librime and a release NoemaIME
@@ -267,6 +272,9 @@ cp "${BIN_DIR}/NoemaIME" "${contents}/MacOS/NoemaIME"
 cp "${LIBRIME_DIR}/lib/librime.1.dylib" "${contents}/Frameworks/librime.1.dylib"
 chmod 0755 "${contents}/MacOS/NoemaIME" "${contents}/Frameworks/librime.1.dylib"
 ditto "${LIBRIME_DIR}/share/opencc" "${contents}/Resources/opencc"
+# Built-in Rime schema sources (shared_data_dir); the engine deploys them into the
+# user data directory, so the signed bundle stays read-only.
+ditto "${RIME_DEFAULT}" "${contents}/Resources/rime-default"
 
 swift "${IME_RESOURCES}/generate-icons.swift" "${ICON_DIR}" >&2 || die "icon generation failed"
 /usr/bin/iconutil -c icns -o "${contents}/Resources/NoemaIME.icns" "${ICON_DIR}/NoemaIME.iconset" \

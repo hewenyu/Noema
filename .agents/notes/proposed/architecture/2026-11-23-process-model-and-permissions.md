@@ -14,6 +14,9 @@ Status: proposed
   - 方案 A：`librime` 在 M0 暂驻 IMKit 进程，运行于 `@MainActor`，单键处理预算 `<1ms`。
   - 通过 `TypingEngine` 协议解耦按键处理与 Rime 实现，未来可无缝外迁到 XPC 服务而不改调用方。
   - 启动 Safe Mode：若上一次启动在加载方案/词库时崩溃，下一次以最小方案启动并直通 ASCII，避免崩溃循环导致无法打字。
+  - Safe Mode 的判定由 `BootGuard` 承担（`Sources/NoemaEngine/BootGuard.swift`）：先对 `<user_data_dir>/.noema-rime.lock` 取非阻塞 `flock`，拿不到即 `userDataDirLocked`，不读写哨兵也不打开 LevelDB；再读 `.noema-boot-guard`（`O_NOFOLLOW`，损坏、软链或非普通文件即 `bootGuardCorrupted`），连续未完成启动达到阈值（默认 2）即 `bootCrashLoop`，否则以临时文件 + `fsync` + `rename(2)` 递增计数（写不进即 `userDataDirUnwritable`），加载成功后删除哨兵。部署或建会话失败为 `engineInitFailed`。Safe Mode 下引擎零 `librime` 调用，所有按键 `handled: false`。
+  - 进程内同一时刻只允许一个持有 `librime` 的 `RimeEngine`（第二个确定性抛错），`setup` 每进程只调一次：`librime` 是进程级单例，两个引擎会共享 deployer 与会话表。
+  - 内置最小拼音方案 `Resources/rime-default/`（`script_translator`，原创小词表）作为 `shared_data_dir` 随包分发；完整词库仍走 [lexicon note](2026-11-23-lexicon-canonical-and-userdb-isolation.md) 的下载与部署流程。
   - 密码框：`IsSecureEventInputEnabled()` 为真时立即直通并隐藏所有浮窗。
   - 任何热路径超时或异常一律 `return false` 直通 ASCII，永不吞键。
 - **`Noema.app`（伴生 Agent，LaunchAgent 常驻）**：集中持有 Accessibility / Microphone / Speech Recognition 等 TCC 授权，承载 Settings、Clipboard、Voice、AI HUD 等 UI 与后台能力。
@@ -27,6 +30,9 @@ Status: proposed
 
 - **单进程，把所有能力都塞进 IMKit。** Rejected：网络、ASR、模型推理与 AX 遍历会把不可控的延迟和崩溃面带入按键热路径；TCC 授权绑定在输入法 bundle 上，每次重签名或重装都可能漂移；输入法崩溃会影响所有 App 的输入。
 - **M0 即把 `librime` 拆成独立 RimeEngine XPC Service。** 暂缓（not now）：M0 的首要风险是把基本输入跑通，额外的 XPC 往返与生命周期管理会增加延迟预算与调试成本，而 `librime` 本身在进程内 `<1ms` 已满足需求。通过 `TypingEngine` 协议保留外迁接口。重启外迁的条件：实测 Rime 导致 IMKit 进程崩溃或单键 p99 超过 `1ms` 预算，或需要在多个前台进程间共享同一 Rime 会话。
+- **崩溃计数放在 `UserDefaults` 或依赖 launchd 重启次数。** Rejected：`UserDefaults` 写入是异步合并的，崩溃前的递增可能丢失，计数永远到不了阈值；launchd 不管理 IMKit 进程的重启。哨兵与它保护的 `user_data_dir` 放在一起，`rename(2)` 保证崩溃后只见新旧两种记录之一。
+- **单写者锁用阻塞 `flock` 或 PID 文件。** Rejected：阻塞等待会卡住按键热路径；PID 文件在崩溃后残留，需要猜测进程是否存活，而 `flock` 在持有者退出（包括 `SIGKILL`）时由内核释放。
+- **随包内置雾凇或万象作为默认方案。** Rejected：数十 MB 的词库违反大文件红线，并让 Safe Mode 之外的首次启动依赖重型部署；内置原创最小方案只保证"能打字"。
 - **在 IMKit 与 Agent 之间用 `CGEventTap` 监听全局按键。** Rejected：需要 Input Monitoring/Accessibility 权限，违背 IMKit 零 TCC 红线；全局按键监听是高敏感能力，与 IMKit 的事件流重复且存在顺序竞争；在安全输入模式下行为不可预测，存在泄露密码的风险。
 
 ## Acceptance criteria
@@ -37,6 +43,7 @@ Status: proposed
 - `⌘C` 回退事务在 `changeCount` 未变时返回中止结果，不返回剪贴板旧内容（负控测试覆盖）。
 - AI 建议到达后，候选首位与到达前一致；建议只出现在 `✨` 槽位。
 - 带过期 `generationID` 的 IPC 响应被丢弃。
+- 预置连续失败计数达到阈值、损坏哨兵、外部持有锁、只读目录、部署失败五种情况下，`RimeEngine` 进入对应 Safe Mode 原因且所有按键 `handled: false`；`recoverFromSafeMode()` 在条件解除后恢复输入（`Tests/CRimeTests/RimeEngineTests.swift`）。
 
 ## Risks
 
