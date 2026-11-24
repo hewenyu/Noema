@@ -1,0 +1,10 @@
+# SwiftPM and local build output
+.build/
+.swiftpm/
+Package.resolved
+
+# Locally built librime (scripts/build/librime.sh)
+vendor-out/
+
+# macOS
+.DS_Store

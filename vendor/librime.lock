@@ -1,0 +1,12 @@
+# Pinned inputs for scripts/build/librime.sh. KEY=VALUE only; no shell syntax.
+# Changing any line invalidates vendor-out/librime/.lock-sha256 and forces a rebuild.
+LIBRIME_REPO=https://github.com/rime/librime.git
+LIBRIME_COMMIT=f71eac9a4d6063ec926a5d7bec4575d30785b3ee
+LIBRIME_LUA_REPO=https://github.com/hchunhui/librime-lua.git
+LIBRIME_LUA_COMMIT=6da5d6cedb853380ed1b5b9b6979cb1a9c028353
+LIBRIME_LUA_THIRDPARTY_COMMIT=9e5bb71db1544913f8005dadc3df8439c00d08b7
+LIBRIME_OCTAGRAM_REPO=https://github.com/lotem/librime-octagram.git
+LIBRIME_OCTAGRAM_COMMIT=57d18b9f58e5284bd891d559f6bdd16cf60341e9
+BOOST_VERSION=1.92.0
+BOOST_URL=https://archives.boost.io/release/1.92.0/source/boost_1_92_0.tar.gz
+BOOST_SHA256=c4a3b310ddd2472416e091067166b0713be97c63f38c212c484ada022fd296ce
