@@ -8,3 +8,6 @@ vendor-out/
 
 # macOS
 .DS_Store
+
+# Assembled app bundles (scripts/build/bundle.sh)
+dist/
