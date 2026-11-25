@@ -73,7 +73,8 @@ public struct CandidatePanelLayout: Sendable, Hashable {
 /// preedit strip) panels are capsules: the corner radius is half the height. Expanded
 /// panels list one candidate per row; any multi-row panel uses `expandedCornerRadius`.
 /// The expand button is pinned to the trailing edge of the hysteresis width, so the slack
-/// sits between the last candidate and the button.
+/// sits between the last candidate and the button. A page whose single row cannot fit in
+/// `maxPanelWidth` even after truncation is always laid out expanded, without the button.
 public struct CandidateLayoutEngine: Sendable {
     public let style: CandidatePanelStyle
 
@@ -100,35 +101,49 @@ public struct CandidateLayoutEngine: Sendable {
         let pillHeight = contentHeight + 2 * s.pillVerticalInset
         let baselineInPill = s.pillVerticalInset + (contentHeight - candidateLineHeight) / 2 + fonts.candidate.ascent
         let hasCandidates = !state.candidates.isEmpty
-        let buttonArea = hasCandidates ? s.expandButtonGap + s.expandButtonWidth : 0
-        let fixed = 2 * s.horizontalPadding + buttonArea
+        let maxWidth = max(s.maxPanelWidth, s.minPanelWidth)
 
         // 1. Measure every candidate.
-        var measured = state.candidates.enumerated().map { index, item in
+        let originalMeasured = state.candidates.enumerated().map { index, item in
             MeasuredItem(index: index, item: item, fonts: fonts, style: s)
         }
 
-        // 2. Keep the widest row within maxPanelWidth: drop comments, then truncate text.
-        let maxWidth = max(s.maxPanelWidth, s.minPanelWidth)
-        if expanded {
+        // 2. Fit the page into one row within maxPanelWidth (with room for the button):
+        //    drop comments, then truncate text to a common cap, then re-measure. Labels,
+        //    insets, spacing, and the "…" itself never shrink, so a large page (Rime
+        //    `menu/page_size: 20`) can still overflow; such a page cannot collapse.
+        let collapsedFixed = 2 * s.horizontalPadding + (hasCandidates ? s.expandButtonGap + s.expandButtonWidth : 0)
+        func rowWidth(_ items: [MeasuredItem]) -> CGFloat {
+            collapsedFixed + items.reduce(0) { $0 + $1.width } + s.itemSpacing * CGFloat(max(items.count - 1, 0))
+        }
+        var collapsedMeasured = originalMeasured
+        if rowWidth(collapsedMeasured) > maxWidth {
+            for i in collapsedMeasured.indices { collapsedMeasured[i].dropComment() }
+        }
+        let overflow = rowWidth(collapsedMeasured) - maxWidth
+        if overflow > 0 {
+            let textBudget = collapsedMeasured.reduce(0) { $0 + $1.textWidth } - overflow
+            let cap = Self.waterLevel(collapsedMeasured.map(\.textWidth), budget: textBudget)
+            for i in collapsedMeasured.indices { collapsedMeasured[i].truncate(toTextWidth: cap, font: fonts.candidate.font) }
+        }
+        let canCollapse = !hasCandidates || rowWidth(collapsedMeasured) <= maxWidth
+
+        // A page that cannot collapse is laid out expanded, without the (dead) button.
+        let effectiveExpanded = expanded || !canCollapse
+        let showExpandButton = hasCandidates && canCollapse
+        let buttonArea = showExpandButton ? s.expandButtonGap + s.expandButtonWidth : 0
+        let fixed = 2 * s.horizontalPadding + buttonArea
+        var measured: [MeasuredItem]
+        if effectiveExpanded {
+            // Expanded rows start from the untruncated measurements; each row fits on its own.
+            measured = originalMeasured
             for i in measured.indices where fixed + measured[i].width > maxWidth {
                 measured[i].dropComment()
                 let cap = maxWidth - fixed - (measured[i].width - measured[i].textWidth)
                 measured[i].truncate(toTextWidth: cap, font: fonts.candidate.font)
             }
         } else {
-            func rowWidth() -> CGFloat {
-                fixed + measured.reduce(0) { $0 + $1.width } + s.itemSpacing * CGFloat(max(measured.count - 1, 0))
-            }
-            if rowWidth() > maxWidth {
-                for i in measured.indices { measured[i].dropComment() }
-            }
-            let overflow = rowWidth() - maxWidth
-            if overflow > 0 {
-                let textBudget = measured.reduce(0) { $0 + $1.textWidth } - overflow
-                let cap = Self.waterLevel(measured.map(\.textWidth), budget: textBudget)
-                for i in measured.indices { measured[i].truncate(toTextWidth: cap, font: fonts.candidate.font) }
-            }
+            measured = collapsedMeasured
         }
 
         // 3. Measure the preedit strip.
@@ -142,7 +157,7 @@ public struct CandidateLayoutEngine: Sendable {
 
         // 4. Content width, then the hysteresis width.
         var contentWidth: CGFloat
-        if expanded {
+        if effectiveExpanded {
             contentWidth = fixed + (measured.map(\.width).max() ?? 0)
         } else {
             contentWidth = fixed + measured.reduce(0) { $0 + $1.width } + s.itemSpacing * CGFloat(max(measured.count - 1, 0))
@@ -152,7 +167,7 @@ public struct CandidateLayoutEngine: Sendable {
             contentWidth = max(contentWidth, min(stripWidth, maxWidth))
         }
         contentWidth = ceil(contentWidth)
-        let width = hysteresis.resolve(contentWidth: contentWidth, expanded: expanded)
+        let width = hysteresis.resolve(contentWidth: contentWidth, expanded: effectiveExpanded)
 
         // 5. Position, top-down.
         var y = s.verticalPadding
@@ -186,7 +201,7 @@ public struct CandidateLayoutEngine: Sendable {
         let expandedPillWidth = width - fixed
         for (position, item) in measured.enumerated() {
             let pill: CGRect
-            if expanded {
+            if effectiveExpanded {
                 pill = CGRect(x: s.horizontalPadding, y: y, width: expandedPillWidth, height: pillHeight)
                 y += pillHeight + (position == measured.count - 1 ? 0 : s.itemSpacing)
             } else {
@@ -197,18 +212,18 @@ public struct CandidateLayoutEngine: Sendable {
                 pill: pill, baselineInPill: baselineInPill, style: s,
                 highlighted: state.highlightedIndex == item.index))
         }
-        if hasCandidates && !expanded { y += pillHeight }
+        if hasCandidates && !effectiveExpanded { y += pillHeight }
 
         let height = ceil(y + s.verticalPadding)
-        let isCapsule = !expanded && stripLayout == nil
+        let isCapsule = !effectiveExpanded && stripLayout == nil
         let radius = isCapsule ? floor(height / 2) : min(s.expandedCornerRadius, floor(height / 2))
-        let button = hasCandidates
+        let button = showExpandButton
             ? CGRect(x: width - s.horizontalPadding - s.expandButtonWidth, y: firstRowY, width: s.expandButtonWidth, height: pillHeight)
             : nil
         let highlighted = items.first(where: \.isHighlighted)?.pillFrame
         return CandidatePanelLayout(
             panelSize: CGSize(width: width, height: height), contentWidth: contentWidth, cornerRadius: radius,
-            isExpanded: expanded, preeditStrip: stripLayout, items: items, highlightedPillFrame: highlighted,
+            isExpanded: effectiveExpanded, preeditStrip: stripLayout, items: items, highlightedPillFrame: highlighted,
             expandButtonFrame: button, generationID: state.generationID)
     }
 

@@ -660,6 +660,67 @@ extension LibrimeSerializedTests {
             #expect(client.inserts.isEmpty, "chevron clicks commit nothing")
         }
 
+        /// Real Rime with `menu/page_size: 20` (Codex review of PR #19): typing `s` fills a
+        /// 20-candidate page that cannot fit one capsule row even with every text cut to
+        /// "…". The shipped controller lays it out expanded with no dead collapse button,
+        /// every capsule inside the panel, and a real click on the last one commits it.
+        @Test func twentyCandidatePageExpandsInsideThePanel() throws {
+            let style = CandidatePanelStyle()
+            let controller = CandidatePanelController(style: style)
+            controller.screensProvider = {
+                [ScreenFrame(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                             visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 875))]
+            }
+            controller.shouldOrderFront = false
+            let recorder = RecordingPresenter()
+            let harness = try Harness(pageSize: 20, candidatePresenter: TeePresenter([recorder, controller]))
+            defer { harness.shutdown(); controller.hide() }
+            // Wired as `EngineHost` wires the shipped panel.
+            controller.onSelectCandidate = { [coordinator = harness.coordinator] index, generation in
+                _ = coordinator.selectCandidate(at: index, expectedGenerationID: generation)
+            }
+            let client = RecordingClient()
+            client.caretRect = CGRect(x: 400, y: 600, width: 1, height: 18)
+            let token = UUID()
+            #expect(harness.coordinator.handleKey(.text("s"), token: token, client: client))
+
+            let state = try #require(recorder.lastState)
+            #expect(state.candidates.count >= 15, "page_size 20 took effect: \(state.candidates.count)")
+            let options = try #require(recorder.lastOptions)
+            let direct = CandidateLayoutEngine(style: style).layout(state: state, options: options, expanded: false)
+            let layout = try #require(controller.currentLayout)
+            #expect(!controller.isExpanded, "nobody clicked the chevron")
+            for candidate in [direct, layout] {
+                #expect(candidate.isExpanded && candidate.expandButtonFrame == nil)
+                #expect(candidate.contentWidth <= candidate.panelSize.width, "\(candidate.contentWidth) > \(candidate.panelSize.width)")
+                #expect(candidate.panelSize.width <= style.maxPanelWidth)
+                #expect(candidate.items.count == state.candidates.count)
+                for item in candidate.items {
+                    #expect(item.pillFrame.minX >= 0 && item.pillFrame.maxX <= candidate.panelSize.width, "\(item.index): \(item.pillFrame)")
+                    #expect(item.pillFrame.minY >= 0 && item.pillFrame.maxY <= candidate.panelSize.height, "\(item.index): \(item.pillFrame)")
+                    #expect(candidate.hitTest(item.pillFrame.center) == .candidate(item.index))
+                }
+            }
+            #expect(direct.items.map(\.pillFrame) == layout.items.map(\.pillFrame))
+            let view = controller.panelViewForTesting
+            let panel = controller.panelForTesting
+            #expect(panel.frame.size == layout.panelSize && view.bounds.size == layout.panelSize)
+
+            // A real click on the last capsule commits the last candidate.
+            let last = try #require(layout.items.last)
+            let point = view.convert(last.pillFrame.center, to: nil)
+            client.calls.removeAll()
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = try #require(NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: 0,
+                    windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                    pressure: type == .leftMouseDown ? 1 : 0))
+                type == .leftMouseDown ? view.mouseDown(with: event) : view.mouseUp(with: event)
+            }
+            #expect(client.inserts == [state.candidates[last.index].text])
+            #expect(!harness.engine.currentState.isComposing && !controller.isVisible)
+        }
+
         @Test func pagingFromThePanelRefreshesCandidates() throws {
             let harness = try Harness()
             defer { harness.shutdown() }
@@ -775,6 +836,17 @@ final class RecordingPresenter: CandidatePresenting {
     }
 }
 
+/// Forwards every presenter call to each of `presenters`, in order.
+@MainActor
+final class TeePresenter: CandidatePresenting {
+    let presenters: [any CandidatePresenting]
+    init(_ presenters: [any CandidatePresenting]) { self.presenters = presenters }
+    func update(state: CompositionState, client: any TextInputClient, options: CandidatePresentationOptions) {
+        for presenter in presenters { presenter.update(state: state, client: client, options: options) }
+    }
+    func hide() { for presenter in presenters { presenter.hide() } }
+}
+
 /// A deployed engine on a throwaway workspace and a coordinator over it.
 @MainActor
 final class Harness {
@@ -784,15 +856,22 @@ final class Harness {
     let coordinator: InputSessionCoordinator
     private var isUp = true
 
+    /// `pageSize` overrides the shipped `menu/page_size: 5` in a copied `default.yaml`.
     init(
         withoutPunctuator: Bool = false,
+        pageSize: Int? = nil,
         isSecureInputEnabled: @escaping @MainActor () -> Bool = { false },
         inlinePreeditDisabledBundleIDs: Set<String> = [],
         candidatePresenter: (any CandidatePresenting)? = nil
     ) throws {
-        if withoutPunctuator {
+        if withoutPunctuator || pageSize != nil {
             workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
-            try workspace.replaceInSharedFile("noema_pinyin.schema.yaml", "    - punctuator\n", with: "")
+            if withoutPunctuator {
+                try workspace.replaceInSharedFile("noema_pinyin.schema.yaml", "    - punctuator\n", with: "")
+            }
+            if let pageSize {
+                try workspace.replaceInSharedFile("default.yaml", "page_size: 5", with: "page_size: \(pageSize)")
+            }
         } else {
             workspace = try EngineWorkspace()
         }

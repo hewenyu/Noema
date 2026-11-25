@@ -9,7 +9,7 @@ M1 需要一个真正可用的候选窗（Issue #6）：每次按键都要在 2 
 ## Decision
 
 - **模块**：新 `NoemaUI` 库（依赖 `NoemaCore`、`NoemaIMEShell`）实现 `CandidatePresenting`，受 `check-imports.sh` 同样的零 TCC 扫描；只用 `AppKit`、`CoreText`、`QuartzCore`、`CoreGraphics`，不用 `ApplicationServices`。
-- **布局与绘制**：`CandidateLayoutEngine` 用 CoreText（`CTFontCreateUIFontForLanguage(.system, …, "zh-Hans")`，系统级联覆盖 Apple Color Emoji 与拉丁文）测量标签、候选、注释与浮动预编辑（`CTLineGetOffsetForStringIndex` 定位光标），产出纯值 `CandidatePanelLayout`（`Sendable`、`Hashable`，不含 `CTLine`/`CTFont`/`CGColor`），可无头测试。单行折叠时圆角为高度一半（胶囊）；展开为每行一个候选的列表，或有浮动预编辑时，圆角固定 14 pt。过宽时先丢注释，再按水位线截断候选并加"…"，截断按字素簇进行，不拆 ZWJ 表情。浮动预编辑超出面板宽度时在 `PreeditStripLayout.clipRect` 内水平滚动（`scrollOffset`）：光标在尾部留白之前不滚动，之后只滚到光标贴住留白、最多滚到文本末尾，因此光标条始终在 `clipRect` 内；文本与光标裁剪到 `clipRect` 绘制，不越出面板边缘。
+- **布局与绘制**：`CandidateLayoutEngine` 用 CoreText（`CTFontCreateUIFontForLanguage(.system, …, "zh-Hans")`，系统级联覆盖 Apple Color Emoji 与拉丁文）测量标签、候选、注释与浮动预编辑（`CTLineGetOffsetForStringIndex` 定位光标），产出纯值 `CandidatePanelLayout`（`Sendable`、`Hashable`，不含 `CTLine`/`CTFont`/`CGColor`），可无头测试。单行折叠时圆角为高度一半（胶囊）；展开为每行一个候选的列表，或有浮动预编辑时，圆角固定 14 pt。过宽时先丢注释，再按水位线截断候选并加"…"，截断按字素簇进行，不拆 ZWJ 表情。截断后重新测量整行：标签、内边距、间距与"…"本身不会缩小，`menu/page_size: 20` 这类大页即使全部截成"…"仍超出 `maxPanelWidth`，此时该页自动按展开列表布局（用未截断的测量值），并隐藏无法收起的展开按钮（Codex 审查 PR #19）。浮动预编辑超出面板宽度时在 `PreeditStripLayout.clipRect` 内水平滚动（`scrollOffset`）：光标在尾部留白之前不滚动，之后只滚到光标贴住留白、最多滚到文本末尾，因此光标条始终在 `clipRect` 内；文本与光标裁剪到 `clipRect` 绘制，不越出面板边缘。
 - **视图**：`CandidatePanelView` 与其子视图全部 `isFlipped`，布局、高亮 `CAShapeLayer`、CoreText 绘制与点击命中共用自上而下坐标；每次 `CTLineDraw` 前围绕基线反转文本矩阵。蓝色胶囊高亮在文本视图下方的独立宿主视图里（图层自身的 sublayer 会盖住其 `draw(_:)` 内容），关闭隐式动画更新。点击按代次绑定：`mouseDown` 记下命中目标与当时布局的 `generationID`，`apply(_:)` 换到别的代次即取消这次按下，`mouseUp` 只在同一代次、同一目标上触发，并回报按下时的代次，所以在旧面板上按下、刷新后松开不会提交新候选。动态颜色只在 `effectiveAppearance.performAsCurrentDrawingAppearance` 内解析，`draw(_:)` 与 `viewDidChangeEffectiveAppearance()` 都会解析。
 - **零闪烁**：`WidthHysteresis` 把宽度向上量化到 32 pt 档位，同一组合与同一模式内只增不减，`hide()` 与模式切换时重置；展开按钮钉在量化宽度的尾部。控制器复用一个 `NSPanel`，只在隐藏 → 可见时 `orderFrontRegardless()`，frame 变化时才 `setFrame`，且先改 panel frame 再 `apply` 布局，子视图在 `layout()` 里取 `bounds`；图层修改都在关闭动作的 `CATransaction` 里，`animationBehavior = .none`。
 - **窗口**：`NonActivatingCandidatePanel` 的 `canBecomeKey`/`canBecomeMain` 为 false，`.nonactivatingPanel`；层级为客户端窗口层级 + 1，至少 `.popUpMenu`，至多屏保层级，因此浮在 Spotlight/Raycast 之上。背景默认 `NSGlassEffectView`（无窗口阴影），`.visualEffect` 模式用 `NSVisualEffectView`（`.hudWindow`，有阴影）。
@@ -26,6 +26,7 @@ M1 需要一个真正可用的候选窗（Issue #6）：每次按键都要在 2 
 - **用 `screen.frame.intersects(caretRect)` 判断光标是否在屏上。** Rejected：CoreGraphics 把宽度为 0 的矩形视为空，合法的竖直光标会被判无效，候选窗退回鼠标位置；1×1 探针加 2 pt 容差在屏幕边缘也成立。
 - **用 AX（`AXUIElement`）读取光标位置。** Rejected：需要辅助功能授权，违反零 TCC（规则 1），`check-imports.sh` 也会拒绝。
 - **`firstRect` 回退直接用相对下标。** Rejected：`firstRect(forCharacterRange:)` 取文档下标，相对下标 0 指向文档第一行，长文档中候选窗会放到错误的行（Codex 审查 PR #19）。
+- **大页单行截断后不再复核宽度。** Rejected：`page_size: 20` 时 `contentWidth` 为 923 pt，而迟滞宽度夹在 720 pt，末个胶囊越过展开按钮与面板右缘，无法看到也无法点击（Codex 审查 PR #19）。
 - **浮动预编辑过宽时截断或换行。** Rejected：截断会把光标所在部分藏起来，换行让面板高度逐键变化；在裁剪区内水平滚动保持高度不变且光标始终可见。
 - **子视图用 `autoresizingMask` 跟随面板，并在 `apply` 里按 `panelSize` 直接设 frame。** Rejected：先设子视图 frame 再 `setFrame` 时，AppKit 把尺寸差再叠加一次，展开/收起后子视图变成 `(0, 276)`、`(352, 0)`（Codex 审查 PR #19）。
 - **把高亮画在 `draw(_:)` 里。** Rejected：高亮随选择移动时整块重绘；独立 `CAShapeLayer` 只改路径，并可关闭隐式动画，避免从原点滑入的闪烁。

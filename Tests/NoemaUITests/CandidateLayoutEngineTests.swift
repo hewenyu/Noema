@@ -128,8 +128,36 @@ import Testing
         let lastPill = try #require(many.items.last).pillFrame
         let manyButton = try #require(many.expandButtonFrame)
         #expect(lastPill.maxX <= manyButton.minX)
+        #expect(!many.isExpanded, "a page that fits after truncation stays a collapsed row")
+        #expect(many.contentWidth <= many.panelSize.width)
         let expanded = engine.layout(state: state([long]), options: inline, expanded: true)
         #expect(expanded.panelSize.width <= style.maxPanelWidth)
+    }
+
+    /// A 20-candidate page (Rime `menu/page_size: 20`) cannot fit one row even with every
+    /// text truncated to "…": labels, insets, and spacing alone overflow. The collapsed
+    /// request is laid out expanded, without a dead collapse button, every capsule inside
+    /// the panel and clickable (Codex review of PR #19).
+    @Test func pageTooWideForOneRowExpandsWithoutTheButton() throws {
+        let texts = ["是", "时", "事情", "市场", "使用", "十分", "式样", "师傅", "世界", "施工",
+                     "实现", "试验", "室内", "视频", "收到", "上海", "说明", "所以", "森林", "四个"]
+        let layout = engine.layout(state: state(texts, preedit: "s"), options: inline, expanded: false)
+        #expect(layout.isExpanded && layout.expandButtonFrame == nil)
+        #expect(layout.items.map(\.displayText) == texts, "readable, never crushed to …")
+        #expect(layout.contentWidth <= layout.panelSize.width && layout.panelSize.width <= style.maxPanelWidth)
+        #expect(layout.cornerRadius == style.expandedCornerRadius)
+        for item in layout.items {
+            #expect(item.pillFrame.minX >= style.horizontalPadding)
+            #expect(item.pillFrame.maxX <= layout.panelSize.width - style.horizontalPadding, "\(item.index): \(item.pillFrame)")
+            #expect(item.pillFrame.maxY <= layout.panelSize.height)
+            #expect(layout.hitTest(CGPoint(x: item.pillFrame.midX, y: item.pillFrame.midY)) == .candidate(item.index))
+        }
+        #expect(layout.items.map(\.index) == Array(0..<20))
+
+        // Explicitly expanded: the same rows, still no button that could not collapse.
+        let requested = engine.layout(state: state(texts, preedit: "s"), options: inline, expanded: true)
+        #expect(requested.isExpanded && requested.expandButtonFrame == nil)
+        #expect(requested.items.map(\.pillFrame) == layout.items.map(\.pillFrame))
     }
 
     @Test func emojiCandidatesAreDetectedAndNeverSplit() throws {
