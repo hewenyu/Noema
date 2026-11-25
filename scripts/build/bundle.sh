@@ -103,7 +103,7 @@ for file in "${RIME_DEFAULT_FILES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Inputs: a current librime and a release NoemaIME
+# Inputs: a current librime, a release NoemaIME, and a release noema-rime-deployer
 # ---------------------------------------------------------------------------
 
 LOCK_SHA256="$(shasum -a 256 "${REPO_ROOT}/vendor/librime.lock" | awk '{print $1}')"
@@ -115,10 +115,17 @@ cd "${REPO_ROOT}"
 # --disable-local-rpath drops SwiftPM's default @loader_path rpath, leaving only the
 # release @executable_path/../Frameworks rpath from Package.swift.
 SWIFT_BUILD=(swift build -c release --arch arm64 --disable-local-rpath)
-log "${SWIFT_BUILD[*]} --product NoemaIME"
-"${SWIFT_BUILD[@]}" --product NoemaIME >&2
+# noema-rime-deployer is the isolated Rime deployment subprocess RimeEngine runs from
+# Contents/MacOS; librime's deployer never runs inside NoemaIME.
+EXECUTABLES=(NoemaIME noema-rime-deployer)
+for product in "${EXECUTABLES[@]}"; do
+  log "${SWIFT_BUILD[*]} --product ${product}"
+  "${SWIFT_BUILD[@]}" --product "${product}" >&2
+done
 BIN_DIR="$("${SWIFT_BUILD[@]}" --show-bin-path)"
-[[ -f "${BIN_DIR}/NoemaIME" ]] || die "release build produced no ${BIN_DIR}/NoemaIME"
+for product in "${EXECUTABLES[@]}"; do
+  [[ -f "${BIN_DIR}/${product}" ]] || die "release build produced no ${BIN_DIR}/${product}"
+done
 
 # ---------------------------------------------------------------------------
 # Locked publish. Every run that publishes into the same --out holds one flock(2)
@@ -268,9 +275,12 @@ contents="${stage_app}/Contents"
 
 log "assembling ${APP_NAME}"
 mkdir -p "${contents}/MacOS" "${contents}/Frameworks" "${contents}/Resources"
-cp "${BIN_DIR}/NoemaIME" "${contents}/MacOS/NoemaIME"
+for product in "${EXECUTABLES[@]}"; do
+  cp "${BIN_DIR}/${product}" "${contents}/MacOS/${product}"
+  chmod 0755 "${contents}/MacOS/${product}"
+done
 cp "${LIBRIME_DIR}/lib/librime.1.dylib" "${contents}/Frameworks/librime.1.dylib"
-chmod 0755 "${contents}/MacOS/NoemaIME" "${contents}/Frameworks/librime.1.dylib"
+chmod 0755 "${contents}/Frameworks/librime.1.dylib"
 ditto "${LIBRIME_DIR}/share/opencc" "${contents}/Resources/opencc"
 # Built-in Rime schema sources (shared_data_dir); the engine deploys them into the
 # user data directory, so the signed bundle stays read-only.
@@ -309,6 +319,7 @@ else
   log "signing ad-hoc (no hardened runtime: CI only, not distributable)"
 fi
 sign "${contents}/Frameworks/librime.1.dylib"
+sign --entitlements "${ENTITLEMENTS}" "${contents}/MacOS/noema-rime-deployer"
 sign --entitlements "${ENTITLEMENTS}" "${contents}/MacOS/NoemaIME"
 sign --entitlements "${ENTITLEMENTS}" "${stage_app}"
 codesign --verify --strict "${stage_app}" || die "codesign --verify failed for the staged bundle"

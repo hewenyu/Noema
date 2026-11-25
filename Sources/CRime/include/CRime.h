@@ -29,7 +29,7 @@ RimeApi *_Nullable noema_rime_get_api(void);
 // Returns 1 when noema_rime_get_api() yields a table that provides the members Noema calls.
 int noema_rime_api_available(void);
 
-// True when the API table provides every member RimeEngine calls: setup, deployment,
+// True when the API table provides every member RimeEngine and noema-rime-deployer call: setup, deployment,
 // session lifecycle, key processing, candidate selection/paging, commit/context/status
 // readers with their free functions, and option get/set.
 bool noema_rime_engine_api_available(void);

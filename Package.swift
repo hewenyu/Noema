@@ -12,6 +12,7 @@ let package = Package(
     products: [
         .executable(name: "noema-cli", targets: ["noema-cli"]),
         .executable(name: "NoemaIME", targets: ["NoemaIME"]),
+        .executable(name: "noema-rime-deployer", targets: ["noema-rime-deployer"]),
     ],
     targets: [
         // C bridge to the vendored librime built by scripts/build/librime.sh.
@@ -37,11 +38,16 @@ let package = Package(
         .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine"]),
         // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
         .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine"]),
+        // Isolated Rime deployment subprocess, bundled beside NoemaIME in Contents/MacOS.
+        // RimeEngine runs it; librime's deployer never runs in the input method process.
+        .executableTarget(name: "noema-rime-deployer", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
         .testTarget(name: "NoemaCoreTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaText"]),
         // Pure engine logic (key mapping, boot guard); never initializes librime.
         .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine"]),
         // Every test that initializes librime: one top-level serialized suite.
-        .testTarget(name: "CRimeTests", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
+        // Depends on noema-rime-deployer so every `swift test` builds the deployer that
+        // RimeEngine spawns from the build directory.
+        .testTarget(name: "CRimeTests", dependencies: ["CRime", "NoemaCore", "NoemaEngine", "noema-rime-deployer"]),
     ],
     // Swift 6 language mode: complete strict-concurrency checking for every Swift target.
     swiftLanguageModes: [.v6]

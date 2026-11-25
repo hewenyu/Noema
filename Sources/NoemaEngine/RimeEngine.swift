@@ -5,12 +5,13 @@ import NoemaCore
 /// Where an engine finds its schemas and keeps its user data.
 public struct RimeEngineConfiguration: Sendable, Hashable {
     public enum DeployPolicy: String, Sendable, Hashable, Codable {
-        /// Deploy when the staged build or its deploy stamp is missing, or any shared data
-        /// file (recursively) or top-level user `*.custom.yaml` is not older than the stamp.
+        /// Deploy when `build/` fails `DeployManifest.validated` or its recorded inputs differ
+        /// from the current files under `sharedDataDir` and the top-level user `*.custom.yaml`.
         case deployIfNeeded
-        /// Always run a workspace deployment before loading.
+        /// Always run an isolated deployment before loading.
         case forceDeploy
-        /// Never deploy; a missing build enters Safe Mode (`engineInitFailed`).
+        /// Never deploy; a missing, incomplete, or tampered build enters Safe Mode
+        /// (`engineInitFailed`).
         case neverDeploy
     }
 
@@ -23,6 +24,12 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
     public var deployPolicy: DeployPolicy
     /// Consecutive unfinished boots that put the next boot into Safe Mode.
     public var bootFailureThreshold: Int
+    /// The `noema-rime-deployer` executable. Nil locates it next to the main executable
+    /// (`NoemaIME.app/Contents/MacOS`) or, for SwiftPM test bundles, in the build directory
+    /// holding the `.xctest` bundle.
+    public var deployerURL: URL?
+    /// How long a deployment subprocess may run before it is terminated.
+    public var deployTimeout: Duration
 
     public init(
         sharedDataDir: URL,
@@ -30,7 +37,9 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
         logDir: URL,
         schemaID: String = "noema_pinyin",
         deployPolicy: DeployPolicy = .deployIfNeeded,
-        bootFailureThreshold: Int = 2
+        bootFailureThreshold: Int = 2,
+        deployerURL: URL? = nil,
+        deployTimeout: Duration = .seconds(60)
     ) {
         self.sharedDataDir = sharedDataDir
         self.userDataDir = userDataDir
@@ -38,14 +47,17 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
         self.schemaID = schemaID
         self.deployPolicy = deployPolicy
         self.bootFailureThreshold = bootFailureThreshold
+        self.deployerURL = deployerURL
+        self.deployTimeout = deployTimeout
     }
 }
 
 /// `TypingEngine` over the in-process librime.
 ///
 /// Boot: claim the process-wide librime (a second live engine throws), take the
-/// user-data `flock`, arm the boot-guard sentinel, deploy if needed, initialize, open a
-/// session on `schemaID`, then disarm. Any refusal or failure on that path leaves the
+/// user-data `flock`, arm the boot-guard sentinel, deploy if needed through the
+/// `noema-rime-deployer` subprocess (see `RimeEngine+Deploy.swift`), initialize, open a
+/// session on `schemaID`, then disarm. librime's deployer never runs in this process. Any refusal or failure on that path leaves the
 /// engine in Safe Mode: it releases librime, the lock, and the claim, makes no further
 /// librime calls, and answers every key with `handled: false` and `.safeMode`.
 ///
@@ -100,7 +112,9 @@ public final class RimeEngine: TypingEngine {
             state = refreshState()
             handled = true
         }
-        return KeyHandlingResult(handled: handled || committed != nil, committedText: committed, state: state)
+        // librime's answer stands even when it committed: an editor's DirectCommit commits
+        // the composition and rejects the key, which the client must then still receive.
+        return KeyHandlingResult(handled: handled, committedText: committed, state: state)
     }
 
     public func selectCandidate(at index: Int) -> KeyHandlingResult {
@@ -216,26 +230,13 @@ public final class RimeEngine: TypingEngine {
         case .enterSafeMode(let reason): return enterSafeMode(reason)
         }
 
-        let loaded = withTraits { traits -> Bool in
+        guard prepareBuild() else { return enterSafeMode(.engineInitFailed) }
+        withTraits { traits in
             RimeProcessLifecycle.setupIfNeeded(owner: resources.owner, api: api, traits: &traits)
-            api.pointee.deployer_initialize(&traits)
-            if configuration.deployPolicy != .neverDeploy, needsDeploy() {
-                removeDeployStamp()
-                guard api.pointee.deploy() != 0, isBuildComplete() else {
-                    api.pointee.finalize()
-                    return false
-                }
-                writeDeployStamp()
-            }
-            guard isBuildComplete() else {
-                api.pointee.finalize()
-                return false
-            }
             api.pointee.initialize(&traits)
-            resources.isInitialized = true
-            return true
         }
-        guard loaded, openSession() else { return enterSafeMode(.engineInitFailed) }
+        resources.isInitialized = true
+        guard openSession() else { return enterSafeMode(.engineInitFailed) }
         guardian.disarm()
         refreshState()
     }
@@ -261,71 +262,6 @@ public final class RimeEngine: TypingEngine {
         // Releases librime, the lock, and the claim; Safe Mode makes no librime calls.
         resources.releaseAll()
         currentState = .empty(generationID: nextGeneration(), schemaID: configuration.schemaID, safeModeReason: reason)
-    }
-
-    /// Staged outputs the schema needs, relative to `user_data_dir/build`.
-    private var stagedFiles: [String] { ["default.yaml", "\(configuration.schemaID).schema.yaml"] }
-
-    private func isBuildComplete() -> Bool {
-        let build = configuration.userDataDir.appending(path: "build")
-        return stagedFiles.allSatisfy { name in
-            var isDirectory: ObjCBool = false
-            return FileManager.default.fileExists(atPath: build.appending(path: name).path, isDirectory: &isDirectory)
-                && !isDirectory.boolValue
-        }
-    }
-
-    /// Written into `build/` after every successful deployment. Its modification time,
-    /// not the staged YAML files' (librime leaves those untouched when only a non-YAML
-    /// input such as `lua/*.lua` changes), is the reference `deployIfNeeded` compares
-    /// inputs against, so a changed input triggers exactly one redeployment.
-    public nonisolated static let deployStampFileName = ".noema-deploy-stamp"
-
-    private var deployStampURL: URL {
-        configuration.userDataDir.appending(path: "build").appending(path: Self.deployStampFileName)
-    }
-
-    private func writeDeployStamp() {
-        try? Data().write(to: deployStampURL, options: .atomic)
-    }
-
-    private func removeDeployStamp() {
-        try? FileManager.default.removeItem(at: deployStampURL)
-    }
-
-    /// True when the staged build or the deploy stamp is missing, or any deploy input is
-    /// at least as new as the stamp: every non-directory entry under `sharedDataDir`
-    /// (including `dicts/`, `lua/`, `opencc/`) and every top-level `*.custom.yaml` in
-    /// `userDataDir`. Any stat or enumeration error answers true, so a doubtful build is
-    /// redeployed, never trusted.
-    private func needsDeploy() -> Bool {
-        if configuration.deployPolicy == .forceDeploy || !isBuildComplete() { return true }
-        let fileManager = FileManager.default
-        func modified(_ url: URL) -> Date? {
-            // Resolve symlinks so a linked input is judged by its target's time.
-            (try? fileManager.attributesOfItem(atPath: url.resolvingSymlinksInPath().path))?[.modificationDate] as? Date
-        }
-        guard let deployed = modified(deployStampURL) else { return true }
-        func isStale(_ url: URL) -> Bool { modified(url).map { $0 >= deployed } ?? true }
-
-        var enumerationFailed = false
-        guard let sharedEntries = fileManager.enumerator(
-            at: configuration.sharedDataDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            errorHandler: { _, _ in
-                enumerationFailed = true
-                return false
-            }
-        ) else { return true }
-        for case let url as URL in sharedEntries {
-            guard let isDirectory = try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory else { return true }
-            if !isDirectory, isStale(url) { return true }
-        }
-        if enumerationFailed { return true }
-
-        guard let userEntries = try? fileManager.contentsOfDirectory(at: configuration.userDataDir, includingPropertiesForKeys: nil)
-        else { return true }
-        return userEntries.contains { $0.lastPathComponent.hasSuffix(".custom.yaml") && isStale($0) }
     }
 
     /// Runs `body` with traits whose C strings live exactly as long as the call.

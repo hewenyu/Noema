@@ -155,10 +155,17 @@ public struct CompositionState: Sendable, Hashable, Codable {
 }
 
 /// The outcome of handing one key (or a selection/commit request) to the engine.
+///
+/// `handled` and `committedText` are independent. The shell first inserts
+/// `committedText`, if any, and then, when `handled` is false, passes the key itself
+/// through to the client. `handled: false` with `committedText` set is a real outcome:
+/// a key the schema does not handle (e.g. `,` without a punctuator) commits the open
+/// composition and still belongs to the client, so `nihao` then `,` yields "你好,".
 public struct KeyHandlingResult: Sendable, Hashable, Codable {
-    /// False means the shell must pass the key through to the client unchanged.
+    /// False means the shell must pass the key through to the client unchanged, after
+    /// inserting `committedText`.
     public let handled: Bool
-    /// Text to insert into the client, if the engine committed any.
+    /// Text to insert into the client before anything else, if the engine committed any.
     public let committedText: String?
     public let state: CompositionState
     /// Set when the key was passed through because the engine is degraded.

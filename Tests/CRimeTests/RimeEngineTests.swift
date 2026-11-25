@@ -207,19 +207,40 @@ extension LibrimeSerializedTests {
             #expect(engine.processKey(.text("1")).committedText == "啊")
         }
 
+        /// Without a punctuator, librime's editor commits the composition on `,` and rejects
+        /// the key (DirectCommit). The engine reports exactly that: the commit and an
+        /// unhandled key, so the shell inserts "你好" and then passes `,` to the client.
+        @Test func unhandledKeyAfterDirectCommitPassesThrough() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.replaceInSharedFile("noema_pinyin.schema.yaml", "    - punctuator\n", with: "")
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+            engine.type("nihao")
+            #expect(engine.currentState.candidates.first?.text == "你好")
+            let comma = engine.processKey(.text(","))
+            #expect(!comma.handled, "the comma belongs to the client")
+            #expect(comma.committedText == "你好")
+            #expect(!comma.state.isComposing && comma.degradation == nil)
+            // Idle, the comma is simply not handled.
+            let idle = engine.processKey(.text(","))
+            #expect(!idle.handled && idle.committedText == nil)
+        }
+
         @Test func deployIfNeededReusesTheStagedBuild() throws {
             let workspace = try EngineWorkspace()
             let staged = workspace.user.appending(path: "build/noema_pinyin.schema.yaml")
             let first = try workspace.engine()
             first.shutdown()
             let stamp = try #require(try FileManager.default.attributesOfItem(atPath: staged.path)[.modificationDate] as? Date)
-            let deployed = try workspace.deployStampDate()
+            let deployed = try workspace.deploymentID()
             #expect(FileManager.default.fileExists(atPath: workspace.user.appending(path: "build/noema_pinyin.table.bin").path))
+            #expect(try workspace.deployLeftovers().isEmpty, "staging and old builds are removed")
             let second = try workspace.engine()
             defer { second.shutdown() }
             #expect(!second.isSafeMode)
             #expect(try FileManager.default.attributesOfItem(atPath: staged.path)[.modificationDate] as? Date == stamp)
-            #expect(try workspace.deployStampDate() == deployed, "unchanged inputs must not redeploy")
+            #expect(try workspace.deploymentID() == deployed, "unchanged inputs must not redeploy")
             second.type("nihao")
             #expect(second.currentState.candidates.first?.text == "你好")
         }
@@ -257,56 +278,76 @@ extension LibrimeSerializedTests {
             #expect(engine.selectCandidate(at: 0).committedText != nil)
         }
 
-        /// A changed input under a shared-data subdirectory (one librime does not stage as
-        /// YAML) triggers one redeployment, and only one.
+        /// An added, then deleted, input under a shared-data subdirectory (one librime does
+        /// not stage as YAML) each trigger one redeployment, and only one.
         @Test func deployIfNeededRedeploysWhenASharedSubdirectoryFileChanges() throws {
             let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
             try workspace.engine().shutdown()
-            let firstDeploy = try workspace.deployStampDate()
+            let firstDeploy = try workspace.deploymentID()
 
             let lua = workspace.shared.appending(path: "lua")
             try FileManager.default.createDirectory(at: lua, withIntermediateDirectories: true)
             try "-- extra\n".write(to: lua.appending(path: "extra.lua"), atomically: true, encoding: .utf8)
             try workspace.engine().shutdown()
-            let secondDeploy = try workspace.deployStampDate()
-            #expect(secondDeploy > firstDeploy, "a new lua/extra.lua must redeploy")
+            let secondDeploy = try workspace.deploymentID()
+            #expect(secondDeploy != firstDeploy, "a new lua/extra.lua must redeploy")
+            #expect(try workspace.manifest().inputs.contains { $0.relativePath == "shared/lua/extra.lua" })
 
             let engine = try workspace.engine()
-            defer { engine.shutdown() }
-            #expect(try workspace.deployStampDate() == secondDeploy, "nothing changed since: no redeploy")
+            #expect(try workspace.deploymentID() == secondDeploy, "nothing changed since: no redeploy")
             engine.type("nihao")
             #expect(engine.currentState.candidates.first?.text == "你好")
+            engine.shutdown()
+
+            // Deleting the file is a change too: modification times alone cannot see it.
+            try FileManager.default.removeItem(at: lua.appending(path: "extra.lua"))
+            let afterDelete = try workspace.engine()
+            defer { afterDelete.shutdown() }
+            #expect(!afterDelete.isSafeMode)
+            #expect(try workspace.deploymentID() != secondDeploy, "a deleted lua/extra.lua must redeploy")
+            #expect(try !workspace.manifest().inputs.contains { $0.relativePath == "shared/lua/extra.lua" })
         }
 
-        /// A user `*.custom.yaml` patch triggers a redeployment that librime really applies.
-        @Test func deployIfNeededRedeploysWhenAUserCustomPatchChanges() throws {
+        /// A user `*.custom.yaml` patch triggers a redeployment that librime really applies,
+        /// and deleting the patch triggers one that really reverts it.
+        @Test func deployIfNeededRedeploysWhenAUserCustomPatchChangesOrIsDeleted() throws {
             let workspace = try EngineWorkspace()
             let first = try workspace.engine()
             first.type("shi")
             #expect(first.currentState.pageSize == 5 && first.currentState.candidates.count == 5)
             first.shutdown()
-            let firstDeploy = try workspace.deployStampDate()
+            let firstDeploy = try workspace.deploymentID()
 
-            try "patch:\n  menu/page_size: 3\n".write(
-                to: workspace.user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
-            let engine = try workspace.engine()
-            defer { engine.shutdown() }
-            #expect(!engine.isSafeMode)
-            #expect(try workspace.deployStampDate() > firstDeploy)
-            engine.type("shi")
-            #expect(engine.currentState.pageSize == 3 && engine.currentState.candidates.count == 3,
-                    "the patched page size must be live: \(engine.currentState.candidates.map(\.text))")
+            let patch = workspace.user.appending(path: "noema_pinyin.custom.yaml")
+            try "patch:\n  menu/page_size: 3\n".write(to: patch, atomically: true, encoding: .utf8)
+            let patched = try workspace.engine()
+            #expect(!patched.isSafeMode)
+            let patchedDeploy = try workspace.deploymentID()
+            #expect(patchedDeploy != firstDeploy)
+            patched.type("shi")
+            #expect(patched.currentState.pageSize == 3 && patched.currentState.candidates.count == 3,
+                    "the patched page size must be live: \(patched.currentState.candidates.map(\.text))")
+            patched.shutdown()
+
+            try FileManager.default.removeItem(at: patch)
+            let reverted = try workspace.engine()
+            defer { reverted.shutdown() }
+            #expect(!reverted.isSafeMode)
+            #expect(try workspace.deploymentID() != patchedDeploy, "deleting the patch must redeploy")
+            reverted.type("shi")
+            #expect(reverted.currentState.pageSize == 5 && reverted.currentState.candidates.count == 5,
+                    "the deleted patch must no longer apply: \(reverted.currentState.candidates.map(\.text))")
         }
 
         @Test func neverDeployLoadsAnExistingBuildWithoutDeploying() throws {
             let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
             try workspace.engine().shutdown()
-            let deployed = try workspace.deployStampDate()
+            let deployed = try workspace.deploymentID()
             try "-- extra\n".write(to: workspace.shared.appending(path: "extra.lua"), atomically: true, encoding: .utf8)
             let engine = try workspace.engine(policy: .neverDeploy)
             defer { engine.shutdown() }
             #expect(!engine.isSafeMode)
-            #expect(try workspace.deployStampDate() == deployed, "neverDeploy must not deploy")
+            #expect(try workspace.deploymentID() == deployed, "neverDeploy must not deploy")
         }
 
         @Test func directoryPosingAsAStagedFileIsNotABuild() throws {
@@ -315,6 +356,83 @@ extension LibrimeSerializedTests {
             let staged = workspace.user.appending(path: "build/noema_pinyin.schema.yaml")
             try FileManager.default.removeItem(at: staged)
             try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: false)
+            let engine = try workspace.engine(policy: .neverDeploy)
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == .engineInitFailed)
+        }
+
+        /// A deployment that fails (here: `default.yaml` lists a schema that does not
+        /// exist) runs in the isolated subprocess and staging directory, so the previous
+        /// `build/` survives byte for byte while the engine enters Safe Mode.
+        @Test func failedDeploymentLeavesThePreviousBuildUntouched() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.engine().shutdown()
+            let before = try workspace.buildSnapshot()
+            #expect(before.keys.contains("default.yaml") && before.keys.contains("noema_pinyin.table.bin"))
+            #expect(before.keys.contains(DeployManifest.fileName))
+
+            try workspace.replaceInSharedFile("default.yaml", "page_size: 5", with: "page_size: 9")
+            try workspace.replaceInSharedFile("default.yaml", "  - schema: noema_pinyin\n",
+                                              with: "  - schema: noema_pinyin\n  - schema: noema_missing\n")
+            let engine = try workspace.engine(policy: .forceDeploy)
+            #expect(engine.safeModeReason == .engineInitFailed)
+            engine.expectEverythingPassesThrough()
+            engine.shutdown()
+            #expect(try workspace.buildSnapshot() == before, "a failed deployment must not touch build/")
+            #expect(try workspace.deployLeftovers().isEmpty)
+
+            // The intact old build still loads without deploying.
+            let fallback = try workspace.engine(policy: .neverDeploy)
+            defer { fallback.shutdown() }
+            #expect(!fallback.isSafeMode)
+            fallback.type("shi")
+            #expect(fallback.currentState.pageSize == 5)
+        }
+
+        /// No deployer to run is a failed deployment, never an in-process one.
+        @Test func missingDeployerEntersSafeModeWithoutTouchingTheBuild() throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let before = try workspace.buildSnapshot()
+            let missing = workspace.root.appending(path: "no-such-deployer")
+            let engine = try workspace.engine(policy: .forceDeploy, deployerURL: missing)
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == .engineInitFailed)
+            #expect(try workspace.buildSnapshot() == before)
+        }
+
+        /// A compiled dictionary missing from `build/` is an incomplete build: deployIfNeeded
+        /// rebuilds it, neverDeploy refuses to load it.
+        @Test func missingCompiledDictionaryIsAnIncompleteBuild() throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let table = workspace.user.appending(path: "build/noema_pinyin.table.bin")
+
+            try FileManager.default.removeItem(at: table)
+            let rebuilt = try workspace.engine()
+            #expect(!rebuilt.isSafeMode)
+            #expect(FileManager.default.fileExists(atPath: table.path), "deployIfNeeded must rebuild the table")
+            rebuilt.type("nihao")
+            #expect(rebuilt.currentState.candidates.first?.text == "你好")
+            rebuilt.shutdown()
+
+            try FileManager.default.removeItem(at: table)
+            let refused = try workspace.engine(policy: .neverDeploy)
+            defer { refused.shutdown() }
+            #expect(refused.safeModeReason == .engineInitFailed)
+            #expect(!refused.processKey(.text("n")).handled)
+            refused.expectEverythingPassesThrough()
+            #expect(!FileManager.default.fileExists(atPath: table.path), "neverDeploy must not rebuild")
+        }
+
+        /// A compiled output whose bytes no longer match the manifest is not trusted either.
+        @Test func tamperedOutputIsAnIncompleteBuild() throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let prism = workspace.user.appending(path: "build/noema_pinyin.prism.bin")
+            var bytes = try Data(contentsOf: prism)
+            bytes[bytes.count / 2] ^= 0xFF
+            try bytes.write(to: prism)
             let engine = try workspace.engine(policy: .neverDeploy)
             defer { engine.shutdown() }
             #expect(engine.safeModeReason == .engineInitFailed)
@@ -582,9 +700,9 @@ final class EngineWorkspace {
     }
 
     @MainActor
-    func engine(policy: RimeEngineConfiguration.DeployPolicy = .deployIfNeeded) throws -> RimeEngine {
+    func engine(policy: RimeEngineConfiguration.DeployPolicy = .deployIfNeeded, deployerURL: URL? = nil) throws -> RimeEngine {
         try RimeEngine(configuration: RimeEngineConfiguration(
-            sharedDataDir: shared, userDataDir: user, logDir: logs, deployPolicy: policy
+            sharedDataDir: shared, userDataDir: user, logDir: logs, deployPolicy: policy, deployerURL: deployerURL
         ))
     }
 
@@ -600,9 +718,46 @@ final class EngineWorkspace {
         try (String(contentsOf: url, encoding: .utf8) + text).write(to: url, atomically: true, encoding: .utf8)
     }
 
-    func deployStampDate() throws -> Date {
-        let stamp = user.appending(path: "build").appending(path: RimeEngine.deployStampFileName)
-        return try #require(try FileManager.default.attributesOfItem(atPath: stamp.path)[.modificationDate] as? Date)
+    /// Replaces text in a copied shared file; the text must be present.
+    func replaceInSharedFile(_ name: String, _ target: String, with replacement: String) throws {
+        precondition(shared != Self.shippedSharedData, "never edit the shipped schema")
+        let url = shared.appending(path: name)
+        let text = try String(contentsOf: url, encoding: .utf8)
+        try #require(text.contains(target), "\(name) lacks \(target.debugDescription)")
+        try text.replacingOccurrences(of: target, with: replacement).write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Identifies the live deployment: every deployment renames a fresh directory into
+    /// `build/`, so its inode changes exactly when a deployment happened.
+    func deploymentID() throws -> UInt64 {
+        var info = stat()
+        try #require(lstat(user.appending(path: "build").path, &info) == 0)
+        return UInt64(info.st_ino)
+    }
+
+    func manifest() throws -> DeployManifest {
+        try JSONDecoder().decode(DeployManifest.self, from: Data(contentsOf: user.appending(path: "build/\(DeployManifest.fileName)")))
+    }
+
+    /// Every file under `build/`, by relative path, with its bytes.
+    func buildSnapshot() throws -> [String: Data] {
+        let build = user.appending(path: "build")
+        var snapshot: [String: Data] = [:]
+        let enumerator = try #require(FileManager.default.enumerator(atPath: build.path))
+        for case let relative as String in enumerator {
+            var isDirectory: ObjCBool = false
+            let url = build.appending(path: relative)
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+                snapshot[relative] = try Data(contentsOf: url)
+            }
+        }
+        return snapshot
+    }
+
+    /// Staging directories or old builds a deployment left in `user_data_dir`.
+    func deployLeftovers() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: user.path)
+            .filter { $0.hasPrefix(".deploy-staging.") || $0.hasPrefix(".build-old.") }
     }
 
     func sentinelFailures() throws -> Int {
