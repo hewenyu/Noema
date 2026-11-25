@@ -2,6 +2,7 @@ import Foundation
 import NoemaCore
 import NoemaEngine
 import NoemaIMEShell
+import NoemaUI
 
 /// Owns the one `RimeEngine` of the input method process and the coordinator every
 /// `NoemaInputController` shares. Until the engine is ready, and after `shutdown()`, the
@@ -21,12 +22,38 @@ final class EngineHost {
     private(set) var state: State = .uninitialized
     private let log = NoemaLog.ime("lifecycle")
 
-    private(set) lazy var coordinator = InputSessionCoordinator(engineProvider: { [unowned self] in
-        if case .ready(let engine) = self.state { return engine }
-        return nil
-    })
+    /// Created with `coordinator`, the first time IMKit calls a controller: never by
+    /// `--version`, `--check-rime`, or a `shutdown()` before any client.
+    private var candidatePanel: CandidatePanelController?
+
+    private(set) lazy var coordinator: InputSessionCoordinator = {
+        let panel = CandidatePanelController()
+        let coordinator = InputSessionCoordinator(
+            engineProvider: { [unowned self] in
+                if case .ready(let engine) = self.state { return engine }
+                return nil
+            },
+            candidatePresenter: panel,
+            inlinePreeditDisabledBundleIDs: Self.inlinePreeditDisabledBundleIDs())
+        panel.onSelectCandidate = { [weak coordinator] index, generation in
+            coordinator?.selectCandidate(at: index, expectedGenerationID: generation)
+        }
+        panel.onChangePage = { [weak coordinator] backward, generation in
+            coordinator?.changePage(backward: backward, expectedGenerationID: generation)
+        }
+        candidatePanel = panel
+        return coordinator
+    }()
 
     private init() {}
+
+    /// Client bundle IDs that get no marked text (the panel draws the preedit), from
+    /// `defaults write <imeBundleID> InlinePreeditDisabledBundleIDs -array <bundle-id>...`.
+    static let inlinePreeditDisabledKey = "InlinePreeditDisabledBundleIDs"
+
+    private static func inlinePreeditDisabledBundleIDs() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: inlinePreeditDisabledKey) ?? [])
+    }
 
     /// Starts the engine on the user's Rime data and returns at once: `RimeEngine.start`
     /// deploys off the main actor, so IMKit keys keep passing through and SIGTERM keeps
@@ -93,6 +120,7 @@ final class EngineHost {
     /// (AppKit `terminate(_:)`, a signal source), where no main-actor continuation could run
     /// before the process exits. Idempotent.
     func shutdown(deployerGrace: Duration = .milliseconds(500)) {
+        candidatePanel?.hide()
         switch state {
         case .unavailable:
             return

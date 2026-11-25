@@ -123,6 +123,22 @@ private final class IMKTextInputClientAdapter: TextInputClient {
 
     var clientBundleIdentifier: String? { client.bundleIdentifier() }
 
+    var uniqueClientIdentifier: String? { client.uniqueClientIdentifierString() }
+
+    var windowLevel: Int? { Int(client.windowLevel()) }
+
+    /// `attributes(forCharacterIndex:lineHeightRectangle:)` first, then
+    /// `firstRect(forCharacterRange:actualRange:)`; `.zero` from both is nil.
+    /// `CaretPositionResolver` validates whatever comes back.
+    func caretScreenRect(atUTF16Offset offset: Int) -> CGRect? {
+        let index = max(offset, 0)
+        var rect = NSRect.zero
+        _ = client.attributes(forCharacterIndex: index, lineHeightRectangle: &rect)
+        if rect != .zero { return rect }
+        let fallback = client.firstRect(forCharacterRange: NSRange(location: index, length: 0), actualRange: nil)
+        return fallback == .zero ? nil : fallback
+    }
+
     func insertText(_ text: String) {
         client.insertText(text, replacementRange: replacementRange)
     }

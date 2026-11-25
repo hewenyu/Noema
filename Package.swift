@@ -39,8 +39,11 @@ let package = Package(
         // Engine-independent IMKit shell logic: session coordination, NSEvent bridging, and
         // the text-client and candidate-presenter seams. Zero TCC, like NoemaIME.
         .target(name: "NoemaIMEShell", dependencies: ["NoemaCore"]),
+        // The candidate panel: CoreText layout, caret placement, and the non-activating
+        // NSPanel that implements CandidatePresenting. Zero TCC, like NoemaIME.
+        .target(name: "NoemaUI", dependencies: ["NoemaCore", "NoemaIMEShell"]),
         // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
-        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell"]),
+        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaUI"]),
         // Isolated Rime deployment subprocess, bundled beside NoemaIME in Contents/MacOS.
         // RimeEngine runs it; librime's deployer never runs in the input method process.
         .executableTarget(name: "noema-rime-deployer", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
@@ -49,6 +52,8 @@ let package = Package(
         .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine"]),
         // NSEvent bridging and other shell logic that needs no engine.
         .testTarget(name: "NoemaIMEShellTests", dependencies: ["NoemaCore", "NoemaIMEShell"]),
+        // Headless CoreText layout, width hysteresis, and caret placement of the panel.
+        .testTarget(name: "NoemaUITests", dependencies: ["NoemaCore", "NoemaIMEShell", "NoemaUI"]),
         // Every test that initializes librime: one top-level serialized suite.
         // Depends on noema-rime-deployer, noema-cli, and NoemaIME so every `swift test` builds the
         // deployer RimeEngine spawns and the executables the end-to-end tests run.
