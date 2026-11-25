@@ -1,4 +1,3 @@
-import AppKit
 import Darwin
 import Foundation
 import NoemaCore
@@ -50,7 +49,7 @@ extension LibrimeSerializedTests {
             #expect(!FileManager.default.fileExists(atPath: workspace.sentinel.path))
         }
 
-        /// Cancelling the task (`onCancel`), or `cancelTerminatingDeployer` then cancelling
+        /// Cancelling the task (`onCancel`), or `cancelAndFinishCleanup` then cancelling
         /// (what `EngineHost.shutdown()` does), stops the deployer within 2 s, disarms the
         /// sentinel, releases the lock and the claim, and leaves no staging directory.
         @Test(arguments: [false, true])
@@ -75,7 +74,13 @@ extension LibrimeSerializedTests {
             #expect(kill(pid, 0) == 0, "the deployer is running")
 
             let cancelled = clock.now
-            if synchronousCancel { cancellation.cancelTerminatingDeployer() }
+            if synchronousCancel {
+                cancellation.cancelAndFinishCleanup()
+                // Already clean before the boot task has run again.
+                #expect(kill(pid, 0) != 0 && errno == ESRCH, "the deployer was stopped")
+                #expect(!FileManager.default.fileExists(atPath: workspace.sentinel.path))
+                #expect(try workspace.deployLeftovers().isEmpty)
+            }
             boot.cancel()
             let result = await boot.result
             #expect(clock.now - cancelled < .seconds(2))
@@ -127,51 +132,67 @@ extension LibrimeSerializedTests {
             #expect(!engine.isSafeMode)
         }
 
-        /// AppKit termination mid-boot (`applicationShouldTerminate` → `.terminateLater`, then
-        /// `reply(toApplicationShouldTerminate:)` exits): the reply waits for the cancelled
-        /// boot's cleanup, so two interrupted boots in a row on the same `user_data_dir` leave
-        /// no armed sentinel and the third boot types normally instead of `bootCrashLoop`.
-        /// The process "exits" when the reply fires: the sentinel is restored to its bytes at
-        /// that moment, as if the cleanup still pending had never run.
-        @Test func appKitTerminateLaterCleansUpRepeatedBootInterruptionsWithoutCrashLoop() async throws {
+        /// Codex PR #18 round 4: AppKit `terminate(_:)` called from a `DispatchQueue.main`
+        /// block exits before any main-actor continuation can run, because the main queue is
+        /// not reentrant. `cancelAndFinishCleanup` (what `EngineHost.shutdown()` runs) must
+        /// therefore finish the cleanup before it returns, inside that block. Two interrupted
+        /// boots in a row on one `user_data_dir` (the second deployer ignores SIGTERM, so the
+        /// SIGKILL escalation runs) leave no deployer, staging, or sentinel and a free lock at
+        /// that moment, and the third boot types normally instead of `bootCrashLoop`. Whatever
+        /// cleanup only ran after the block is undone, as if the process had exited.
+        @Test func mainQueueSynchronousTerminationCleansUpRepeatedBootInterruptionsWithoutCrashLoop() async throws {
             let workspace = try EngineWorkspace()
             for round in 1...2 {
-                let pidFile = workspace.root.appending(path: "deployer-\(round).pid")
-                let wrapper = try workspace.deployerScript("echo $$ > '\(pidFile.path)'\nexec /bin/sleep 15")
-                let host = try await InterruptibleBoot(configuration: workspace.configuration(deployerURL: wrapper), pidFile: pidFile)
-                let pid = try #require(host.deployerPID)
+                let deployer = try SlowDeployer(ignoringSIGTERM: round == 2)
+                let cancellation = DeployCancellation()
+                let boot = Task { @MainActor in
+                    try await RimeEngine.start(
+                        configuration: workspace.configuration(deployerURL: deployer.wrapper), cancellation: cancellation)
+                }
+                let pid = try #require(await deployer.waitForPIDAsync(), "round \(round): the slow deployer never started")
+                // Past the deployer's launch, so `DeployCancellation` holds its process.
+                try await Task.sleep(for: .milliseconds(50))
                 #expect(kill(pid, 0) == 0, "round \(round): the deployer is running")
 
-                let delegate = TerminationDelegateDouble(shutdown: host.shutdown)
-                let clock = ContinuousClock()
-                let asked = clock.now
-                var exitSnapshot: ExitSnapshot?
-                var replies = 0
-                let reply = delegate.applicationShouldTerminate { terminate in
-                    replies += 1
-                    #expect(terminate)
-                    exitSnapshot = ExitSnapshot(workspace: workspace, deployerPID: pid)
+                let user = workspace.user, sentinel = workspace.sentinel
+                let (snapshot, lockFree, elapsed) = await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            let clock = ContinuousClock()
+                            let began = clock.now
+                            cancellation.cancelAndFinishCleanup(deployerGrace: .milliseconds(500))
+                            let elapsed = clock.now - began
+                            // Still inside the main-queue block: no deferred main-actor work ran.
+                            let snapshot = ExitSnapshot(user: user, sentinel: sentinel, deployerPID: pid)
+                            let probe = BootGuard(userDataDir: user)
+                            let lockFree = probe.acquireLock() == .acquired
+                            probe.releaseLock()
+                            continuation.resume(returning: (snapshot, lockFree, elapsed))
+                        }
+                    }
                 }
-                #expect(reply == .terminateLater, "round \(round): a running boot defers termination")
-                while exitSnapshot == nil, clock.now - asked < .seconds(5) {
-                    try await Task.sleep(for: .milliseconds(10))
-                }
-                #expect(clock.now - asked < .seconds(2), "round \(round): the reply is bounded")
-                let snapshot = try #require(exitSnapshot)
-                // Past the 1 s fallback: the reply still fired exactly once.
-                try await Task.sleep(for: .milliseconds(1200))
-                #expect(replies == 1)
+                #expect(elapsed < .seconds(2), "round \(round): cleanup is bounded")
                 #expect(!snapshot.deployerAlive, "round \(round): the deployer was stopped")
                 #expect(snapshot.stagingLeftovers.isEmpty, "round \(round): staging was removed")
                 #expect(snapshot.sentinel == nil, "round \(round): the boot sentinel was disarmed")
+                #expect(lockFree, "round \(round): the user-data lock was released")
 
-                await host.boot.value
+                boot.cancel()
+                guard case .failure(let error) = await boot.result else {
+                    Issue.record("round \(round): a cancelled boot must not return an engine")
+                    return
+                }
+                #expect(error as? NoemaError == .engineUnavailable(reason: "boot cancelled"))
                 try snapshot.restoreSentinel(in: workspace)
             }
 
-            let engine = try await RimeEngine.start(configuration: workspace.configuration())
+            let cancellation = DeployCancellation()
+            let engine = try await RimeEngine.start(configuration: workspace.configuration(), cancellation: cancellation)
             defer { engine.shutdown() }
-            #expect(!engine.isSafeMode, "two AppKit-terminated boots are not a crash loop")
+            #expect(!engine.isSafeMode, "two main-queue terminations mid-boot are not a crash loop")
+            // A finished boot drops its abandon hook: a late cleanup leaves the engine alone.
+            cancellation.cancelAndFinishCleanup()
+            #expect(!engine.isShutDown)
             let coordinator = InputSessionCoordinator(
                 engineProvider: { engine }, candidatePresenter: RecordingPresenter(), isSecureInputEnabled: { false })
             let client = RecordingClient()
@@ -179,48 +200,6 @@ extension LibrimeSerializedTests {
             for key in "nihao" { #expect(coordinator.handleKey(.text(key), token: token, client: client)) }
             #expect(coordinator.handleKey(.key(VirtualKeyCode.space, " "), token: token, client: client))
             #expect(client.calls.last == .insert("你好"))
-        }
-
-        /// The synchronous exits (`applicationWillTerminate`, after `NSApplication.run()`
-        /// returns) pump the main run loop until the cancelled boot has cleaned up. It runs as
-        /// a run-loop block, like an AppKit event handler, not inside a main-queue job.
-        @Test func synchronousShutdownAwaitCleansUpPostRunLoopBoot() async throws {
-            let workspace = try EngineWorkspace()
-            try workspace.writeSentinel(#"{"consecutiveFailures":1,"lastAttemptEpoch":1}"#)
-            let pidFile = workspace.root.appending(path: "deployer.pid")
-            let wrapper = try workspace.deployerScript("echo $$ > '\(pidFile.path)'\nexec /bin/sleep 15")
-            let host = try await InterruptibleBoot(configuration: workspace.configuration(deployerURL: wrapper), pidFile: pidFile)
-            let pid = try #require(host.deployerPID)
-
-            let user = workspace.user, sentinel = workspace.sentinel
-            let clock = ContinuousClock()
-            let began = clock.now
-            let snapshot: ExitSnapshot = await withCheckedContinuation { continuation in
-                RunLoop.main.perform {
-                    MainActor.assumeIsolated {
-                        BootTerminationCoordinator.awaitShutdownSynchronously(shutdown: host.shutdown)
-                        continuation.resume(returning: ExitSnapshot(user: user, sentinel: sentinel, deployerPID: pid))
-                    }
-                }
-            }
-            #expect(clock.now - began < .seconds(2))
-            #expect(!snapshot.deployerAlive, "the deployer was stopped")
-            #expect(snapshot.stagingLeftovers.isEmpty, "staging was removed")
-            #expect(snapshot.sentinel == nil, "the boot sentinel was disarmed before exit")
-            await host.boot.value
-            // Nothing booting: returns at once without pumping.
-            let idle = clock.now
-            BootTerminationCoordinator.awaitShutdownSynchronously(shutdown: { nil })
-            #expect(clock.now - idle < .milliseconds(50))
-        }
-
-        /// No boot running: `.terminateNow` at once, and the deferred reply never fires.
-        @Test func terminateNowWhenNotBooting() async throws {
-            var replies = 0
-            let delegate = TerminationDelegateDouble(shutdown: { nil })
-            #expect(delegate.applicationShouldTerminate { _ in replies += 1 } == .terminateNow)
-            try await Task.sleep(for: .milliseconds(1200))
-            #expect(replies == 0)
         }
 
         /// A Safe Mode decision returns at once and runs no deployer.
@@ -243,65 +222,11 @@ final class EngineSlot {
     var engine: RimeEngine?
 }
 
-/// What `EngineHost` does around a boot, against a workspace: `RimeEngine.start` in a
-/// `Task<Void, Never>`, and a `shutdown` that stops the deployer, cancels the task, and
-/// returns it. Initialization waits until the (slow) deployer has written its pid.
-@MainActor
-final class InterruptibleBoot {
-    let boot: Task<Void, Never>
-    let cancellation: DeployCancellation
-    private(set) var deployerPID: pid_t?
-    private(set) var shutDown = false
-
-    init(configuration: RimeEngineConfiguration, pidFile: URL) async throws {
-        let cancellation = DeployCancellation()
-        self.cancellation = cancellation
-        boot = Task { @MainActor in
-            if let engine = try? await RimeEngine.start(configuration: configuration, cancellation: cancellation) {
-                Issue.record("a cancelled boot must not return an engine")
-                engine.shutdown()
-            }
-        }
-        let clock = ContinuousClock()
-        let start = clock.now
-        while !FileManager.default.fileExists(atPath: pidFile.path), clock.now - start < .seconds(10) {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        try await Task.sleep(for: .milliseconds(50))
-        let text = try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-        deployerPID = pid_t(text)
-    }
-
-    func shutdown() -> Task<Void, Never>? {
-        if shutDown { return boot }
-        shutDown = true
-        cancellation.cancelTerminatingDeployer()
-        boot.cancel()
-        return boot
-    }
-}
-
-/// `InputMethodAppDelegate.applicationShouldTerminate`, with `reply` standing in for
-/// `NSApplication.reply(toApplicationShouldTerminate:)`.
-@MainActor
-struct TerminationDelegateDouble {
-    let shutdown: () -> Task<Void, Never>?
-
-    func applicationShouldTerminate(reply: @escaping @MainActor (Bool) -> Void) -> NSApplication.TerminateReply {
-        let waiting = BootTerminationCoordinator.beginShutdown(shutdown: shutdown, onComplete: { reply(true) })
-        return waiting ? .terminateLater : .terminateNow
-    }
-}
-
 /// The workspace at the moment the process would exit.
 struct ExitSnapshot {
     let deployerAlive: Bool
     let stagingLeftovers: [String]
     let sentinel: Data?
-
-    init(workspace: EngineWorkspace, deployerPID: pid_t) {
-        self.init(user: workspace.user, sentinel: workspace.sentinel, deployerPID: deployerPID)
-    }
 
     init(user: URL, sentinel: URL, deployerPID: pid_t) {
         deployerAlive = kill(deployerPID, 0) == 0

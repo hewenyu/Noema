@@ -381,13 +381,14 @@ enum Tool {
 }
 
 /// A `--deployer` that never finishes: a shell wrapper that records its PID, then `exec`s
-/// the compiled sleeper (same PID), which sleeps until a signal or 60 s.
+/// the compiled sleeper (same PID), which sleeps until a signal (SIGTERM, unless
+/// `ignoringSIGTERM`) or 60 s.
 final class SlowDeployer {
     let root: URL
     var wrapper: URL { root.appending(path: "slow-deployer") }
     var pidFile: URL { root.appending(path: "pid") }
 
-    init() throws {
+    init(ignoringSIGTERM: Bool = false) throws {
         let fm = FileManager.default
         root = fm.temporaryDirectory.appending(path: "noema-slow-deployer-\(UUID().uuidString)")
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -396,7 +397,7 @@ final class SlowDeployer {
         let script = """
             #!/bin/sh
             echo $$ > '\(root.path)/pid.tmp' && mv '\(root.path)/pid.tmp' '\(pidFile.path)'
-            exec '\(sleeper.path)'
+            exec '\(sleeper.path)'\(ignoringSIGTERM ? " --ignore-sigterm" : "")
             """
         try script.write(to: wrapper, atomically: true, encoding: .utf8)
         try #require(chmod(wrapper.path, 0o755) == 0)
@@ -417,6 +418,18 @@ final class SlowDeployer {
             if let text = try? String(contentsOf: pidFile, encoding: .utf8),
                let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) { return pid }
             usleep(10_000)
+        }
+        return nil
+    }
+
+    /// `waitForPID` without blocking the caller's actor (up to 10 s).
+    func waitForPIDAsync() async -> pid_t? {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(10)
+        while clock.now < deadline {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+               let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) { return pid }
+            try? await Task.sleep(for: .milliseconds(10))
         }
         return nil
     }

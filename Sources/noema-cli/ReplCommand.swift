@@ -82,7 +82,7 @@ enum ReplCommand {
 ///
 /// The engine boots through `RimeEngine.start(configuration:cancellation:)` after the
 /// SIGINT/SIGTERM handlers are installed, so a signal during deployment stops the deployer,
-/// lets the boot remove its staging directory and disarm the boot guard, and only then
+/// synchronously removes its staging directory and disarms the boot guard, and only then
 /// removes the ephemeral directory and exits `128 + signal`.
 @MainActor
 final class ReplSession {
@@ -180,33 +180,23 @@ final class ReplSession {
 
     static var current: ReplSession?
 
-    /// SIGINT/SIGTERM. During boot: stop the deployer, cancel the boot, and wait for it to
-    /// clean up (staging, boot guard, lock) before removing the ephemeral directory; a 1 s
-    /// fallback exits regardless. Once running: shut the engine down. Exits `128 + signal`.
+    /// SIGINT/SIGTERM. During boot: stop the deployer, cancel the boot, and finish its
+    /// cleanup (staging, boot guard, lock) synchronously before removing the ephemeral
+    /// directory. Once running: shut the engine down. Exits `128 + signal`.
     func handleTerminationSignal(_ signalNumber: Int32) {
         guard !isTornDown else { return }
         isTornDown = true
         let status = 128 + signalNumber
-        guard let task = bootTask else {
+        if let task = bootTask {
+            bootTask = nil
+            bootCancellation.cancelAndFinishCleanup(deployerGrace: .milliseconds(500))
+            task.cancel()
+        } else {
             engine?.shutdown()
-            cleanupEphemeral()
-            flush()
-            exit(status)
         }
-        bootTask = nil
-        bootCancellation.cancelTerminatingDeployer(grace: .milliseconds(500))
-        task.cancel()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            MainActor.assumeIsolated { ReplSession.current?.cleanupEphemeral() }
-            fflush(stdout)
-            exit(status)
-        }
-        Task { @MainActor in
-            await task.value
-            self.cleanupEphemeral()
-            self.flush()
-            exit(status)
-        }
+        cleanupEphemeral()
+        flush()
+        exit(status)
     }
 
     func finish(status: Int32) -> Never {

@@ -51,7 +51,7 @@ IMKit creates one `NoemaInputController` per client session; it forwards every I
 - returns `false` without an engine, in Safe Mode, and in idle ASCII mode;
 - inserts `committedText` first, then shows marked text with UTF-16 caret and selection or clears it, and returns `handled`.
 
-`EngineHost` registers the `IMKServer`, then calls `RimeEngine.start` after launch; until ready and after `shutdown()` (which stops a running deployer; `BootTerminationCoordinator` awaits boot cleanup), every key passes through. The candidate panel plugs in through `CandidatePresenting` (`NoOpCandidatePresenter` today).
+`EngineHost` registers the `IMKServer`, then calls `RimeEngine.start` after launch; until ready and after `shutdown()` (synchronous boot cleanup), every key passes through. The candidate panel plugs in through `CandidatePresenting` (`NoOpCandidatePresenter` today).
 
 `noema-cli install` validates a staged copy of the bundle inside `--dest` (identifiers, executables, librime, `rime-default`, strict signature; ad-hoc anywhere in the bundle or its nested code only with `--allow-adhoc`) and swaps it in with two renames under a `flock`; for `~/Library/Input Methods` it also registers the bundle and stops the `NoemaIME` processes found before the swap. Processes left running (`--no-reload`, or a 3 s timeout, which exits 1) go to a pending-reload ledger. `reload` stops this user's `NoemaIME` of one bundle plus its ledger; `repl` drives a real engine from stdin. Details: [`noema-cli` sources](../Sources/noema-cli/InstallCommand.swift).
 

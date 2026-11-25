@@ -93,7 +93,8 @@ public final class RimeEngine: TypingEngine {
     /// Cancelling the task, or `cancellation`, stops the deployer (SIGTERM, then SIGKILL)
     /// and throws `.engineUnavailable(reason: "boot cancelled")` after disarming the
     /// sentinel (a cancelled boot is not a crash) and releasing the lock and the claim;
-    /// `build/` is left as it was.
+    /// `build/` is left as it was. `cancellation.cancelAndFinishCleanup` does all of that
+    /// before it returns, on the caller's main-actor stack, without waiting for this task.
     public static func start(
         configuration: RimeEngineConfiguration,
         cancellation: DeployCancellation = DeployCancellation()
@@ -105,16 +106,28 @@ public final class RimeEngine: TypingEngine {
             throw .engineUnavailable(reason: "boot cancelled")
         }
         guard engine.beginBoot(clearingSentinel: false) else { return engine }
+        guard cancellation.registerAbandon({ engine.abandonBoot() }) else {
+            engine.abandonBoot()
+            throw .engineUnavailable(reason: "boot cancelled")
+        }
         let prepared = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                guard let group = cancellation.enterPrepare() else {
+                    continuation.resume(returning: false)
+                    return
+                }
                 DispatchQueue.global(qos: .userInitiated).async {
-                    continuation.resume(returning: prepareBuild(configuration: configuration, cancellation: cancellation))
+                    let ok = prepareBuild(configuration: configuration, cancellation: cancellation)
+                    // Only after prepareBuild returned: its staging directory is gone.
+                    cancellation.leavePrepare(group)
+                    continuation.resume(returning: ok)
                 }
             }
         } onCancel: {
             cancellation.cancel()
         }
-        if cancellation.isCancelled || Task.isCancelled {
+        cancellation.clearAbandon()
+        if cancellation.isCancelled || Task.isCancelled || engine.isShutDown {
             engine.abandonBoot()
             throw .engineUnavailable(reason: "boot cancelled")
         }
@@ -303,9 +316,11 @@ public final class RimeEngine: TypingEngine {
     }
 
     /// A cancelled boot: disarm (cancellation is not a crash), release everything, and shut down.
+    /// Idempotent: `cancelAndFinishCleanup` may already have run it.
     private func abandonBoot() {
-        resources.bootGuard.disarm()
+        guard !isShutDown else { return }
         isShutDown = true
+        resources.bootGuard.disarm()
         resources.releaseAll()
         currentState = .empty(generationID: nextGeneration(), schemaID: configuration.schemaID)
     }

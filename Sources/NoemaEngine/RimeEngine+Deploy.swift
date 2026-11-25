@@ -245,10 +245,18 @@ extension RimeEngine {
 /// the running `noema-rime-deployer`, if any; `RimeEngine.prepareBuild` then stops at its
 /// next step (the deploy loop polls every 50 ms and escalates to SIGKILL after 2 s), removes
 /// its staging directory, and leaves `build/` untouched. Once cancelled, no new deployer starts.
+///
+/// `cancelAndFinishCleanup` is the synchronous variant for a process about to exit: it also
+/// waits for the background `prepareBuild` and then runs the boot's abandon hook on the
+/// caller's main-actor stack, so the cleanup never waits for a main-actor continuation.
 public final class DeployCancellation: Sendable {
     private struct State {
         var cancelled = false
         var process: Process?
+        /// Entered while `prepareBuild` runs off the main actor; left after it returns.
+        var prepareGroup: DispatchGroup?
+        /// Disarms the boot sentinel and releases the lock and the claim; runs at most once.
+        var onAbandon: (@MainActor @Sendable () -> Void)?
     }
 
     // `Process` is not Sendable; every access to it goes through this lock.
@@ -270,15 +278,65 @@ public final class DeployCancellation: Sendable {
         }
     }
 
-    /// `cancel()`, then waits up to `grace` for a running deployer to exit and sends it
-    /// SIGKILL if it has not, so a process about to `exit` leaves no orphan deployer.
-    public func cancelTerminatingDeployer(grace: Duration = .milliseconds(500)) {
+    /// For a caller about to exit, even from inside a `DispatchQueue.main` block (AppKit
+    /// `terminate(_:)`, a signal source), where no main-actor continuation can run before the
+    /// process ends: `cancel()`; SIGKILL the deployer if it outlives `deployerGrace`; wait up
+    /// to `cleanupWait` for the background `prepareBuild` to return (it removes its staging
+    /// directory and never touches the main actor, so this cannot deadlock); then run the
+    /// boot's abandon hook here, synchronously: the sentinel is disarmed and the lock and the
+    /// claim are released before this returns. If `prepareBuild` is still running after
+    /// `cleanupWait`, the hook is skipped and the boot counts as unfinished.
+    @MainActor
+    public func cancelAndFinishCleanup(deployerGrace: Duration = .milliseconds(500), cleanupWait: Duration = .seconds(1)) {
         cancel()
-        guard let process = state.withLockUnchecked({ $0.process }) else { return }
-        let clock = ContinuousClock()
-        let deadline = clock.now + grace
-        while process.isRunning, clock.now < deadline { usleep(10_000) }
-        if process.processIdentifier > 0, process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        if let process = state.withLockUnchecked({ $0.process }) {
+            let clock = ContinuousClock()
+            let deadline = clock.now + deployerGrace
+            while process.isRunning, clock.now < deadline { usleep(10_000) }
+            if process.processIdentifier > 0, process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+        if let group = state.withLockUnchecked({ $0.prepareGroup }) {
+            let (seconds, attoseconds) = cleanupWait.components
+            let wait = max(0, Double(seconds) + Double(attoseconds) / 1e18)
+            guard group.wait(timeout: .now() + wait) == .success else { return }
+        }
+        let abandon = state.withLockUnchecked { state -> (@MainActor @Sendable () -> Void)? in
+            defer { state.onAbandon = nil }
+            return state.onAbandon
+        }
+        abandon?()
+    }
+
+    /// Installs the boot's abandon hook unless already cancelled (then false).
+    func registerAbandon(_ abandon: @escaping @MainActor @Sendable () -> Void) -> Bool {
+        state.withLockUnchecked { state -> Bool in
+            guard !state.cancelled else { return false }
+            state.onAbandon = abandon
+            return true
+        }
+    }
+
+    func clearAbandon() {
+        state.withLockUnchecked { $0.onAbandon = nil }
+    }
+
+    /// A group entered for the coming `prepareBuild`, or nil when already cancelled.
+    func enterPrepare() -> DispatchGroup? {
+        state.withLockUnchecked { state -> DispatchGroup? in
+            guard !state.cancelled else { return nil }
+            let group = DispatchGroup()
+            group.enter()
+            state.prepareGroup = group
+            return group
+        }
+    }
+
+    /// Called once `prepareBuild` has returned, so its staging directory is already gone.
+    func leavePrepare(_ group: DispatchGroup) {
+        state.withLockUnchecked { state in
+            if state.prepareGroup === group { state.prepareGroup = nil }
+        }
+        group.leave()
     }
 
     /// Starts `process` unless already cancelled; the check and the launch share the lock,
