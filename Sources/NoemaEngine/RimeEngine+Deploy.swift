@@ -21,7 +21,7 @@ extension RimeEngine {
     func prepareBuild() -> Bool {
         let user = configuration.userDataDir
         let build = user.appending(path: "build")
-        recoverInterruptedDeployments()
+        guard recoverInterruptedDeployments() else { return false }
         let manifest = DeployManifest.validated(buildDir: build, schemaID: configuration.schemaID)
         if configuration.deployPolicy == .neverDeploy { return manifest != nil }
         guard let inputs = try? DeployManifest.inputs(
@@ -123,43 +123,66 @@ extension RimeEngine {
     }
 
     /// Replaces `build` with `staged`: move the old build aside, move the staged one in,
-    /// and put the old one back if the second rename fails.
+    /// make that durable, and only then drop the old one; put the old one back if the
+    /// second rename fails.
     private func switchBuild(to staged: URL, replacing build: URL, tag: String) -> Bool {
-        let old = configuration.userDataDir.appending(path: Self.oldBuildPrefix + tag)
+        let user = configuration.userDataDir
+        let old = user.appending(path: Self.oldBuildPrefix + tag)
         var info = stat()
-        let hadBuild = lstat(build.path, &info) == 0
-        if hadBuild, rename(build.path, old.path) != 0 { return false }
-        guard rename(staged.path, build.path) == 0 else {
-            if hadBuild { _ = rename(old.path, build.path) }
+        let (buildStatus, buildErrno) = Self.lstatCapturingErrno(build, &info)
+        let hadBuild: Bool
+        if buildStatus == 0 {
+            hadBuild = true
+        } else if buildErrno == ENOENT {
+            hadBuild = false
+        } else {
             return false
         }
-        if hadBuild { try? FileManager.default.removeItem(at: old) }
-        syncDirectory(configuration.userDataDir)
+        if hadBuild, rename(build.path, old.path) != 0 { return false }
+        guard rename(staged.path, build.path) == 0 else {
+            if hadBuild, rename(old.path, build.path) == 0 { syncDirectory(user) }
+            return false
+        }
+        syncDirectory(user)
+        if hadBuild {
+            try? FileManager.default.removeItem(at: old)
+            syncDirectory(user)
+        }
         return true
     }
 
     /// After a crash mid-deployment: when `build/` is missing, put back the best build that
     /// was moved aside but never replaced (one that passes `DeployManifest.validated`, else
     /// any, newest modification time first), make that rename durable, and only then remove
-    /// every other leftover staging directory and old build.
-    private func recoverInterruptedDeployments() {
+    /// every other leftover staging directory and old build. False (Safe Mode) when the state
+    /// of `build/` or a candidate cannot be read or the restoring rename fails; every
+    /// leftover is then kept, so a later boot can still recover.
+    private func recoverInterruptedDeployments() -> Bool {
         let fileManager = FileManager.default
         let user = configuration.userDataDir
-        guard let names = try? fileManager.contentsOfDirectory(atPath: user.path) else { return }
+        guard let names = try? fileManager.contentsOfDirectory(atPath: user.path) else { return false }
         let build = user.appending(path: "build")
         var info = stat()
-        if lstat(build.path, &info) != 0 {
-            let candidates = names.filter { $0.hasPrefix(Self.oldBuildPrefix) }.compactMap { name -> OldBuild? in
+        let (buildStatus, buildErrno) = Self.lstatCapturingErrno(build, &info)
+        if buildStatus != 0 {
+            guard buildErrno == ENOENT else { return false }
+            var candidates: [OldBuild] = []
+            for name in names where name.hasPrefix(Self.oldBuildPrefix) {
                 let url = user.appending(path: name)
                 var candidate = stat()
-                guard lstat(url.path, &candidate) == 0, candidate.st_mode & S_IFMT == S_IFDIR else { return nil }
-                return OldBuild(
+                let (candidateStatus, candidateErrno) = Self.lstatCapturingErrno(url, &candidate)
+                guard candidateStatus == 0 else {
+                    if candidateErrno == ENOENT { continue }
+                    return false
+                }
+                guard candidate.st_mode & S_IFMT == S_IFDIR else { continue }
+                candidates.append(OldBuild(
                     name: name,
                     isValid: DeployManifest.validated(buildDir: url, schemaID: configuration.schemaID) != nil,
-                    modified: candidate.st_mtimespec)
+                    modified: candidate.st_mtimespec))
             }
-            if let best = candidates.max(by: { $0.isWorse(than: $1) }),
-               rename(user.appending(path: best.name).path, build.path) == 0 {
+            if let best = candidates.max(by: { $0.isWorse(than: $1) }) {
+                guard rename(user.appending(path: best.name).path, build.path) == 0 else { return false }
                 syncDirectory(user)
             }
         }
@@ -167,8 +190,17 @@ extension RimeEngine {
             let url = user.appending(path: name)
             var leftover = stat()
             // The restored build no longer exists under its old name.
-            guard lstat(url.path, &leftover) == 0 else { continue }
+            guard Self.lstatCapturingErrno(url, &leftover).0 == 0 else { continue }
             try? fileManager.removeItem(at: url)
+        }
+        return true
+    }
+
+    private nonisolated static func lstatCapturingErrno(_ url: URL, _ info: inout stat) -> (Int32, Int32) {
+        url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return (-1, EINVAL) }
+            let result = lstat(path, &info)
+            return (result, result == 0 ? 0 : errno)
         }
     }
 

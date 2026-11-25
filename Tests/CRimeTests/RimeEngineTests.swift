@@ -637,6 +637,51 @@ extension LibrimeSerializedTests {
             #expect(try workspace.deployLeftovers().isEmpty)
         }
 
+        /// When the restoring rename fails (here an ACL denies adding a subdirectory to
+        /// `user_data_dir`, while file writes, deletes, and the lock still work), recovery
+        /// enters Safe Mode and keeps every `.build-old.*`, under both policies, so the
+        /// old build is still restorable once the permission returns.
+        @Test func interruptedSwitchRenameFailurePreservesOldBuildsUntilPermissionsRecover() throws {
+            let workspace = try EngineWorkspace()
+            let first = try workspace.engine()
+            first.type("nihao")
+            #expect(first.currentState.candidates.first?.text == "你好")
+            first.shutdown()
+            let deployed = try workspace.deploymentID()
+            let build = workspace.user.appending(path: "build")
+            let interrupted = workspace.user.appending(path: ".build-old.interrupted")
+            let secondary = workspace.user.appending(path: ".build-old.secondary")
+            try FileManager.default.copyItem(at: build, to: secondary)
+            try workspace.setModificationDate(Date(timeIntervalSinceNow: -3600), of: secondary)
+            try #require(rename(build.path, interrupted.path) == 0)
+            func oldBuildsAreIntact() {
+                #expect(!FileManager.default.fileExists(atPath: build.path))
+                #expect(FileManager.default.fileExists(atPath: interrupted.path))
+                #expect(FileManager.default.fileExists(atPath: secondary.path))
+            }
+
+            try workspace.chmod("+a", "everyone deny add_subdirectory")
+            defer { try? workspace.chmod("-N") }
+            for policy in [RimeEngineConfiguration.DeployPolicy.neverDeploy, .deployIfNeeded] {
+                let refused = try workspace.engine(policy: policy)
+                #expect(refused.safeModeReason == .engineInitFailed, "\(policy)")
+                refused.shutdown()
+                oldBuildsAreIntact()
+            }
+
+            try workspace.chmod("-N")
+            let engine = try workspace.engine(policy: .neverDeploy)
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == .bootCrashLoop, "two failed boots trip the boot guard")
+            oldBuildsAreIntact()
+            #expect(engine.recoverFromSafeMode())
+            #expect(!engine.isSafeMode)
+            #expect(try workspace.deploymentID() == deployed, "the old build is restored, not redeployed")
+            #expect(try workspace.deployLeftovers().isEmpty)
+            engine.type("nihao")
+            #expect(engine.currentState.candidates.first?.text == "你好")
+        }
+
         // MARK: Lifecycle
 
         @Test func onlyOneLiveEngineAtATime() throws {
@@ -878,6 +923,7 @@ final class EngineWorkspace {
     var user: URL { root.appending(path: "user") }
     var logs: URL { root.appending(path: "log") }
     var sentinel: URL { user.appending(path: BootGuard.sentinelFileName) }
+    private var hasACL = false
 
     init(sharedFiles: [String]? = nil) throws {
         root = FileManager.default.temporaryDirectory.appending(path: "noema-engine-tests-\(UUID().uuidString)")
@@ -894,7 +940,8 @@ final class EngineWorkspace {
     }
 
     deinit {
-        chmod(user.path, 0o755)
+        if hasACL { try? chmod("-N") }
+        Darwin.chmod(user.path, 0o755)
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -957,6 +1004,18 @@ final class EngineWorkspace {
     func deployLeftovers() throws -> [String] {
         try FileManager.default.contentsOfDirectory(atPath: user.path)
             .filter { $0.hasPrefix(".deploy-staging.") || $0.hasPrefix(".build-old.") }
+    }
+
+    /// Runs `/bin/chmod <arguments> <user>`, e.g. to add (`+a`) or strip (`-N`) an ACL.
+    func chmod(_ arguments: String...) throws {
+        guard FileManager.default.fileExists(atPath: user.path) else { return }
+        let process = Process()
+        process.executableURL = URL(filePath: "/bin/chmod")
+        process.arguments = arguments + [user.path]
+        try process.run()
+        process.waitUntilExit()
+        try #require(process.terminationStatus == 0, "chmod \(arguments) failed")
+        hasACL = arguments.first == "+a" || (hasACL && arguments.first != "-N")
     }
 
     func setModificationDate(_ date: Date, of url: URL) throws {
