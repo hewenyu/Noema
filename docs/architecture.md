@@ -29,7 +29,7 @@ noema-rime-deployer ─┘        │                      │
 NoemaText, NoemaIPC: standalone libraries
 ```
 
-Tests use Swift Testing only. `NoemaCoreTests` cover `NoemaCore`, `NoemaIPC`, and `NoemaText`; `NoemaEngineTests` cover `RimeKeyMapper`, `BootGuard`, `DeployManifest`, and candidate labels without librime; `NoemaIMEShellTests` feed real `NSEvent`s to `NSEventKeyBridge`; `NoemaUITests` cover panel layout with real CoreText fonts, width hysteresis, and caret placement headlessly. `CRimeTests` holds every test that initializes librime, under the serialized suite `LibrimeSerializedTests`: the raw bridge, `RimeEngine` on `Resources/rime-default` (every Safe Mode reason, failed and cancelled deployments, P95 latency under 2 ms), `InputSessionCoordinator` on the real engine, and the real `noema-cli` and `NoemaIME` executables, which `swift test` therefore builds.
+Tests use Swift Testing only. `NoemaCoreTests` cover `NoemaCore`, `NoemaIPC`, and `NoemaText`; `NoemaEngineTests` cover `RimeKeyMapper`, `BootGuard`, `DeployManifest`, and candidate labels without librime; `NoemaIMEShellTests` feed real `NSEvent`s to `NSEventKeyBridge` and check `DocumentCaretRange`; `NoemaUITests` cover panel layout with real CoreText fonts, width hysteresis, and caret placement headlessly. `CRimeTests` holds every test that initializes librime, under the serialized suite `LibrimeSerializedTests`: the raw bridge, `RimeEngine` on `Resources/rime-default` (every Safe Mode reason, failed and cancelled deployments, P95 latency under 2 ms), `InputSessionCoordinator` on the real engine, and the real `noema-cli` and `NoemaIME` executables, which `swift test` therefore builds.
 
 ## Typing engine
 
@@ -59,7 +59,7 @@ IMKit creates one `NoemaInputController` per client session; it forwards every I
 
 ## Candidate panel
 
-`CandidatePanelController` implements `CandidatePresenting` with one reused non-activating `NSPanel` above the client's window level. `CaretPositionResolver` places it below the client's caret (above near the screen bottom), falling back to the last valid caret of the same `uniqueClientIdentifier`, then the mouse. `CandidateLayoutEngine` lays out with CoreText; `WidthHysteresis` keeps widths on 32 pt tiers that never shrink within a composition. The backdrop is `NSGlassEffectView` or, in `.visualEffect` mode, `NSVisualEffectView`. Manual checks: [smoke checklist](runbooks/smoke-checklist.md). Rationale: [candidate panel note](../.agents/notes/implemented/architecture/2026-11-25-candidate-panel-coretext-glass.md).
+`CandidatePanelController` implements `CandidatePresenting` with one reused non-activating `NSPanel` above the client's window level. `CaretPositionResolver` places it below the client's caret (above near the screen bottom), falling back to the last valid caret of the same `uniqueClientIdentifier`, then the mouse. `CandidateLayoutEngine` lays out with CoreText and scrolls an overflowing floating preedit to keep its caret visible; `WidthHysteresis` keeps widths on 32 pt tiers that never shrink within a composition. The backdrop is `NSGlassEffectView` or, in `.visualEffect` mode, `NSVisualEffectView`. Manual checks: [smoke checklist](runbooks/smoke-checklist.md). Rationale: [candidate panel note](../.agents/notes/implemented/architecture/2026-11-25-candidate-panel-coretext-glass.md).
 
 ## Build pipeline
 

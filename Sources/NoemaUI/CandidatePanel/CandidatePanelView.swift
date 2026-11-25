@@ -23,7 +23,10 @@ public final class CandidatePanelView: NSView {
     private let highlightHost = FlippedView()
     private let highlightLayer = CAShapeLayer()
     private let contentView: CandidateContentView
-    private var pressedTarget: CandidateHitTarget?
+    /// The target under `mouseDown` and the generation it was laid out for. A refresh to
+    /// another generation before `mouseUp` cancels the click, so a press on an old panel
+    /// never commits a candidate of the new one.
+    private var pressed: (target: CandidateHitTarget, generationID: UInt64)?
     private var scrollAccumulator: CGFloat = 0
 
     public init(style: CandidatePanelStyle) {
@@ -61,6 +64,7 @@ public final class CandidatePanelView: NSView {
     /// Shows `layout`; the caller wraps this in a `CATransaction` with actions disabled.
     public func apply(_ layout: CandidatePanelLayout) {
         guard layout != self.layout else { return }
+        if self.layout?.generationID != layout.generationID { pressed = nil }
         self.layout = layout
         contentView.layout = layout
         let frame = CGRect(origin: .zero, size: layout.panelSize)
@@ -82,7 +86,7 @@ public final class CandidatePanelView: NSView {
 
     /// Clears the press state, e.g. when the panel hides mid-click.
     public func reset() {
-        pressedTarget = nil
+        pressed = nil
         scrollAccumulator = 0
     }
 
@@ -103,16 +107,20 @@ public final class CandidatePanelView: NSView {
     // MARK: - Mouse
 
     override public func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        pressedTarget = layout?.hitTest(point)
+        guard let layout else { pressed = nil; return }
+        let target = layout.hitTest(convert(event.locationInWindow, from: nil))
+        pressed = target == .none ? nil : (target, layout.generationID)
     }
 
+    /// Fires only when the release lands on the pressed target of the same generation, and
+    /// always reports the press's generation, never a newer layout's.
     override public func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        defer { pressedTarget = nil }
-        guard let layout, let pressed = pressedTarget, layout.hitTest(point) == pressed else { return }
-        switch pressed {
-        case .candidate(let index): onSelectCandidate?(index, layout.generationID)
+        defer { pressed = nil }
+        guard let layout, let pressed, layout.generationID == pressed.generationID,
+              layout.hitTest(point) == pressed.target else { return }
+        switch pressed.target {
+        case .candidate(let index): onSelectCandidate?(index, pressed.generationID)
         case .expandButton: onToggleExpand?()
         case .none: break
         }
@@ -167,9 +175,13 @@ private final class CandidateContentView: NSView {
         let scale = window?.backingScaleFactor ?? 2
 
         if let strip = layout.preeditStrip {
+            // Text and caret scroll inside `clipRect`; nothing spills past the panel edge.
+            ctx.saveGState()
+            ctx.clip(to: strip.clipRect)
             drawLine(CandidateTypesetter.line(strip.text, font: fonts.preedit.font, color: palette.preeditText), at: strip.textOrigin, in: ctx)
             ctx.setFillColor(palette.caret)
             ctx.fill(strip.caretRect)
+            ctx.restoreGState()
             if let dividerY = strip.dividerY {
                 let hairline = 1 / scale
                 ctx.setFillColor(palette.divider)

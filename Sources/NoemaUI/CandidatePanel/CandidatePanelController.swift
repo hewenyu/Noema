@@ -164,7 +164,9 @@ public final class CandidatePanelController: CandidatePresenting {
     /// launcher panels), at most the screen saver level.
     static func windowLevel(above clientLevel: Int?) -> NSWindow.Level {
         let ceiling = Int(CGWindowLevelForKey(.screenSaverWindow))
-        return NSWindow.Level(rawValue: max(NSWindow.Level.popUpMenu.rawValue, min((clientLevel ?? 0) + 1, ceiling)))
+        let level = clientLevel ?? 0
+        let raised = level >= ceiling ? ceiling : level + 1
+        return NSWindow.Level(rawValue: max(NSWindow.Level.popUpMenu.rawValue, raised))
     }
 
     private func installBackdrop() {

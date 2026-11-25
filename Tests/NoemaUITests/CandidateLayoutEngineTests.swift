@@ -80,6 +80,40 @@ import Testing
         #expect(engine.layout(state: state(["你好"]), options: inline, expanded: false).preeditStrip == nil)
     }
 
+    /// A floating preedit wider than `maxPanelWidth` scrolls horizontally inside its clip
+    /// rect: the caret is always visible and never drawn past the panel edge.
+    @Test func overflowingFloatingPreeditScrollsToKeepTheCaretVisible() throws {
+        let preedit = String(repeating: "nihao ", count: 30)
+        let length = preedit.utf16.count
+        func strip(caret: Int) throws -> (CandidatePanelLayout, PreeditStripLayout) {
+            let layout = engine.layout(state: state(["你好"], preedit: preedit, caret: caret), options: floating, expanded: false)
+            return (layout, try #require(layout.preeditStrip))
+        }
+        func expectInside(_ layout: CandidatePanelLayout, _ strip: PreeditStripLayout) {
+            #expect(strip.caretRect.minX >= strip.clipRect.minX, "caret \(strip.caretRect) clip \(strip.clipRect)")
+            #expect(strip.caretRect.maxX <= strip.clipRect.maxX, "caret \(strip.caretRect) clip \(strip.clipRect)")
+            #expect(strip.clipRect.maxX <= layout.panelSize.width)
+            #expect(layout.panelSize.width <= style.maxPanelWidth)
+            #expect(strip.textOrigin.x == strip.clipRect.minX - strip.scrollOffset)
+        }
+
+        let (endLayout, end) = try strip(caret: length)
+        #expect(end.scrollOffset > 0)
+        expectInside(endLayout, end)
+
+        let (middleLayout, middle) = try strip(caret: length / 2)
+        expectInside(middleLayout, middle)
+        #expect(middle.scrollOffset <= end.scrollOffset)
+
+        let (startLayout, start) = try strip(caret: 0)
+        #expect(start.scrollOffset == 0 && start.caretRect.minX == start.clipRect.minX)
+        expectInside(startLayout, start)
+
+        // A preedit that fits never scrolls.
+        let short = try #require(engine.layout(state: state(["你好"]), options: floating, expanded: false).preeditStrip)
+        #expect(short.scrollOffset == 0 && short.textOrigin.x == short.clipRect.minX)
+    }
+
     // MARK: Clamping, emoji
 
     @Test func longCandidatesAreTruncatedWithinTheMaximumWidth() throws {

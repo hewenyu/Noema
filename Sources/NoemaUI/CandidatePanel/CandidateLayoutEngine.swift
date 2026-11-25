@@ -27,8 +27,13 @@ public struct CandidateItemLayout: Sendable, Hashable {
 /// The floating preedit drawn for inline-preedit-disabled clients.
 public struct PreeditStripLayout: Sendable, Hashable {
     public let frame: CGRect
+    /// The text area inside `frame`; text and caret are drawn clipped to it.
+    public let clipRect: CGRect
+    /// How far the text is scrolled left so the caret stays inside `clipRect` (0 when it fits).
+    public let scrollOffset: CGFloat
+    /// The text baseline origin, already shifted left by `scrollOffset`.
     public let textOrigin: CGPoint
-    /// The caret bar at the engine's UTF-16 caret offset.
+    /// The caret bar at the engine's UTF-16 caret offset, always inside `clipRect`.
     public let caretRect: CGRect
     public let text: String
     /// The hairline between the strip and the candidates; nil without candidates.
@@ -154,9 +159,15 @@ public struct CandidateLayoutEngine: Sendable {
         var stripLayout: PreeditStripLayout?
         if let strip {
             let frame = CGRect(x: s.horizontalPadding, y: y, width: width - 2 * s.horizontalPadding, height: strip.height)
-            let origin = CGPoint(x: frame.minX + s.pillHorizontalInset, y: (y + s.preeditVerticalInset + fonts.preedit.ascent).rounded())
+            let clipRect = CGRect(
+                x: frame.minX + s.pillHorizontalInset, y: frame.minY,
+                width: max(frame.width - 2 * s.pillHorizontalInset, 0), height: frame.height)
+            let scrollOffset = Self.preeditScrollOffset(
+                textWidth: max(strip.line.width, strip.caretX), caretX: strip.caretX,
+                viewport: max(clipRect.width - s.caretWidth, 0))
+            let origin = CGPoint(x: clipRect.minX - scrollOffset, y: (y + s.preeditVerticalInset + fonts.preedit.ascent).rounded())
             let caret = CGRect(
-                x: origin.x + strip.caretX, y: y + s.preeditVerticalInset,
+                x: clipRect.minX + strip.caretX - scrollOffset, y: y + s.preeditVerticalInset,
                 width: s.caretWidth, height: ceil(fonts.preedit.ascent + fonts.preedit.descent))
             y += strip.height
             var dividerY: CGFloat?
@@ -164,7 +175,9 @@ public struct CandidateLayoutEngine: Sendable {
                 dividerY = y + s.dividerInset
                 y += 2 * s.dividerInset
             }
-            stripLayout = PreeditStripLayout(frame: frame, textOrigin: origin, caretRect: caret, text: state.preedit, dividerY: dividerY)
+            stripLayout = PreeditStripLayout(
+                frame: frame, clipRect: clipRect, scrollOffset: scrollOffset, textOrigin: origin,
+                caretRect: caret, text: state.preedit, dividerY: dividerY)
         }
 
         let firstRowY = y
@@ -197,6 +210,18 @@ public struct CandidateLayoutEngine: Sendable {
             panelSize: CGSize(width: width, height: height), contentWidth: contentWidth, cornerRadius: radius,
             isExpanded: expanded, preeditStrip: stripLayout, items: items, highlightedPillFrame: highlighted,
             expandButtonFrame: button, generationID: state.generationID)
+    }
+
+    /// How far to scroll a floating preedit of `textWidth` so the caret at `caretX` stays in
+    /// `[0, viewport]`: 0 while the caret is left of the trailing margin, otherwise just
+    /// enough to put it at the margin, never past the end of the text. Since
+    /// `caretX <= textWidth`, the scrolled caret is always within `[0, viewport]`.
+    static func preeditScrollOffset(textWidth: CGFloat, caretX: CGFloat, viewport: CGFloat) -> CGFloat {
+        let maxScroll = max(textWidth - viewport, 0)
+        guard maxScroll > 0 else { return 0 }
+        let margin = min(24, viewport * 0.25)
+        guard caretX > viewport - margin else { return 0 }
+        return min(maxScroll, max(caretX - (viewport - margin), 0))
     }
 
     /// The largest cap `c` with `sum(min(w, c)) <= budget` (water-filling), never below 0.

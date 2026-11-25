@@ -3,6 +3,7 @@ import Foundation
 import NoemaCore
 import NoemaEngine
 import NoemaIMEShell
+import NoemaUI
 import Testing
 
 /// `InputSessionCoordinator` driving the real `RimeEngine` on the shipped schema: what
@@ -529,6 +530,65 @@ extension LibrimeSerializedTests {
             #expect(harness.engine.currentState.generationID == current, "the engine never saw the click")
         }
 
+        /// The real `CandidatePanelView` wired to the coordinator the way the panel
+        /// controller wires it: a press on generation A, a refresh to generation B, then a
+        /// release on the same point commits nothing (Codex review of PR #19).
+        @Test func clickPressedOnAStalePanelNeverCommitsTheRefreshedCandidate() throws {
+            let harness = try Harness()
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            let panel = PanelUnderTest(coordinator: harness.coordinator)
+
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let layoutA = panel.show(try #require(harness.presenter.lastState))
+            #expect(layoutA.items.first?.displayText == "你")
+            let point = try #require(layoutA.items.first).pillFrame.center
+            client.calls.removeAll()
+            panel.view.mouseDown(with: try panel.mouse(.leftMouseDown, at: point))
+
+            for key in "hao" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let layoutB = panel.show(try #require(harness.presenter.lastState))
+            #expect(layoutB.generationID != layoutA.generationID && layoutB.items.first?.displayText == "你好")
+            #expect(layoutB.hitTest(point) == .candidate(0), "the release lands on candidate 0 of B")
+            client.calls.removeAll()
+            panel.view.mouseUp(with: try panel.mouse(.leftMouseUp, at: point))
+            #expect(client.inserts.isEmpty, "a stale press commits nothing: \(client.calls)")
+            #expect(harness.engine.currentState.preedit == "ni hao")
+
+            // Without an intervening refresh the same click commits candidate 0.
+            _ = harness.coordinator.handleKey(.key(VirtualKeyCode.escape, "\u{1B}"), token: token, client: client)
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let layoutC = panel.show(try #require(harness.presenter.lastState))
+            #expect(layoutC.items.first?.displayText == "你")
+            client.calls.removeAll()
+            panel.view.mouseDown(with: try panel.mouse(.leftMouseDown, at: point))
+            panel.view.mouseUp(with: try panel.mouse(.leftMouseUp, at: point))
+            #expect(client.inserts == ["你"])
+            #expect(!harness.engine.currentState.isComposing)
+        }
+
+        /// Real Rime with inline preedit disabled: a 150-letter preedit overflows the panel,
+        /// and the floating strip scrolls so the caret stays inside its clip rect.
+        @Test func longPanelOnlyPreeditKeepsTheCaretInsideThePanel() throws {
+            let harness = try Harness(inlinePreeditDisabledBundleIDs: [RecordingClient.bundleID])
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            for key in String(repeating: "nihao", count: 30) {
+                _ = harness.coordinator.handleKey(.text(key), token: token, client: client)
+            }
+            let state = try #require(harness.presenter.lastState)
+            let options = try #require(harness.presenter.lastOptions)
+            #expect(options.rendersPreeditInPanel && client.calls.isEmpty)
+            let style = CandidatePanelStyle()
+            let layout = CandidateLayoutEngine(style: style).layout(state: state, options: options, expanded: false)
+            let strip = try #require(layout.preeditStrip)
+            #expect(strip.scrollOffset > 0, "the preedit overflows: \(state.preedit.utf16.count) UTF-16 units")
+            #expect(strip.caretRect.minX >= strip.clipRect.minX && strip.caretRect.maxX <= strip.clipRect.maxX)
+            #expect(strip.clipRect.maxX <= layout.panelSize.width && layout.panelSize.width <= style.maxPanelWidth)
+        }
+
         @Test func pagingFromThePanelRefreshesCandidates() throws {
             let harness = try Harness()
             defer { harness.shutdown() }
@@ -575,6 +635,50 @@ final class RecordingClient: TextInputClient {
     }
 
     func clearMarkedText() { calls.append(.clear) }
+
+    var inserts: [String] {
+        calls.compactMap { if case .insert(let text) = $0 { text } else { nil } }
+    }
+}
+
+/// The shipped `CandidatePanelView` in an offscreen window, its click callback wired to
+/// the coordinator as `CandidatePanelController` wires it.
+@MainActor
+final class PanelUnderTest {
+    let window: NSWindow
+    let view = CandidatePanelView(style: CandidatePanelStyle())
+    private let engine = CandidateLayoutEngine(style: CandidatePanelStyle())
+
+    init(coordinator: InputSessionCoordinator) {
+        window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: 800, height: 200), styleMask: [.borderless],
+            backing: .buffered, defer: false)
+        window.contentView = view
+        view.onSelectCandidate = { index, generation in
+            _ = coordinator.selectCandidate(at: index, expectedGenerationID: generation)
+        }
+    }
+
+    /// Lays out `state` as the inline-preedit panel and applies it to the view.
+    @discardableResult
+    func show(_ state: CompositionState) -> CandidatePanelLayout {
+        let layout = engine.layout(state: state, options: CandidatePresentationOptions(), expanded: false)
+        view.frame = CGRect(origin: .zero, size: layout.panelSize)
+        view.apply(layout)
+        return layout
+    }
+
+    /// A real mouse event at `point` in the view's (flipped) coordinates.
+    func mouse(_ type: NSEvent.EventType, at point: CGPoint) throws -> NSEvent {
+        try #require(NSEvent.mouseEvent(
+            with: type, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+            pressure: type == .leftMouseDown ? 1 : 0))
+    }
+}
+
+private extension CGRect {
+    var center: CGPoint { CGPoint(x: midX, y: midY) }
 }
 
 @MainActor

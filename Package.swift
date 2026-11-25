@@ -59,7 +59,7 @@ let package = Package(
         // deployer RimeEngine spawns and the executables the end-to-end tests run.
         .testTarget(
             name: "CRimeTests",
-            dependencies: ["CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "noema-rime-deployer", "noema-cli", "NoemaIME"]
+            dependencies: ["CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaUI", "noema-rime-deployer", "noema-cli", "NoemaIME"]
         ),
     ],
     // Swift 6 language mode: complete strict-concurrency checking for every Swift target.
