@@ -1,11 +1,12 @@
 import Carbon.HIToolbox
+import CryptoKit
 import Darwin
 import Foundation
 import NoemaCore
 
 /// A running process identified by pid plus start time, so a recycled pid is never
 /// mistaken for the process that was found.
-struct ProcessIdentity: Hashable {
+struct ProcessIdentity: Hashable, Codable {
     let pid: pid_t
     let startSeconds: UInt64
     let startMicroseconds: UInt64
@@ -56,7 +57,6 @@ enum IMEProcesses {
     }
 
     /// Processes of the current user, other than this one, whose canonical executable path
-    /// is `canonicalExecutable`.
     /// is `canonicalExecutable`. The pid's identity is read before and after its path, so
     /// a pid recycled in between is skipped rather than attributed the other's path.
     static func running(canonicalExecutable: String) -> [ProcessIdentity] {
@@ -82,13 +82,23 @@ enum IMEProcesses {
         return info.identity == identity && !info.isZombie
     }
 
-    /// Sends SIGTERM to each process that is still the same process and still ours, then
-    /// waits up to `timeout` for all of them to exit. Returns (signalled, still running).
-    static func terminate(_ identities: [ProcessIdentity], timeout: Duration = .seconds(3)) -> (signalled: Int, remaining: Int) {
+    struct TerminateResult {
+        /// Processes sent SIGTERM.
+        let signalled: Int
+        /// Signalled processes that exited within the timeout.
+        let stopped: Int
+        /// Signalled processes still running at the timeout.
+        let remaining: [ProcessIdentity]
+    }
+
+    /// Sends SIGTERM to each process that is still the same process (pid and start time),
+    /// still ours, and not a zombie, then waits up to `timeout` for all of them to exit.
+    static func terminate(_ identities: [ProcessIdentity], timeout: Duration = .seconds(3)) -> TerminateResult {
         let uid = getuid()
         var signalled: [ProcessIdentity] = []
         for identity in Set(identities) {
-            guard let info = bsdInfo(identity.pid), info.uid == uid, info.identity == identity else { continue }
+            guard let info = bsdInfo(identity.pid), info.uid == uid, info.identity == identity, !info.isZombie
+            else { continue }
             if kill(identity.pid, SIGTERM) == 0 { signalled.append(identity) }
         }
         let clock = ContinuousClock()
@@ -98,12 +108,122 @@ enum IMEProcesses {
             usleep(50_000)
             remaining = remaining.filter(isAlive)
         }
-        return (signalled.count, remaining.count)
+        return TerminateResult(signalled: signalled.count, stopped: signalled.count - remaining.count, remaining: remaining)
+    }
+
+    /// Lowercase hex SHA-256 of `text`, naming per-path files in the temporary directory.
+    static func digest(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Blocks until this process holds the exclusive install lock for `canonicalDirectory`
+    /// (an Input Methods directory). `install` and `reload` both take it, so the swap, the
+    /// pending-reload ledger, and the termination never interleave. Returns the descriptor.
+    static func lockDirectory(_ canonicalDirectory: String) throws(CLIError) -> Int32 {
+        // The per-user temporary directory, never the shared /tmp.
+        let path = FileManager.default.temporaryDirectory
+            .appending(path: "noema-ime-install-\(digest(canonicalDirectory)).lock", directoryHint: .notDirectory).fileSystemPath
+        let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw CLIError("cannot open install lock \(path): \(String(cString: strerror(errno)))") }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            close(descriptor)
+            throw CLIError("cannot lock \(path): \(String(cString: strerror(errno)))")
+        }
+        return descriptor
     }
 
     /// Registers the bundle with Text Input Sources so it appears in System Settings.
     static func register(bundle: URL) -> OSStatus {
         TISRegisterInputSource(bundle as CFURL)
+    }
+}
+
+/// Processes of a replaced bundle that still have to be stopped: what `install --no-reload`
+/// saw running before the swap, or what a `--reload` or `reload` could not stop in time.
+/// Once a bundle is renamed away its processes no longer run from the target path, so a
+/// later `reload` finds them only here.
+///
+/// One JSON file per user and canonical target bundle in the per-user temporary
+/// directory, read and written only under `IMEProcesses.lockDirectory` of the bundle's
+/// parent. Reads refuse a symlink, a non-regular file, another owner, more than 64 KiB, or
+/// a payload for another uid or bundle; writes go through an fsynced `0600` sibling and
+/// `rename(2)`. Every identity is re-checked (pid, start time, uid) before any signal.
+enum PendingReloadStore {
+    struct Payload: Codable {
+        let uid: uid_t
+        let canonicalBundle: String
+        let processes: [ProcessIdentity]
+    }
+
+    static let maximumSize = 64 * 1024
+
+    static func path(canonicalBundle: String) -> String {
+        FileManager.default.temporaryDirectory
+            .appending(path: "noema-ime-pending-reload-\(IMEProcesses.digest(canonicalBundle)).json", directoryHint: .notDirectory)
+            .fileSystemPath
+    }
+
+    /// The recorded processes that are still alive; empty when there is no valid ledger.
+    static func load(canonicalBundle: String) -> [ProcessIdentity] {
+        let descriptor = open(path(canonicalBundle: canonicalBundle), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { return [] }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
+              info.st_size <= off_t(maximumSize)
+        else { return [] }
+        var bytes = [UInt8](repeating: 0, count: maximumSize + 1)
+        var total = 0
+        while total < bytes.count {
+            let count = bytes.withUnsafeMutableBytes { read(descriptor, $0.baseAddress! + total, $0.count - total) }
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { break }
+            total += count
+        }
+        guard total <= maximumSize,
+              let payload = try? JSONDecoder().decode(Payload.self, from: Data(bytes[0..<total])),
+              payload.uid == getuid(), payload.canonicalBundle == canonicalBundle
+        else { return [] }
+        return payload.processes.filter(IMEProcesses.isAlive)
+    }
+
+    /// Records `processes` (deduplicated); an empty list removes the ledger.
+    static func save(_ processes: [ProcessIdentity], canonicalBundle: String) throws(CLIError) {
+        let unique = Array(Set(processes)).sorted { $0.pid < $1.pid }
+        guard !unique.isEmpty else { return clear(canonicalBundle: canonicalBundle) }
+        let final = path(canonicalBundle: canonicalBundle)
+        guard let data = try? JSONEncoder().encode(Payload(uid: getuid(), canonicalBundle: canonicalBundle, processes: unique)),
+              data.count <= maximumSize
+        else { throw CLIError("cannot encode the pending-reload ledger") }
+        let temporary = "\(final).tmp.\(getpid())"
+        unlink(temporary)
+        let descriptor = open(temporary, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else {
+            throw CLIError("cannot write the pending-reload ledger \(temporary): \(String(cString: strerror(errno)))")
+        }
+        var ok = data.withUnsafeBytes { buffer -> Bool in
+            var offset = 0
+            while offset < buffer.count {
+                let count = write(descriptor, buffer.baseAddress! + offset, buffer.count - offset)
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else { return false }
+                offset += count
+            }
+            return true
+        }
+        ok = ok && fsync(descriptor) == 0
+        ok = close(descriptor) == 0 && ok
+        guard ok, rename(temporary, final) == 0 else {
+            unlink(temporary)
+            throw CLIError("cannot write the pending-reload ledger \(final)")
+        }
+        InstallCommand.syncDirectory(FileManager.default.temporaryDirectory.fileSystemPath)
+    }
+
+    static func clear(canonicalBundle: String) {
+        if unlink(path(canonicalBundle: canonicalBundle)) == 0 {
+            InstallCommand.syncDirectory(FileManager.default.temporaryDirectory.fileSystemPath)
+        }
     }
 }
 

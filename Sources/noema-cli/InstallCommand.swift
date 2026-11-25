@@ -1,4 +1,3 @@
-import CryptoKit
 import Darwin
 import Foundation
 import NoemaCore
@@ -8,7 +7,9 @@ import NoemaCore
 /// The bundle is copied into a staging directory inside `--dest` first and every check
 /// runs on that copy, so what was checked is exactly what is installed. The swap is two
 /// `rename(2)` calls under a per-destination `flock`, rolled back if the second fails; an
-/// existing target that is not a Noema bundle is never touched.
+/// existing target that is not a Noema bundle is never touched. Processes of the replaced
+/// bundle that are not stopped (`--no-reload`, or a reload timeout, which exits 1) go to
+/// the `PendingReloadStore` for a later `noema-cli reload`.
 enum InstallCommand {
     static let usage = """
         usage: noema-cli install [--bundle <path>] [--dest <dir>] [--allow-adhoc]
@@ -125,11 +126,13 @@ enum InstallCommand {
         // 3. Swap under the per-destination lock.
         let target = "\(canonicalDest)/\(NoemaPaths.imeBundleName)"
         let executable = "\(target)/Contents/MacOS/\(NoemaPaths.imeExecutableName)"
-        let lock = try lockDestination(canonicalDest)
+        let lock = try IMEProcesses.lockDirectory(canonicalDest)
         defer { close(lock) }
         try ensureReplaceable(target)
         // Before the swap: once renamed away, an old process's executable no longer has
-        // the target path.
+        // the target path. Earlier `--no-reload` installs or timed-out reloads left theirs
+        // in the pending-reload ledger.
+        let pending = PendingReloadStore.load(canonicalBundle: target)
         let before = IMEProcesses.running(canonicalExecutable: executable)
         let old = "\(canonicalDest)/.\(NoemaPaths.imeBundleName).old.\(tag)"
         let hadTarget = FileKind.of(target) != .missing
@@ -156,12 +159,30 @@ enum InstallCommand {
                 fputs("noema-cli install: TISRegisterInputSource returned \(status)\n", stderr)
             }
         }
-        if options.reload {
-            let after = IMEProcesses.running(canonicalExecutable: executable)
-            let (signalled, remaining) = IMEProcesses.terminate(before + after)
-            print("reloaded: stopped \(signalled) NoemaIME process(es); macOS relaunches it on next use")
-            if remaining > 0 { fputs("noema-cli install: \(remaining) process(es) did not exit within 3 s\n", stderr) }
+        guard options.reload else {
+            // `noema-cli reload --bundle <target>` stops them later.
+            do {
+                try PendingReloadStore.save(pending + before, canonicalBundle: target)
+            } catch {
+                fputs("noema-cli install: warning: \(error.message)\n", stderr)
+            }
+            return
         }
+        let after = IMEProcesses.running(canonicalExecutable: executable)
+        let result = IMEProcesses.terminate(pending + before + after)
+        guard result.remaining.isEmpty else {
+            do {
+                try PendingReloadStore.save(result.remaining, canonicalBundle: target)
+            } catch {
+                fputs("noema-cli install: warning: \(error.message)\n", stderr)
+            }
+            throw CLIError("""
+                installed \(target), but reload failed: signalled \(result.signalled), stopped \(result.stopped), \
+                \(result.remaining.count) process(es) did not exit within 3 s (retry with noema-cli reload --bundle \(target))
+                """)
+        }
+        PendingReloadStore.clear(canonicalBundle: target)
+        print("reloaded: stopped \(result.stopped) NoemaIME process(es); macOS relaunches it on next use")
     }
 
     /// The installed bundle may be replaced only when it is a real directory holding a
@@ -249,21 +270,6 @@ enum InstallCommand {
         if isAdhoc {
             fputs("noema-cli install: warning: installing an ad-hoc signed bundle (local development only)\n", stderr)
         }
-    }
-
-    /// Blocks until this process holds the exclusive install lock for `canonicalDest`.
-    static func lockDestination(_ canonicalDest: String) throws(CLIError) -> Int32 {
-        let digest = SHA256.hash(data: Data(canonicalDest.utf8)).map { String(format: "%02x", $0) }.joined()
-        // The per-user temporary directory, never the shared /tmp.
-        let path = FileManager.default.temporaryDirectory
-            .appending(path: "noema-ime-install-\(digest).lock", directoryHint: .notDirectory).fileSystemPath
-        let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw CLIError("cannot open install lock \(path): \(String(cString: strerror(errno)))") }
-        guard flock(descriptor, LOCK_EX) == 0 else {
-            close(descriptor)
-            throw CLIError("cannot lock \(path): \(String(cString: strerror(errno)))")
-        }
-        return descriptor
     }
 
     static func readPlist(_ path: String) -> [String: Any]? {

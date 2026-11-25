@@ -76,14 +76,22 @@ func runInputMethodServer() -> Never {
     app.setActivationPolicy(.prohibited)
 
     // SIGTERM (`noema-cli reload`, logout) and SIGINT: release librime and the user-data
-    // lock before exiting.
+    // lock before exiting. The engine boots off the main actor, so this handler runs even
+    // mid-deployment; shutdown() then stops the deployer subprocess before exit.
     var signalSources: [any DispatchSourceSignal] = []
     for signalNumber in [SIGTERM, SIGINT] {
         signal(signalNumber, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
         source.setEventHandler {
-            MainActor.assumeIsolated { EngineHost.shared.shutdown() }
-            exit(0)
+            let bootTask = MainActor.assumeIsolated { EngineHost.shared.shutdown() }
+            guard let bootTask else { exit(0) }
+            // Let the cancelled boot task finish staging cleanup and disarm the sentinel,
+            // bounded well under `noema-cli reload`'s 3 s wait.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { exit(0) }
+            Task { @MainActor in
+                await bootTask.value
+                exit(0)
+            }
         }
         source.resume()
         signalSources.append(source)

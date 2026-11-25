@@ -190,24 +190,74 @@ extension LibrimeSerializedTests {
         @Test func installReloadStopsTheProcessOfTheReplacedBundle() throws {
             let fixture = try BundleFixture()
             #expect(try fixture.install().status == 0)
-            let running = fixture.dest.appending(path: "NoemaIME.app/Contents/MacOS/NoemaIME")
-            try FileManager.default.removeItem(at: running)
-            try FileManager.default.copyItem(atPath: "/bin/sleep", toPath: running.path)
-            try #require(try Tool.run("/usr/bin/codesign", ["--force", "--sign", "-", running.path]).status == 0)
-            let old = Process()
-            old.executableURL = running
-            old.arguments = ["30"]
-            try old.run()
-            defer { old.terminate() }
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            let old = try SleeperProcess(at: target.appending(path: "Contents/MacOS/NoemaIME"))
+            defer { old.kill() }
 
             var arguments = ["install", "--bundle", fixture.app.path, "--dest", fixture.dest.path]
             arguments += ["--allow-adhoc", "--no-register", "--reload"]
             let run = try Tool.cli(arguments, stdin: "")
             #expect(run.status == 0, "stderr: \(run.stderr)")
-            #expect(run.stdout.contains("stopped 1 NoemaIME process(es)"))
-            old.waitUntilExit()
-            #expect(old.terminationReason == .uncaughtSignal && old.terminationStatus == SIGTERM)
+            #expect(run.stdout.contains("reloaded: stopped 1 NoemaIME process(es)"))
+            #expect(old.waitForSIGTERMExit())
             #expect(try fixture.destEntries() == ["NoemaIME.app"])
+            let again = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+            #expect(again.status == 0 && again.stdout.contains("stopped 0 NoemaIME process(es)"), "no pending process is left")
+        }
+
+        /// `--no-reload` leaves the old process running and records it, so a later `reload`
+        /// of the target still finds it although its bundle was renamed away and deleted.
+        @Test func installNoReloadFollowedByReloadStopsOldProcess() throws {
+            let fixture = try BundleFixture()
+            #expect(try fixture.install().status == 0)
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            let old = try SleeperProcess(at: target.appending(path: "Contents/MacOS/NoemaIME"))
+            defer { old.kill() }
+
+            let install = try fixture.install()
+            #expect(install.status == 0, "stderr: \(install.stderr)")
+            #expect(!install.stdout.contains("reloaded"))
+            usleep(200_000)
+            #expect(old.process.isRunning, "--no-reload leaves the old process alone")
+
+            let reload = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+            #expect(reload.status == 0, "stderr: \(reload.stderr)")
+            #expect(reload.stdout.contains("reload: stopped 1 NoemaIME process(es)"), "stdout: \(reload.stdout)")
+            #expect(old.waitForSIGTERMExit())
+            let again = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+            #expect(again.status == 0 && again.stdout.contains("stopped 0 NoemaIME process(es)"), "the ledger is cleared")
+        }
+
+        /// A process that ignores SIGTERM makes `install --reload` and `reload` exit 1 without
+        /// claiming it stopped, and stays recorded for the next `reload`.
+        @Test func installReloadTimeoutExitsNonZeroAndPreservesPendingProcess() throws {
+            let fixture = try BundleFixture()
+            #expect(try fixture.install().status == 0)
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            let stubborn = try SleeperProcess(at: target.appending(path: "Contents/MacOS/NoemaIME"), ignoringSIGTERM: true)
+            defer { stubborn.kill() }
+
+            var arguments = ["install", "--bundle", fixture.app.path, "--dest", fixture.dest.path]
+            arguments += ["--allow-adhoc", "--no-register", "--reload"]
+            let install = try Tool.cli(arguments, stdin: "")
+            #expect(install.status == 1, "stdout: \(install.stdout)")
+            #expect(install.stdout.contains("installed ") && !install.stdout.contains("reloaded"))
+            #expect(!install.stdout.contains("stopped 1"))
+            #expect(install.stderr.contains("reload failed: signalled 1, stopped 0, 1 process(es) did not exit within 3 s"),
+                    "stderr: \(install.stderr)")
+            #expect(stubborn.process.isRunning)
+            #expect(try fixture.destEntries() == ["NoemaIME.app"], "the install itself completed")
+
+            let reload = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+            #expect(reload.status == 1, "stdout: \(reload.stdout)")
+            #expect(!reload.stdout.contains("stopped 1"))
+            #expect(reload.stdout.contains("reload: signalled 1, stopped 0"), "the pending process was found again")
+            #expect(reload.stderr.contains("1 process(es) did not exit within 3 s"))
+            #expect(stubborn.process.isRunning)
+
+            stubborn.kill()
+            let after = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+            #expect(after.status == 0 && after.stdout.contains("stopped 0 NoemaIME process(es)"), "a dead pending process is pruned")
         }
 
         @Test func reloadWithNothingRunningSucceeds() throws {
@@ -224,30 +274,15 @@ extension LibrimeSerializedTests {
             let root = FileManager.default.temporaryDirectory.appending(path: "noema-reload-tests-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: root) }
             let bundle = root.appending(path: "NoemaIME.app")
-            let executable = bundle.appending(path: "Contents/MacOS/NoemaIME")
-            let bystander = root.appending(path: "other/NoemaIME")
-            for url in [executable, bystander] {
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try FileManager.default.copyItem(atPath: "/bin/sleep", toPath: url.path)
-                // A copied platform binary keeps Apple's signature for another path and is
-                // killed on launch; an ad-hoc signature makes the copy runnable.
-                let signed = try Tool.run("/usr/bin/codesign", ["--force", "--sign", "-", url.path])
-                try #require(signed.status == 0, "codesign: \(signed.stderr)")
-            }
-            let target = Process(), other = Process()
-            for (process, url) in [(target, executable), (other, bystander)] {
-                process.executableURL = url
-                process.arguments = ["30"]
-                try process.run()
-            }
-            defer { other.terminate(); target.terminate() }
+            let target = try SleeperProcess(at: bundle.appending(path: "Contents/MacOS/NoemaIME"))
+            let other = try SleeperProcess(at: root.appending(path: "other/NoemaIME"))
+            defer { other.kill(); target.kill() }
 
             let run = try Tool.cli(["reload", "--bundle", bundle.path], stdin: "")
             #expect(run.status == 0, "stderr: \(run.stderr)")
             #expect(run.stdout.contains("stopped 1 NoemaIME process(es)"))
-            target.waitUntilExit()
-            #expect(target.terminationReason == .uncaughtSignal && target.terminationStatus == SIGTERM)
-            #expect(other.isRunning, "a NoemaIME outside the bundle is not ours to stop")
+            #expect(target.waitForSIGTERMExit())
+            #expect(other.process.isRunning, "a NoemaIME outside the bundle is not ours to stop")
         }
 
         private static func ephemeralRoot(in stderr: String) -> String? {
@@ -297,6 +332,74 @@ enum Tool {
         return (process.terminationStatus,
                 try String(contentsOf: output, encoding: .utf8), try String(contentsOf: errors, encoding: .utf8))
     }
+}
+
+/// A plain `arm64` C program compiled into `executable` and started: it writes a
+/// readiness file, then sleeps until a signal (SIGTERM, unless `ignoringSIGTERM`) or 60 s.
+/// Compiled rather than a copied `/bin/sleep`, whose re-signed arm64e platform copy
+/// crashes on some hosts.
+final class SleeperProcess {
+    static let source = """
+        #include <fcntl.h>
+        #include <signal.h>
+        #include <string.h>
+        #include <unistd.h>
+        int main(int argc, char **argv) {
+            const char *ready = 0;
+            for (int i = 1; i < argc; i++) {
+                if (strcmp(argv[i], "--ignore-sigterm") == 0) signal(SIGTERM, SIG_IGN);
+                else if (strcmp(argv[i], "--ready") == 0 && i + 1 < argc) ready = argv[++i];
+            }
+            alarm(60);
+            if (ready) {
+                int fd = open(ready, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                if (fd >= 0) { write(fd, "1", 1); close(fd); }
+            }
+            for (;;) pause();
+        }
+        """
+
+    let process = Process()
+
+    init(at executable: URL, ignoringSIGTERM: Bool = false) throws {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appending(path: "noema-sleeper-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+        let sourceURL = work.appending(path: "sleeper.c")
+        try Self.source.write(to: sourceURL, atomically: true, encoding: .utf8)
+        try fm.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.removeItem(at: executable)
+        let compiled = try Tool.run("/usr/bin/clang", ["-arch", "arm64", "-O1", "-o", executable.path, sourceURL.path])
+        try #require(compiled.status == 0, "clang: \(compiled.stderr)")
+        let signed = try Tool.run("/usr/bin/codesign", ["--force", "--sign", "-", executable.path])
+        try #require(signed.status == 0, "codesign: \(signed.stderr)")
+
+        let ready = work.appending(path: "ready")
+        process.executableURL = executable
+        process.arguments = (ignoringSIGTERM ? ["--ignore-sigterm"] : []) + ["--ready", ready.path]
+        try process.run()
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(10)
+        while !fm.fileExists(atPath: ready.path), process.isRunning, clock.now < deadline { usleep(10_000) }
+        try #require(fm.fileExists(atPath: ready.path) && process.isRunning, "the helper did not start")
+    }
+
+    /// Waits up to 10 s for the exit; true when SIGTERM ended it.
+    func waitForSIGTERMExit() -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(10)
+        while process.isRunning, clock.now < deadline { usleep(10_000) }
+        guard !process.isRunning else { return false }
+        return process.terminationReason == .uncaughtSignal && process.terminationStatus == SIGTERM
+    }
+
+    func kill() {
+        if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+        process.waitUntilExit()
+    }
+
+    deinit { kill() }
 }
 
 /// A real, ad-hoc signed `NoemaIME.app` assembled from the debug products, the vendored

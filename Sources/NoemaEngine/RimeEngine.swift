@@ -57,7 +57,8 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
 /// Boot: claim the process-wide librime (a second live engine throws), take the
 /// user-data `flock`, arm the boot-guard sentinel, deploy if needed through the
 /// `noema-rime-deployer` subprocess (see `RimeEngine+Deploy.swift`), initialize, open a
-/// session on `schemaID`, then disarm. librime's deployer never runs in this process. Any refusal or failure on that path leaves the
+/// session on `schemaID`, then disarm. librime's deployer never runs in this process;
+/// `start(configuration:cancellation:)` waits for it off the main actor. Any refusal or failure on that path leaves the
 /// engine in Safe Mode: it releases librime, the lock, and the claim, makes no further
 /// librime calls, and answers every key with `handled: false` and `.safeMode`.
 ///
@@ -77,8 +78,47 @@ public final class RimeEngine: TypingEngine {
 
     /// Throws `.engineUnavailable` when librime lacks a required API member or another
     /// `RimeEngine` in this process has not been shut down. Every other failure enters
-    /// Safe Mode instead of throwing.
-    public init(configuration: RimeEngineConfiguration) throws(NoemaError) {
+    /// Safe Mode instead of throwing. A needed deployment blocks the caller for up to
+    /// `deployTimeout`; `start(configuration:cancellation:)` runs it off the main actor.
+    public convenience init(configuration: RimeEngineConfiguration) throws(NoemaError) {
+        try self.init(claiming: configuration)
+        boot(clearingSentinel: false)
+    }
+
+    /// Boots like `init(configuration:)`, but runs `prepareBuild` (the manifest check and
+    /// any `noema-rime-deployer` run, which make no librime call) on a global queue, so the
+    /// main actor keeps serving events. Locking, arming, `initialize`, and the session stay
+    /// on the main actor. A Safe Mode decision returns at once with no background work.
+    ///
+    /// Cancelling the task, or `cancellation`, stops the deployer (SIGTERM, then SIGKILL)
+    /// and throws `.engineUnavailable(reason: "boot cancelled")` after disarming the
+    /// sentinel (a cancelled boot is not a crash) and releasing the lock and the claim;
+    /// `build/` is left as it was.
+    public static func start(
+        configuration: RimeEngineConfiguration,
+        cancellation: DeployCancellation = DeployCancellation()
+    ) async throws(NoemaError) -> RimeEngine {
+        let engine = try RimeEngine(claiming: configuration)
+        guard engine.beginBoot(clearingSentinel: false) else { return engine }
+        let prepared = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: prepareBuild(configuration: configuration, cancellation: cancellation))
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+        if cancellation.isCancelled || Task.isCancelled {
+            engine.abandonBoot()
+            throw .engineUnavailable(reason: "boot cancelled")
+        }
+        engine.finishBoot(prepared: prepared)
+        return engine
+    }
+
+    /// Checks the API table and claims librime; boots nothing.
+    private init(claiming configuration: RimeEngineConfiguration) throws(NoemaError) {
         guard noema_rime_engine_api_available(), let api = noema_rime_get_api() else {
             throw .engineUnavailable(reason: "librime API table lacks members RimeEngine requires")
         }
@@ -90,7 +130,6 @@ public final class RimeEngine: TypingEngine {
         self.api = api
         self.resources = resources
         self.currentState = .empty(schemaID: configuration.schemaID)
-        boot(clearingSentinel: false)
     }
 
     // MARK: - TypingEngine
@@ -209,36 +248,61 @@ public final class RimeEngine: TypingEngine {
     private var isOperational: Bool { !isShutDown && !isSafeMode }
 
     private func boot(clearingSentinel: Bool) {
+        guard beginBoot(clearingSentinel: clearingSentinel) else { return }
+        finishBoot(prepared: Self.prepareBuild(configuration: configuration, cancellation: DeployCancellation()))
+    }
+
+    /// Creates the directories, takes the lock, and arms the sentinel. False means the
+    /// engine is already in Safe Mode and must not deploy.
+    private func beginBoot(clearingSentinel: Bool) -> Bool {
         let fileManager = FileManager.default
         do {
             try fileManager.createDirectory(at: configuration.userDataDir, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: configuration.logDir, withIntermediateDirectories: true)
         } catch {
-            return enterSafeMode(.userDataDirUnwritable)
+            enterSafeMode(.userDataDirUnwritable)
+            return false
         }
         let guardian = resources.bootGuard
         if clearingSentinel {
             switch guardian.acquireLock() {
             case .acquired: guardian.clear()
-            case .locked: return enterSafeMode(.userDataDirLocked)
-            case .failed(let reason): return enterSafeMode(reason)
+            case .locked:
+                enterSafeMode(.userDataDirLocked)
+                return false
+            case .failed(let reason):
+                enterSafeMode(reason)
+                return false
             }
         }
         switch guardian.begin() {
-        case .proceed: break
-        case .locked: return enterSafeMode(.userDataDirLocked)
-        case .enterSafeMode(let reason): return enterSafeMode(reason)
+        case .proceed: return true
+        case .locked: enterSafeMode(.userDataDirLocked)
+        case .enterSafeMode(let reason): enterSafeMode(reason)
         }
+        return false
+    }
 
-        guard prepareBuild() else { return enterSafeMode(.engineInitFailed) }
+    /// After `prepareBuild`: initialize librime, open the session, and disarm, or enter
+    /// Safe Mode with the sentinel left armed.
+    private func finishBoot(prepared: Bool) {
+        guard prepared else { return enterSafeMode(.engineInitFailed) }
         withTraits { traits in
             RimeProcessLifecycle.setupIfNeeded(owner: resources.owner, api: api, traits: &traits)
             api.pointee.initialize(&traits)
         }
         resources.isInitialized = true
         guard openSession() else { return enterSafeMode(.engineInitFailed) }
-        guardian.disarm()
+        resources.bootGuard.disarm()
         refreshState()
+    }
+
+    /// A cancelled boot: disarm (cancellation is not a crash), release everything, and shut down.
+    private func abandonBoot() {
+        resources.bootGuard.disarm()
+        isShutDown = true
+        resources.releaseAll()
+        currentState = .empty(generationID: nextGeneration(), schemaID: configuration.schemaID)
     }
 
     private func openSession() -> Bool {
