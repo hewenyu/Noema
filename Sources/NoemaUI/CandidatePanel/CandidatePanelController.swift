@@ -57,6 +57,17 @@ public final class CandidatePanelController: CandidatePresenting {
     }
     private var presentation: Presentation?
 
+    // MARK: Test hooks (internal; `@testable import NoemaUI`)
+
+    /// The screens the resolver places the panel on.
+    var screensProvider: @MainActor () -> [ScreenFrame] = {
+        NSScreen.screens.map { ScreenFrame(frame: $0.frame, visibleFrame: $0.visibleFrame) }
+    }
+    /// `false` keeps the real panel off screen (headless tests); everything else still runs.
+    var shouldOrderFront = true
+    var panelViewForTesting: CandidatePanelView { candidateView }
+    var panelForTesting: NSPanel { panel }
+
     public init(style: CandidatePanelStyle = CandidatePanelStyle()) {
         self.style = style
         backdropMode = style.backdropMode
@@ -127,7 +138,7 @@ public final class CandidatePanelController: CandidatePresenting {
         guard let presentation else { return }
         let layout = layoutEngine.layout(
             state: presentation.state, options: presentation.options, expanded: isExpanded, hysteresis: &hysteresis)
-        let screens = NSScreen.screens.map { ScreenFrame(frame: $0.frame, visibleFrame: $0.visibleFrame) }
+        let screens = screensProvider()
         guard let resolution = resolver.resolve(
             caretRect: presentation.caretRect, clientKey: presentation.clientKey, panelSize: layout.panelSize,
             screens: screens, fallbackMouseLocation: NSEvent.mouseLocation)
@@ -141,21 +152,24 @@ public final class CandidatePanelController: CandidatePresenting {
         let level = Self.windowLevel(above: presentation.windowLevel)
         if panel.level != level { panel.level = level }
 
+        // Resize the panel first, then apply the layout to the resized view: the view sizes
+        // its subviews from its own bounds, never from a size the panel has not reached yet.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        candidateView.apply(layout)
-        glassView?.cornerRadius = layout.cornerRadius
-        effectView?.layer?.cornerRadius = layout.cornerRadius
         if target != lastAppliedFrame {
             let sizeChanged = lastAppliedFrame?.size != target.size
             panel.setFrame(target, display: false)
             if sizeChanged && backdropMode == .visualEffect { panel.invalidateShadow() }
             lastAppliedFrame = target
         }
+        glassView?.cornerRadius = layout.cornerRadius
+        effectView?.layer?.cornerRadius = layout.cornerRadius
+        candidateView.apply(layout)
+        panel.contentView?.layoutSubtreeIfNeeded()
         CATransaction.commit()
 
         if !isVisible {
-            panel.orderFrontRegardless()
+            if shouldOrderFront { panel.orderFrontRegardless() }
             isVisible = true
         }
     }
@@ -208,6 +222,7 @@ public final class CandidatePanelController: CandidatePresenting {
             panel.contentView = effect
             panel.hasShadow = true
         }
+        candidateView.needsLayout = true
         lastAppliedFrame = nil
     }
 }

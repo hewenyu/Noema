@@ -3,7 +3,7 @@ import Foundation
 import NoemaCore
 import NoemaEngine
 import NoemaIMEShell
-import NoemaUI
+@testable import NoemaUI
 import Testing
 
 /// `InputSessionCoordinator` driving the real `RimeEngine` on the shipped schema: what
@@ -589,6 +589,77 @@ extension LibrimeSerializedTests {
             #expect(strip.clipRect.maxX <= layout.panelSize.width && layout.panelSize.width <= style.maxPanelWidth)
         }
 
+        /// The shipped `CandidatePanelController` on the real `NSPanel` (kept off screen),
+        /// driven by real Rime through the coordinator: expanding and collapsing `shi` by
+        /// clicking the chevron resizes the panel, the view, and every subview to the
+        /// layout's size in both backdrop modes (Codex review of PR #19: autoresizing
+        /// applied the size delta twice, leaving `(0, 276)` and `(352, 0)` subviews).
+        @Test(arguments: [CandidatePanelStyle.BackdropMode.glass, .visualEffect])
+        func expandAndCollapseResizeEverySubviewToThePanel(mode: CandidatePanelStyle.BackdropMode) throws {
+            var style = CandidatePanelStyle()
+            style.backdropMode = mode
+            let controller = CandidatePanelController(style: style)
+            controller.screensProvider = {
+                [ScreenFrame(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                             visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 875))]
+            }
+            controller.shouldOrderFront = false
+            let harness = try Harness(candidatePresenter: controller)
+            defer { harness.shutdown(); controller.hide() }
+            let client = RecordingClient()
+            client.caretRect = CGRect(x: 400, y: 500, width: 1, height: 18)
+            let token = UUID()
+            for key in "shi" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+
+            let view = controller.panelViewForTesting
+            let panel = controller.panelForTesting
+            func expectSized(_ layout: CandidatePanelLayout, _ step: String) {
+                let size = layout.panelSize
+                #expect(size.width > 0 && size.height > 0, "\(step)")
+                #expect(panel.frame.size == size, "\(step): panel \(panel.frame.size) vs \(size)")
+                #expect(view.bounds.size == size, "\(step): view \(view.bounds.size) vs \(size)")
+                #expect(view.subviews.count == 2, "\(step): highlight host and CoreText view")
+                for frame in view.subviews.map(\.frame) + view.subviewFramesForTesting {
+                    #expect(frame == CGRect(origin: .zero, size: size), "\(step): subview \(frame) vs \(size)")
+                }
+            }
+            func click(_ rect: CGRect?) throws {
+                let point = view.convert(try #require(rect).center, to: nil)
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    let event = try #require(NSEvent.mouseEvent(
+                        with: type, location: point, modifierFlags: [], timestamp: 0,
+                        windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                        pressure: type == .leftMouseDown ? 1 : 0))
+                    type == .leftMouseDown ? view.mouseDown(with: event) : view.mouseUp(with: event)
+                }
+            }
+
+            #expect(controller.isVisible && !controller.isExpanded)
+            let collapsed = try #require(controller.currentLayout)
+            #expect(!collapsed.isExpanded && !collapsed.items.isEmpty)
+            expectSized(collapsed, "collapsed")
+
+            try click(collapsed.expandButtonFrame)
+            #expect(controller.isExpanded)
+            let expanded = try #require(controller.currentLayout)
+            #expect(expanded.isExpanded && expanded.panelSize != collapsed.panelSize)
+            expectSized(expanded, "expanded")
+
+            try click(expanded.expandButtonFrame)
+            #expect(!controller.isExpanded)
+            let recollapsed = try #require(controller.currentLayout)
+            #expect(!recollapsed.isExpanded)
+            expectSized(recollapsed, "collapsed again")
+
+            // Switching the backdrop mid-session re-hosts the view at the same size.
+            controller.backdropMode = mode == .glass ? .visualEffect : .glass
+            expectSized(try #require(controller.currentLayout), "after backdrop switch")
+            try click(controller.currentLayout?.expandButtonFrame)
+            expectSized(try #require(controller.currentLayout), "expanded after backdrop switch")
+            #expect(controller.isExpanded)
+            #expect(client.inserts.isEmpty, "chevron clicks commit nothing")
+        }
+
         @Test func pagingFromThePanelRefreshesCandidates() throws {
             let harness = try Harness()
             defer { harness.shutdown() }
@@ -623,6 +694,8 @@ final class RecordingClient: TextInputClient {
 
     var calls: [Call] = []
     let clientBundleIdentifier: String?
+    /// What `caretScreenRect` reports; nil like a client that reports none.
+    var caretRect: CGRect?
 
     init(bundleIdentifier: String? = RecordingClient.bundleID) {
         clientBundleIdentifier = bundleIdentifier
@@ -635,6 +708,8 @@ final class RecordingClient: TextInputClient {
     }
 
     func clearMarkedText() { calls.append(.clear) }
+
+    func caretScreenRect(atUTF16Offset offset: Int) -> CGRect? { caretRect }
 
     var inserts: [String] {
         calls.compactMap { if case .insert(let text) = $0 { text } else { nil } }
@@ -712,7 +787,8 @@ final class Harness {
     init(
         withoutPunctuator: Bool = false,
         isSecureInputEnabled: @escaping @MainActor () -> Bool = { false },
-        inlinePreeditDisabledBundleIDs: Set<String> = []
+        inlinePreeditDisabledBundleIDs: Set<String> = [],
+        candidatePresenter: (any CandidatePresenting)? = nil
     ) throws {
         if withoutPunctuator {
             workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
@@ -724,7 +800,7 @@ final class Harness {
         try #require(!engine.isSafeMode)
         self.engine = engine
         coordinator = InputSessionCoordinator(
-            engineProvider: { [engine] in engine }, candidatePresenter: presenter, isSecureInputEnabled: isSecureInputEnabled,
+            engineProvider: { [engine] in engine }, candidatePresenter: candidatePresenter ?? presenter, isSecureInputEnabled: isSecureInputEnabled,
             inlinePreeditDisabledBundleIDs: inlinePreeditDisabledBundleIDs)
     }
 

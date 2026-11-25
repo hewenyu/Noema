@@ -18,7 +18,7 @@ public final class CandidatePanelView: NSView {
     /// The panel was scrolled: `true` pages backward, with the layout's generation.
     public var onChangePage: (@MainActor (Bool, UInt64) -> Void)?
 
-    public private(set) var layout: CandidatePanelLayout?
+    public private(set) var panelLayout: CandidatePanelLayout?
     private let style: CandidatePanelStyle
     private let highlightHost = FlippedView()
     private let highlightLayer = CAShapeLayer()
@@ -36,14 +36,14 @@ public final class CandidatePanelView: NSView {
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
 
+        // No autoresizing masks: `layout()` sizes both subviews to `bounds`, so a panel
+        // resize never applies the parent's size delta on top of an explicit frame.
         highlightHost.wantsLayer = true
-        highlightHost.autoresizingMask = [.width, .height]
         highlightLayer.actions = ["path": NSNull(), "fillColor": NSNull(), "hidden": NSNull(), "bounds": NSNull(), "position": NSNull()]
         highlightLayer.isHidden = true
         highlightHost.layer?.addSublayer(highlightLayer)
         addSubview(highlightHost)
 
-        contentView.autoresizingMask = [.width, .height]
         addSubview(contentView)
         updateAppearanceColors()
     }
@@ -61,16 +61,34 @@ public final class CandidatePanelView: NSView {
         return bounds.contains(convert(point, from: superview)) ? self : nil
     }
 
-    /// Shows `layout`; the caller wraps this in a `CATransaction` with actions disabled.
+    override public func layout() {
+        super.layout()
+        syncSubviewFrames()
+    }
+
+    /// The frames of the highlight host and the CoreText view, for tests.
+    var subviewFramesForTesting: [CGRect] { [highlightHost.frame, contentView.frame] }
+
+    /// Sizes the highlight host, its shape layer, and the CoreText view to `bounds`. The
+    /// owner sizes this view (the panel frame) before `apply(_:)`; nothing here reads
+    /// `layout.panelSize`, so the two can never disagree.
+    private func syncSubviewFrames() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        highlightHost.frame = bounds
+        contentView.frame = bounds
+        highlightLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    /// Shows `layout`; the caller sizes this view to `layout.panelSize` first and wraps
+    /// both in a `CATransaction` with actions disabled.
     public func apply(_ layout: CandidatePanelLayout) {
-        guard layout != self.layout else { return }
-        if self.layout?.generationID != layout.generationID { pressed = nil }
-        self.layout = layout
+        syncSubviewFrames()
+        guard layout != self.panelLayout else { return }
+        if self.panelLayout?.generationID != layout.generationID { pressed = nil }
+        self.panelLayout = layout
         contentView.layout = layout
-        let frame = CGRect(origin: .zero, size: layout.panelSize)
-        highlightHost.frame = frame
-        contentView.frame = frame
-        highlightLayer.frame = frame
         if let pill = layout.highlightedPillFrame {
             let radius = layout.isExpanded
                 ? max(min(style.expandedCornerRadius - style.horizontalPadding, pill.height / 2), 4)
@@ -81,6 +99,7 @@ public final class CandidatePanelView: NSView {
             highlightLayer.path = nil
             highlightLayer.isHidden = true
         }
+        needsLayout = true
         contentView.needsDisplay = true
     }
 
@@ -107,7 +126,7 @@ public final class CandidatePanelView: NSView {
     // MARK: - Mouse
 
     override public func mouseDown(with event: NSEvent) {
-        guard let layout else { pressed = nil; return }
+        guard let layout = panelLayout else { pressed = nil; return }
         let target = layout.hitTest(convert(event.locationInWindow, from: nil))
         pressed = target == .none ? nil : (target, layout.generationID)
     }
@@ -117,7 +136,7 @@ public final class CandidatePanelView: NSView {
     override public func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         defer { pressed = nil }
-        guard let layout, let pressed, layout.generationID == pressed.generationID,
+        guard let layout = panelLayout, let pressed, layout.generationID == pressed.generationID,
               layout.hitTest(point) == pressed.target else { return }
         switch pressed.target {
         case .candidate(let index): onSelectCandidate?(index, pressed.generationID)
@@ -127,7 +146,7 @@ public final class CandidatePanelView: NSView {
     }
 
     override public func scrollWheel(with event: NSEvent) {
-        guard let layout, event.momentumPhase.isEmpty else { return }
+        guard let layout = panelLayout, event.momentumPhase.isEmpty else { return }
         let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 10
         scrollAccumulator += delta
         guard abs(scrollAccumulator) >= 30 else { return }
