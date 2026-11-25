@@ -39,6 +39,7 @@ jobs:
       - Package.swift
       - Sources/
       - Tests/
+      - Resources/rime-default/
       - vendor/librime.lock
       - scripts/build/librime.sh
       - scripts/dev/test.sh

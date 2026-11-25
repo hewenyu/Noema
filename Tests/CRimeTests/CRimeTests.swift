@@ -4,123 +4,130 @@ import NoemaEngine
 import Testing
 
 /// Real, headless librime: no mocks. librime is a process-global singleton
-/// (setup/initialize/finalize, one deployer), so every test that touches it lives
-/// in this serialized suite.
+/// (setup/initialize/finalize, one deployer, one active engine), so every test in this
+/// target that touches it is nested under this one serialized suite, across files:
+/// Swift Testing never runs two of them at once.
 @Suite(.serialized)
-struct CRimeTests {
-    @Test func apiTableIsAvailable() throws {
-        let api = try #require(noema_rime_get_api())
-        #expect(noema_rime_api_available() == 1)
-        #expect(RimeRuntime.isAvailable)
-        let version = String(cString: try #require(api.pointee.get_version?()))
-        #expect(version == "1.17.0")
-        #expect(try RimeRuntime.version() == version)
-    }
+struct LibrimeSerializedTests {}
 
-    /// Many tasks query the runtime at once (on a cold process this includes the
-    /// first rime_get_api() call, which noema_rime_get_api() serializes); every
-    /// task must see the same table and the same answers.
-    @Test func concurrentQueriesAgree() async throws {
-        let expected = try RimeRuntime.info()
-        let tableAddress = Int(bitPattern: try #require(noema_rime_get_api()))
-        let results = await withTaskGroup(of: (Bool, RimeRuntimeInfo?, Int?).self) { group in
-            for _ in 0..<64 {
-                group.addTask {
-                    (RimeRuntime.isAvailable, try? RimeRuntime.info(), noema_rime_get_api().map { Int(bitPattern: $0) })
+extension LibrimeSerializedTests {
+    /// The raw C bridge.
+    @Suite struct CRimeTests {
+        @Test func apiTableIsAvailable() throws {
+            let api = try #require(noema_rime_get_api())
+            #expect(noema_rime_api_available() == 1)
+            #expect(noema_rime_engine_api_available())
+            #expect(RimeRuntime.isAvailable)
+            let version = String(cString: try #require(api.pointee.get_version?()))
+            #expect(version == "1.17.0")
+            #expect(try RimeRuntime.version() == version)
+        }
+
+        /// Many tasks query the runtime at once (on a cold process this includes the
+        /// first rime_get_api() call, which noema_rime_get_api() serializes); every
+        /// task must see the same table and the same answers.
+        @Test func concurrentQueriesAgree() async throws {
+            let expected = try RimeRuntime.info()
+            let tableAddress = Int(bitPattern: try #require(noema_rime_get_api()))
+            let results = await withTaskGroup(of: (Bool, RimeRuntimeInfo?, Int?).self) { group in
+                for _ in 0..<64 {
+                    group.addTask {
+                        (RimeRuntime.isAvailable, try? RimeRuntime.info(), noema_rime_get_api().map { Int(bitPattern: $0) })
+                    }
                 }
+                var results: [(Bool, RimeRuntimeInfo?, Int?)] = []
+                for await result in group { results.append(result) }
+                return results
             }
-            var results: [(Bool, RimeRuntimeInfo?, Int?)] = []
-            for await result in group { results.append(result) }
-            return results
+            #expect(results.count == 64)
+            for (available, info, address) in results {
+                #expect(available)
+                #expect(info == expected)
+                #expect(address == tableAddress)
+            }
+            #expect(expected.version == "1.17.0")
+            #expect(expected.allModulesRegistered)
         }
-        #expect(results.count == 64)
-        for (available, info, address) in results {
-            #expect(available)
-            #expect(info == expected)
-            #expect(address == tableAddress)
+
+        /// The struct initializers ignore NULL instead of crashing.
+        @Test func structInitializersIgnoreNull() {
+            noema_rime_traits_init(nil)
+            noema_rime_context_init(nil)
+            noema_rime_status_init(nil)
+            noema_rime_commit_init(nil)
+            var status = RimeStatus()
+            noema_rime_status_init(&status)
+            #expect(status.data_size == Int32(MemoryLayout<RimeStatus>.stride - MemoryLayout<Int32>.size))
         }
-        #expect(expected.version == "1.17.0")
-        #expect(expected.allModulesRegistered)
-    }
 
-    /// The struct initializers ignore NULL instead of crashing.
-    @Test func structInitializersIgnoreNull() {
-        noema_rime_traits_init(nil)
-        noema_rime_context_init(nil)
-        noema_rime_status_init(nil)
-        noema_rime_commit_init(nil)
-        var status = RimeStatus()
-        noema_rime_status_init(&status)
-        #expect(status.data_size == Int32(MemoryLayout<RimeStatus>.stride - MemoryLayout<Int32>.size))
-    }
+        @Test(arguments: ["core", "dict", "gears", "levers", "deployer", "lua", "octagram", "grammar"])
+        func mergedModuleIsRegistered(_ name: String) throws {
+            let findModule = try #require(noema_rime_get_api()?.pointee.find_module)
+            #expect(findModule(name) != nil, "module \(name) is not registered in librime.1.dylib")
+            #expect(try RimeRuntime.hasModule(name))
+        }
 
-    @Test(arguments: ["core", "dict", "gears", "levers", "deployer", "lua", "octagram", "grammar"])
-    func mergedModuleIsRegistered(_ name: String) throws {
-        let findModule = try #require(noema_rime_get_api()?.pointee.find_module)
-        #expect(findModule(name) != nil, "module \(name) is not registered in librime.1.dylib")
-        #expect(try RimeRuntime.hasModule(name))
-    }
+        @Test func unknownModuleIsNotRegistered() throws {
+            let findModule = try #require(noema_rime_get_api()?.pointee.find_module)
+            #expect(findModule("noema_nonexistent_module") == nil)
+            #expect(try !RimeRuntime.hasModule("noema_nonexistent_module"))
+            #expect(try RimeRuntime.info().allModulesRegistered)
+        }
 
-    @Test func unknownModuleIsNotRegistered() throws {
-        let findModule = try #require(noema_rime_get_api()?.pointee.find_module)
-        #expect(findModule("noema_nonexistent_module") == nil)
-        #expect(try !RimeRuntime.hasModule("noema_nonexistent_module"))
-        #expect(try RimeRuntime.info().allModulesRegistered)
-    }
+        /// Deploys a tiny inline schema (one table translator over a two-entry dictionary
+        /// plus a one-line Lua translator) into a fresh temporary user_data_dir, then
+        /// types through a real session and checks what gets committed.
+        @Test func deploysSchemaAndCommitsLuaAndTableCandidates() throws {
+            let workspace = try RimeWorkspace()
+            defer { workspace.remove() }
+            let api = try #require(noema_rime_get_api()).pointee
 
-    /// Deploys a tiny inline schema (one table translator over a two-entry dictionary
-    /// plus a one-line Lua translator) into a fresh temporary user_data_dir, then
-    /// types through a real session and checks what gets committed.
-    @Test func deploysSchemaAndCommitsLuaAndTableCandidates() throws {
-        let workspace = try RimeWorkspace()
-        defer { workspace.remove() }
-        let api = try #require(noema_rime_get_api()).pointee
+            var traits = RimeTraits()
+            noema_rime_traits_init(&traits)
+            let strings = CStrings()
+            defer { strings.free() }
+            traits.shared_data_dir = strings.make(workspace.shared.path)
+            traits.user_data_dir = strings.make(workspace.user.path)
+            traits.distribution_name = strings.make("Noema")
+            traits.distribution_code_name = strings.make("noema-tests")
+            traits.distribution_version = strings.make("0.1.0")
+            traits.app_name = strings.make("rime.noema-tests")
+            traits.min_log_level = 2
+            traits.log_dir = strings.make(workspace.logs.path)
 
-        var traits = RimeTraits()
-        noema_rime_traits_init(&traits)
-        let strings = CStrings()
-        defer { strings.free() }
-        traits.shared_data_dir = strings.make(workspace.shared.path)
-        traits.user_data_dir = strings.make(workspace.user.path)
-        traits.distribution_name = strings.make("Noema")
-        traits.distribution_code_name = strings.make("noema-tests")
-        traits.distribution_version = strings.make("0.1.0")
-        traits.app_name = strings.make("rime.noema-tests")
-        traits.min_log_level = 2
-        traits.log_dir = strings.make(workspace.logs.path)
+            try #require(api.setup != nil && api.deployer_initialize != nil && api.initialize != nil)
+            api.setup(&traits)
+            api.deployer_initialize(&traits)
+            #expect(api.deploy() != 0, "RimeDeployWorkspace failed")
+            let compiled = workspace.user.appending(path: "build/noema_test.table.bin")
+            #expect(FileManager.default.fileExists(atPath: compiled.path), "dictionary was not compiled")
 
-        try #require(api.setup != nil && api.deployer_initialize != nil && api.initialize != nil)
-        api.setup(&traits)
-        api.deployer_initialize(&traits)
-        #expect(api.deploy() != 0, "RimeDeployWorkspace failed")
-        let compiled = workspace.user.appending(path: "build/noema_test.table.bin")
-        #expect(FileManager.default.fileExists(atPath: compiled.path), "dictionary was not compiled")
+            api.initialize(&traits)
+            defer { api.finalize() }
 
-        api.initialize(&traits)
-        defer { api.finalize() }
+            let session = api.create_session()
+            try #require(session != 0)
+            defer { _ = api.destroy_session(session) }
+            #expect(api.select_schema(session, "noema_test") != 0)
 
-        let session = api.create_session()
-        try #require(session != 0)
-        defer { _ = api.destroy_session(session) }
-        #expect(api.select_schema(session, "noema_test") != 0)
+            // Lua translator: "hello" -> noema_lua_ok, committed by selecting it.
+            try type("hello", into: session, api: api)
+            let luaCandidates = try candidates(in: session, api: api)
+            let luaIndex = try #require(luaCandidates.firstIndex(of: "noema_lua_ok"), "candidates: \(luaCandidates)")
+            #expect(api.select_candidate_on_current_page(session, luaIndex) != 0)
+            #expect(try commit(from: session, api: api) == "noema_lua_ok")
 
-        // Lua translator: "hello" -> noema_lua_ok, committed by selecting it.
-        try type("hello", into: session, api: api)
-        let luaCandidates = try candidates(in: session, api: api)
-        let luaIndex = try #require(luaCandidates.firstIndex(of: "noema_lua_ok"), "candidates: \(luaCandidates)")
-        #expect(api.select_candidate_on_current_page(session, luaIndex) != 0)
-        #expect(try commit(from: session, api: api) == "noema_lua_ok")
+            // Table translator: "nihao" -> 你好 as the first candidate, committed with space.
+            try type("nihao", into: session, api: api)
+            #expect(try candidates(in: session, api: api).first == "你好")
+            #expect(api.process_key(session, 0x20, 0) != 0)
+            #expect(try commit(from: session, api: api) == "你好")
 
-        // Table translator: "nihao" -> 你好 as the first candidate, committed with space.
-        try type("nihao", into: session, api: api)
-        #expect(try candidates(in: session, api: api).first == "你好")
-        #expect(api.process_key(session, 0x20, 0) != 0)
-        #expect(try commit(from: session, api: api) == "你好")
-
-        // Input no translator knows yields no candidates.
-        try type("qqq", into: session, api: api)
-        #expect(try candidates(in: session, api: api).isEmpty)
-        api.clear_composition(session)
+            // Input no translator knows yields no candidates.
+            try type("qqq", into: session, api: api)
+            #expect(try candidates(in: session, api: api).isEmpty)
+            api.clear_composition(session)
+        }
     }
 }
 

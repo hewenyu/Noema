@@ -1,0 +1,709 @@
+# Noema built-in minimal pinyin dictionary: common characters and words for
+# first-run and test input. Original, hand-curated list; no third-party data.
+# Encoding: UTF-8. Columns: text, code (space-separated syllables), weight.
+---
+name: noema_pinyin
+version: "1"
+sort: by_weight
+use_preset_vocabulary: false
+...
+啊	a	200
+阿	a	100
+爱	ai	400
+哎	ai	300
+矮	ai	200
+艾	ai	100
+安	an	500
+按	an	400
+案	an	300
+暗	an	200
+岸	an	100
+把	ba	500
+八	ba	400
+吧	ba	300
+爸	ba	200
+拔	ba	100
+白	bai	500
+百	bai	400
+摆	bai	300
+败	bai	200
+拜	bai	100
+办	ban	600
+半	ban	500
+班	ban	400
+般	ban	300
+板	ban	200
+版	ban	100
+帮	bang	200
+棒	bang	100
+包	bao	600
+报	bao	500
+保	bao	400
+宝	bao	300
+抱	bao	200
+饱	bao	100
+被	bei	600
+北	bei	500
+备	bei	400
+背	bei	300
+杯	bei	200
+倍	bei	100
+本	ben	200
+奔	ben	100
+比	bi	600
+必	bi	500
+笔	bi	400
+闭	bi	300
+鼻	bi	200
+币	bi	100
+边	bian	500
+变	bian	400
+便	bian	300
+遍	bian	200
+编	bian	100
+表	biao	200
+标	biao	100
+别	bie	100
+并	bing	400
+病	bing	300
+兵	bing	200
+冰	bing	100
+不	bu	500
+部	bu	400
+步	bu	300
+布	bu	200
+补	bu	100
+才	cai	500
+菜	cai	400
+采	cai	300
+彩	cai	200
+财	cai	100
+参	can	300
+餐	can	200
+残	can	100
+草	cao	200
+操	cao	100
+测	ce	300
+策	ce	200
+侧	ce	100
+曾	ceng	200
+层	ceng	100
+查	cha	400
+差	cha	300
+茶	cha	200
+插	cha	100
+产	chan	100
+长	chang	500
+常	chang	400
+场	chang	300
+唱	chang	200
+厂	chang	100
+超	chao	300
+朝	chao	200
+吵	chao	100
+车	che	200
+彻	che	100
+陈	chen	300
+沉	chen	200
+晨	chen	100
+成	cheng	500
+城	cheng	400
+程	cheng	300
+称	cheng	200
+乘	cheng	100
+吃	chi	400
+持	chi	300
+迟	chi	200
+池	chi	100
+出	chu	500
+处	chu	400
+初	chu	300
+除	chu	200
+楚	chu	100
+传	chuan	300
+穿	chuan	200
+船	chuan	100
+窗	chuang	300
+床	chuang	200
+创	chuang	100
+春	chun	200
+纯	chun	100
+次	ci	300
+此	ci	200
+词	ci	100
+从	cong	100
+存	cun	200
+村	cun	100
+错	cuo	100
+大	da	400
+打	da	300
+达	da	200
+答	da	100
+带	dai	400
+代	dai	300
+待	dai	200
+戴	dai	100
+但	dan	500
+单	dan	400
+当	dan	300
+担	dan	200
+蛋	dan	100
+当	dang	200
+党	dang	100
+到	dao	500
+道	dao	400
+倒	dao	300
+导	dao	200
+刀	dao	100
+的	de	400
+得	de	300
+德	de	200
+地	de	100
+等	deng	300
+灯	deng	200
+登	deng	100
+地	di	600
+第	di	500
+低	di	400
+底	di	300
+弟	di	200
+敌	di	100
+点	dian	300
+电	dian	200
+店	dian	100
+掉	diao	200
+调	diao	100
+定	ding	200
+顶	ding	100
+动	dong	400
+东	dong	300
+懂	dong	200
+冬	dong	100
+都	dou	200
+斗	dou	100
+读	du	300
+度	du	200
+独	du	100
+段	duan	300
+短	duan	200
+断	duan	100
+对	dui	200
+队	dui	100
+多	duo	200
+夺	duo	100
+饿	e	200
+额	e	100
+而	er	400
+二	er	300
+儿	er	200
+耳	er	100
+发	fa	200
+法	fa	100
+反	fan	400
+饭	fan	300
+翻	fan	200
+范	fan	100
+方	fang	300
+放	fang	200
+房	fang	100
+非	fei	300
+飞	fei	200
+费	fei	100
+分	fen	200
+份	fen	100
+风	feng	200
+封	feng	100
+服	fu	500
+父	fu	400
+复	fu	300
+富	fu	200
+夫	fu	100
+该	gai	200
+改	gai	100
+感	gan	400
+干	gan	300
+赶	gan	200
+敢	gan	100
+刚	gang	200
+钢	gang	100
+高	gao	300
+告	gao	200
+搞	gao	100
+个	ge	400
+各	ge	300
+歌	ge	200
+哥	ge	100
+给	gei	100
+跟	gen	200
+根	gen	100
+更	geng	100
+工	gong	400
+公	gong	300
+共	gong	200
+功	gong	100
+够	gou	200
+狗	gou	100
+古	gu	300
+故	gu	200
+顾	gu	100
+挂	gua	100
+关	guan	300
+管	guan	200
+观	guan	100
+光	guang	200
+广	guang	100
+贵	gui	200
+规	gui	100
+国	guo	300
+过	guo	200
+果	guo	100
+还	hai	400
+孩	hai	300
+海	hai	200
+害	hai	100
+汉	han	200
+含	han	100
+好	hao	200
+号	hao	100
+和	he	500
+合	he	400
+河	he	300
+何	he	200
+喝	he	100
+很	hen	100
+红	hong	100
+后	hou	200
+候	hou	100
+湖	hu	400
+户	hu	300
+护	hu	200
+呼	hu	100
+话	hua	400
+花	hua	300
+化	hua	200
+画	hua	100
+坏	huai	100
+还	huan	300
+换	huan	200
+欢	huan	100
+黄	huang	100
+会	hui	200
+回	hui	100
+或	huo	300
+活	huo	200
+火	huo	100
+及	ji	800
+几	ji	700
+机	ji	600
+己	ji	500
+级	ji	400
+记	ji	300
+即	ji	200
+基	ji	100
+家	jia	400
+加	jia	300
+假	jia	200
+价	jia	100
+见	jian	600
+间	jian	500
+件	jian	400
+建	jian	300
+简	jian	200
+键	jian	100
+将	jiang	300
+讲	jiang	200
+江	jiang	100
+叫	jiao	500
+教	jiao	400
+较	jiao	300
+交	jiao	200
+脚	jiao	100
+接	jie	500
+结	jie	400
+界	jie	300
+解	jie	200
+姐	jie	100
+进	jin	500
+今	jin	400
+金	jin	300
+近	jin	200
+紧	jin	100
+经	jing	400
+京	jing	300
+精	jing	200
+静	jing	100
+就	jiu	300
+九	jiu	200
+旧	jiu	100
+局	ju	300
+句	ju	200
+举	ju	100
+觉	jue	200
+决	jue	100
+开	kai	100
+看	kan	100
+考	kao	100
+可	ke	400
+课	ke	300
+科	ke	200
+客	ke	100
+空	kong	100
+快	kuai	200
+块	kuai	100
+来	lai	100
+蓝	lan	100
+老	lao	100
+了	le	200
+乐	le	100
+类	lei	200
+累	lei	100
+里	li	500
+理	li	400
+力	li	300
+利	li	200
+立	li	100
+连	lian	200
+脸	lian	100
+两	liang	300
+量	liang	200
+亮	liang	100
+了	liao	200
+料	liao	100
+林	lin	100
+另	ling	200
+领	ling	100
+六	liu	300
+流	liu	200
+留	liu	100
+龙	long	100
+路	lu	100
+绿	lv	200
+律	lv	100
+吗	ma	300
+妈	ma	200
+马	ma	100
+买	mai	200
+卖	mai	100
+满	man	200
+慢	man	100
+忙	mang	100
+毛	mao	100
+没	mei	300
+每	mei	200
+美	mei	100
+们	men	200
+门	men	100
+面	mian	100
+民	min	100
+明	ming	200
+名	ming	100
+目	mu	200
+木	mu	100
+那	na	200
+拿	na	100
+难	nan	300
+南	nan	200
+男	nan	100
+呢	ne	100
+能	neng	100
+你	ni	200
+泥	ni	100
+年	nian	200
+念	nian	100
+牛	niu	100
+女	nv	100
+怕	pa	100
+排	pai	100
+盘	pan	100
+旁	pang	100
+跑	pao	100
+朋	peng	100
+皮	pi	100
+片	pian	200
+篇	pian	100
+平	ping	300
+苹	ping	200
+评	ping	100
+起	qi	500
+其	qi	400
+期	qi	300
+气	qi	200
+七	qi	100
+前	qian	300
+钱	qian	200
+千	qian	100
+强	qiang	100
+且	qie	100
+亲	qin	100
+情	qing	400
+请	qing	300
+清	qing	200
+青	qing	100
+求	qiu	200
+秋	qiu	100
+去	qu	200
+取	qu	100
+全	quan	100
+却	que	200
+确	que	100
+然	ran	100
+让	rang	100
+热	re	100
+人	ren	200
+认	ren	100
+日	ri	100
+容	rong	100
+如	ru	200
+入	ru	100
+三	san	100
+山	shan	100
+上	shang	200
+商	shang	100
+少	shao	100
+设	she	200
+社	she	100
+谁	shei	100
+什	shen	400
+身	shen	300
+深	shen	200
+神	shen	100
+生	sheng	200
+声	sheng	100
+是	shi	1500
+时	shi	1400
+事	shi	1300
+十	shi	1200
+世	shi	1100
+使	shi	1000
+式	shi	900
+市	shi	800
+室	shi	700
+实	shi	600
+识	shi	500
+试	shi	400
+食	shi	300
+视	shi	200
+始	shi	100
+手	shou	300
+受	shou	200
+收	shou	100
+书	shu	300
+数	shu	200
+输	shu	100
+水	shui	200
+睡	shui	100
+说	shuo	100
+四	si	300
+思	si	200
+死	si	100
+送	song	100
+所	suo	100
+他	ta	300
+她	ta	200
+它	ta	100
+太	tai	100
+谈	tan	100
+堂	tang	100
+讨	tao	100
+特	te	100
+题	ti	300
+体	ti	200
+提	ti	100
+天	tian	200
+田	tian	100
+条	tiao	100
+铁	tie	100
+听	ting	100
+同	tong	100
+头	tou	100
+图	tu	100
+外	wai	100
+完	wan	300
+万	wan	200
+晚	wan	100
+往	wang	200
+网	wang	100
+为	wei	300
+位	wei	200
+未	wei	100
+问	wen	200
+文	wen	100
+我	wo	100
+无	wu	300
+五	wu	200
+物	wu	100
+西	xi	400
+系	xi	300
+喜	xi	200
+习	xi	100
+下	xia	100
+先	xian	300
+现	xian	200
+线	xian	100
+想	xiang	200
+向	xiang	100
+小	xiao	200
+笑	xiao	100
+写	xie	300
+些	xie	200
+谢	xie	100
+新	xin	300
+心	xin	200
+信	xin	100
+行	xing	200
+性	xing	100
+需	xu	100
+学	xue	100
+眼	yan	200
+言	yan	100
+样	yang	100
+要	yao	100
+也	ye	200
+夜	ye	100
+一	yi	1200
+以	yi	1100
+已	yi	1000
+意	yi	900
+义	yi	800
+议	yi	700
+易	yi	600
+衣	yi	500
+医	yi	400
+依	yi	300
+移	yi	200
+艺	yi	100
+因	yin	200
+音	yin	100
+应	ying	100
+用	yong	100
+有	you	200
+又	you	100
+于	yu	300
+语	yu	200
+雨	yu	100
+原	yuan	100
+月	yue	100
+在	zai	200
+再	zai	100
+早	zao	100
+则	ze	100
+怎	zen	100
+站	zhan	100
+长	zhang	200
+张	zhang	100
+找	zhao	100
+这	zhe	200
+着	zhe	100
+真	zhen	100
+正	zheng	100
+只	zhi	300
+之	zhi	200
+知	zhi	100
+中	zhong	200
+种	zhong	100
+主	zhu	200
+住	zhu	100
+字	zi	200
+自	zi	100
+总	zong	100
+走	zou	100
+最	zui	100
+做	zuo	200
+作	zuo	100
+么	me	10
+脑	nao	10
+库	ku	10
+选	xuan	10
+拼	pin	10
+午	wu	10
+验	yan	10
+史	li	10
+束	shu	10
+纪	ji	10
+你好	ni hao	1000
+你们	ni men	600
+我们	wo men	800
+他们	ta men	700
+输入	shu ru	500
+输入法	shu ru fa	900
+中文	zhong wen	800
+中国	zhong guo	900
+测试	ce shi	700
+苹果	ping guo	600
+今天	jin tian	900
+明天	ming tian	700
+天气	tian qi	800
+今天天气	jin tian tian qi	500
+世界	shi jie	800
+西安	xi an	700
+方案	fang an	600
+键盘	jian pan	600
+时间	shi jian	800
+事情	shi qing	700
+时候	shi hou	800
+是的	shi de	500
+已经	yi jing	800
+一个	yi ge	900
+一样	yi yang	600
+意思	yi si	600
+可以	ke yi	900
+问题	wen ti	800
+什么	shen me	900
+怎么	zen me	800
+现在	xian zai	900
+知道	zhi dao	800
+因为	yin wei	800
+所以	suo yi	800
+但是	dan shi	800
+如果	ru guo	700
+自己	zi ji	800
+大家	da jia	700
+工作	gong zuo	800
+学习	xue xi	700
+学生	xue sheng	600
+老师	lao shi	600
+朋友	peng you	700
+喜欢	xi huan	700
+谢谢	xie xie	800
+没有	mei you	900
+还是	hai shi	700
+这个	zhe ge	900
+那个	na ge	800
+我的	wo de	600
+电脑	dian nao	600
+手机	shou ji	700
+文字	wen zi	500
+汉字	han zi	500
+拼音	pin yin	600
+候选	hou xuan	400
+词库	ci ku	400
+开始	kai shi	700
+结束	jie shu	600
+北京	bei jing	700
+上海	shang hai	700
+生活	sheng huo	600
+地方	di fang	600
+东西	dong xi	700
+时代	shi dai	500
+世纪	shi ji	500
+实现	shi xian	500
+试验	shi yan	400
+城市	cheng shi	600
+历史	li shi	600
+关系	guan xi	600
+发现	fa xian	600
+出现	chu xian	600
+需要	xu yao	700
+重要	zhong yao	600
+应该	ying gai	700
+觉得	jue de	700
+看见	kan jian	500
+听说	ting shuo	500
+说话	shuo hua	500
+电话	dian hua	600
+回家	hui jia	500
+吃饭	chi fan	600
+早上	zao shang	500
+晚上	wan shang	600
+下午	xia wu	500
+上午	shang wu	500

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Verify an assembled NoemaIME.app: layout, IMKit Info.plist keys, Mach-O linkage,
-# code signatures and empty signed entitlements, and a real launch that reports the
-# packaged version and loads librime.
+# Verify an assembled NoemaIME.app: layout, IMKit Info.plist keys, Mach-O linkage of
+# MacOS/NoemaIME, MacOS/noema-rime-deployer, and Frameworks/librime.1.dylib, code
+# signatures and empty signed entitlements, and real launches that report the packaged
+# version, load librime, and start the deployer.
 #
 # Usage: scripts/build/verify-bundle.sh [--require-signed] [bundle_path]
 #   bundle_path       default dist/NoemaIME.app (relative to the repository root)
@@ -42,6 +43,7 @@ while [[ "${APP}" != "/" && "${APP}" == */ ]]; do APP="${APP%/}"; done
 CONTENTS="${APP}/Contents"
 INFO="${CONTENTS}/Info.plist"
 EXE="${CONTENTS}/MacOS/NoemaIME"
+DEPLOYER="${CONTENTS}/MacOS/noema-rime-deployer"
 DYLIB="${CONTENTS}/Frameworks/librime.1.dylib"
 ENTITLEMENTS="${REPO_ROOT}/Resources/IME/NoemaIME.entitlements"
 PYTHON3="$(xcrun -f python3 2>/dev/null || command -v python3)" || usage_error "python3 not found (xcode-select --install)"
@@ -50,14 +52,20 @@ PYTHON3="$(xcrun -f python3 2>/dev/null || command -v python3)" || usage_error "
 # 1. Layout
 # ---------------------------------------------------------------------------
 
-for file in "${INFO}" "${EXE}" "${DYLIB}" "${CONTENTS}/Resources/NoemaIME.icns" "${CONTENTS}/Resources/menu-icon.pdf"; do
+for file in "${INFO}" "${EXE}" "${DEPLOYER}" "${DYLIB}" "${CONTENTS}/Resources/NoemaIME.icns" "${CONTENTS}/Resources/menu-icon.pdf"; do
   [[ -f "${file}" && ! -L "${file}" ]] || bad "missing regular file: ${file#"${APP}/"}"
 done
 [[ -x "${EXE}" ]] || bad "Contents/MacOS/NoemaIME is not executable"
+[[ -x "${DEPLOYER}" ]] || bad "Contents/MacOS/noema-rime-deployer is not executable"
 [[ -x "${DYLIB}" ]] || bad "Contents/Frameworks/librime.1.dylib is not executable"
 if [[ ! -d "${CONTENTS}/Resources/opencc" || -z "$(ls -A "${CONTENTS}/Resources/opencc" 2>/dev/null)" ]]; then
   bad "Contents/Resources/opencc is missing or empty"
 fi
+# The built-in Rime schema that RimeEngine loads as shared_data_dir.
+for file in default.yaml noema_pinyin.schema.yaml noema_pinyin.dict.yaml; do
+  [[ -f "${CONTENTS}/Resources/rime-default/${file}" && ! -L "${CONTENTS}/Resources/rime-default/${file}" ]] \
+    || bad "missing regular file: Contents/Resources/rime-default/${file}"
+done
 if (( failures > 0 )); then
   log "${failures} check(s) failed; layout is incomplete, skipping the remaining checks"
   exit 1
@@ -149,25 +157,27 @@ PY
 rpaths_of() {
   otool -l "$1" | awk '/cmd LC_RPATH/ {getline; getline; sub(/^[[:space:]]+path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print}'
 }
-for macho in "${EXE}" "${DYLIB}"; do
+for macho in "${EXE}" "${DEPLOYER}" "${DYLIB}"; do
   name="${macho#"${CONTENTS}/"}"
   archs="$(lipo -archs "${macho}" 2>/dev/null || true)"
   [[ "${archs}" == "arm64" ]] || bad "${name}: architectures are '${archs}', expected arm64 only"
   otool -L "${macho}" | "${SCRIPT_DIR}/librime.sh" --check-linkage-stdin || bad "${name}: otool -L linkage gate failed"
 done
-otool -L "${EXE}" | grep -Fq '@rpath/librime.1.dylib' \
-  || bad "MacOS/NoemaIME does not link @rpath/librime.1.dylib"
+for macho in "${EXE}" "${DEPLOYER}"; do
+  otool -L "${macho}" | grep -Fq '@rpath/librime.1.dylib' \
+    || bad "${macho#"${CONTENTS}/"} does not link @rpath/librime.1.dylib"
+done
 dylib_id="$(otool -D "${DYLIB}" | sed -n '2p')"
 [[ "${dylib_id}" == "@rpath/librime.1.dylib" ]] || bad "Frameworks/librime.1.dylib install_name is '${dylib_id}', expected @rpath/librime.1.dylib"
 dylib_rpaths="$(rpaths_of "${DYLIB}")"
 [[ -z "${dylib_rpaths}" ]] || bad "Frameworks/librime.1.dylib must carry no LC_RPATH, found: ${dylib_rpaths//$'\n'/, }"
-exe_rpaths="$(rpaths_of "${EXE}")"
-[[ -n "${exe_rpaths}" ]] || bad "MacOS/NoemaIME has no LC_RPATH; it cannot find Frameworks/librime.1.dylib"
-while IFS= read -r rpath; do
-  [[ -n "${rpath}" ]] || continue
-  [[ "${rpath}" == "@executable_path/../Frameworks" ]] \
-    || bad "MacOS/NoemaIME LC_RPATH '${rpath}' is not allowed; only @executable_path/../Frameworks"
-done <<<"${exe_rpaths}"
+# Each executable carries exactly one LC_RPATH, the bundle's Frameworks directory.
+for macho in "${EXE}" "${DEPLOYER}"; do
+  name="${macho#"${CONTENTS}/"}"
+  exe_rpaths="$(rpaths_of "${macho}")"
+  [[ "${exe_rpaths}" == "@executable_path/../Frameworks" ]] \
+    || bad "${name} LC_RPATH is '${exe_rpaths//$'\n'/, }'; expected exactly @executable_path/../Frameworks"
+done
 # Shipped bundles carry no Homebrew paths anywhere, not just in load commands.
 homebrew_hits="$(grep -rlF /opt/homebrew "${APP}" 2>/dev/null || true)"
 [[ -z "${homebrew_hits}" ]] || bad "bundle contains /opt/homebrew strings in: ${homebrew_hits//$'\n'/, }"
@@ -179,7 +189,8 @@ homebrew_hits="$(grep -rlF /opt/homebrew "${APP}" 2>/dev/null || true)"
 codesign --verify --strict --deep "${APP}" || bad "codesign --verify --strict --deep failed for the bundle"
 codesign --verify --strict "${DYLIB}" || bad "codesign --verify failed for Frameworks/librime.1.dylib"
 codesign --verify --strict "${EXE}" || bad "codesign --verify failed for MacOS/NoemaIME"
-for target in "${APP}" "${EXE}" "${DYLIB}"; do
+codesign --verify --strict "${DEPLOYER}" || bad "codesign --verify failed for MacOS/noema-rime-deployer"
+for target in "${APP}" "${EXE}" "${DEPLOYER}" "${DYLIB}"; do
   name="${target#"${APP}"}"; name="${name#/Contents/}"; name="${name:-NoemaIME.app}"
   details="$(codesign -dvv "${target}" 2>&1 || true)"
   if (( REQUIRE_SIGNED )); then
@@ -195,7 +206,7 @@ for target in "${APP}" "${EXE}" "${DYLIB}"; do
 done
 # The entitlements actually signed in, not the repository file: zero network, zero TCC,
 # no library-validation opt-out. Absent or an empty dictionary passes; any key fails.
-for target in "${APP}" "${EXE}"; do
+for target in "${APP}" "${EXE}" "${DEPLOYER}"; do
   name="${target#"${APP}"}"; name="${name#/Contents/}"; name="${name:-NoemaIME.app}"
   if ! signed_entitlements="$(codesign -d --entitlements - --xml "${target}" 2>/dev/null)"; then
     bad "${name}: cannot read the signed entitlements"
@@ -217,7 +228,7 @@ done
 
 # ---------------------------------------------------------------------------
 # 6. Real launch: --version must report the packaged version, dyld must resolve the
-#    bundled librime, and every module must register
+#    bundled librime for NoemaIME and noema-rime-deployer, and every module must register
 # ---------------------------------------------------------------------------
 
 expected_version="$(plutil -extract CFBundleShortVersionString raw -o - "${INFO}" 2>/dev/null || true)"
@@ -237,6 +248,16 @@ else
   status=$?
   printf '%s\n' "${probe}" | sed 's/^/[verify-bundle]   /' >&2
   bad "MacOS/NoemaIME --check-rime exited ${status}"
+fi
+
+if deployer_output="$(env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH -u DYLD_INSERT_LIBRARIES \
+  "${DEPLOYER}" --version 2>&1)"; then
+  deployer_version_re='^noema-rime-deployer [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+  [[ "${deployer_output}" != *$'\n'* && "${deployer_output}" =~ ${deployer_version_re} ]] \
+    || bad "MacOS/noema-rime-deployer --version printed '${deployer_output}'"
+else
+  status=$?
+  bad "MacOS/noema-rime-deployer --version exited ${status}: ${deployer_output}"
 fi
 
 if (( failures > 0 )); then
