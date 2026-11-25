@@ -188,6 +188,7 @@ enum InstallCommand {
         }
         let expected = [
             "CFBundleIdentifier": NoemaPaths.imeBundleID,
+            "CFBundleExecutable": NoemaPaths.imeExecutableName,
             "InputMethodServerControllerClass": NoemaPaths.imeControllerClassName,
             "InputMethodConnectionName": NoemaPaths.imeConnectionName,
         ]
@@ -219,15 +220,31 @@ enum InstallCommand {
         guard verify.status == 0 else {
             throw CLIError("code signature is invalid: \(verify.stderr.trimmed)")
         }
-        let details = runTool("/usr/bin/codesign", ["-dvv", app])
-        guard details.status == 0 else { throw CLIError("cannot read the code signature: \(details.stderr.trimmed)") }
-        let isAdhoc = details.stderr.split(separator: "\n").contains("Signature=adhoc")
-        if isAdhoc && !allowAdhoc {
-            throw CLIError("""
-                the bundle is ad-hoc signed. Sign it with a certificate \
-                (scripts/build/bundle.sh --sign <SHA-1>), or pass --allow-adhoc to install \
-                an ad-hoc build for local development
-                """)
+        // The bundle and every piece of nested code it ships: an ad-hoc nested binary under
+        // a certificate-signed bundle is still an ad-hoc install.
+        let contents = "\(app)/Contents"
+        let signed = [
+            (app, "the bundle"),
+            ("\(contents)/MacOS/\(NoemaPaths.imeExecutableName)", "Contents/MacOS/\(NoemaPaths.imeExecutableName)"),
+            ("\(contents)/MacOS/noema-rime-deployer", "Contents/MacOS/noema-rime-deployer"),
+            ("\(contents)/Frameworks/librime.1.dylib", "Contents/Frameworks/librime.1.dylib"),
+        ]
+        var isAdhoc = false
+        for (path, name) in signed {
+            let details = runTool("/usr/bin/codesign", ["-dvv", path])
+            guard details.status == 0 else {
+                throw CLIError("cannot read the code signature of \(name): \(details.stderr.trimmed)")
+            }
+            let lines = details.stderr.split(separator: "\n")
+            let adhoc = lines.contains("Signature=adhoc")
+            if !allowAdhoc && (adhoc || !lines.contains(where: { $0.hasPrefix("Authority=") })) {
+                throw CLIError("""
+                    \(name) is ad-hoc signed or has no signing authority. Sign the bundle with a \
+                    certificate (scripts/build/bundle.sh --sign <SHA-1>), or pass --allow-adhoc to \
+                    install an ad-hoc build for local development
+                    """)
+            }
+            isAdhoc = isAdhoc || adhoc
         }
         if isAdhoc {
             fputs("noema-cli install: warning: installing an ad-hoc signed bundle (local development only)\n", stderr)
@@ -237,8 +254,9 @@ enum InstallCommand {
     /// Blocks until this process holds the exclusive install lock for `canonicalDest`.
     static func lockDestination(_ canonicalDest: String) throws(CLIError) -> Int32 {
         let digest = SHA256.hash(data: Data(canonicalDest.utf8)).map { String(format: "%02x", $0) }.joined()
-        let tmp = ProcessInfo.processInfo.environment["TMPDIR"].flatMap { $0.isEmpty ? nil : $0 } ?? "/tmp"
-        let path = "\(tmp.hasSuffix("/") ? String(tmp.dropLast()) : tmp)/noema-ime-install-\(digest).lock"
+        // The per-user temporary directory, never the shared /tmp.
+        let path = FileManager.default.temporaryDirectory
+            .appending(path: "noema-ime-install-\(digest).lock", directoryHint: .notDirectory).fileSystemPath
         let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else { throw CLIError("cannot open install lock \(path): \(String(cString: strerror(errno)))") }
         guard flock(descriptor, LOCK_EX) == 0 else {

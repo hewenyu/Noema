@@ -22,10 +22,10 @@ Status: proposed
   - 内置最小拼音方案 `Resources/rime-default/`（`script_translator`，原创小词表）作为 `shared_data_dir` 随包分发；完整词库仍走 [lexicon note](2026-11-23-lexicon-canonical-and-userdb-isolation.md) 的下载与部署流程。
   - 密码框：`IsSecureEventInputEnabled()` 为真时立即直通并隐藏所有浮窗。
   - IMKit 壳分两层：`NoemaIMEShell` 库（`InputSessionCoordinator`、`NSEventKeyBridge`、`TextInputClient`/`CandidatePresenting` 接缝）不依赖引擎实现，可在测试中直接驱动真实 `RimeEngine`；`NoemaIME` 可执行文件只剩 `NoemaInputController`（逐个转发 IMKit 回调）、`EngineHost`（进程内唯一 `RimeEngine`）与 `main.swift`。两者都受 `check-imports.sh` 零 TCC 扫描。
-  - 多个 `IMKInputController` 共享一个引擎：同一时刻只有一个会话令牌拥有组字；迟到的 `deactivate(A)` 在 `activate(B)` 之后到达时被忽略；换主时清掉旧客户端的 marked text 并 `clearComposition()`，绝不 `resetSession()`（会重置 `ascii_mode`）。按键顺序：安全输入 → 换主 → 无引擎/Safe Mode → 空闲 ASCII → `processKey`，结果先上屏 `committedText` 再按 `handled` 返回。
+  - 多个 `IMKInputController` 共享一个引擎：同一时刻只有一个会话令牌拥有组字；迟到的 `deactivate(A)` 在 `activate(B)` 之后到达时被忽略；换主时清掉旧客户端的 marked text 并 `clearComposition()`，绝不 `resetSession()`（会重置 `ascii_mode`）。按键顺序：安全输入 → 换主 → 无引擎/Safe Mode → 空闲 ASCII → `processKey`，结果先上屏 `committedText` 再按 `handled` 返回。安全输入下 `commitComposition` 与切到 ASCII 模式只丢弃组字（清除壳放上的 marked text），绝不 `insertText`；`deactivateServer:` 不取客户端代理即释放组字，代理失效也不会留下旧主。
   - `recognizedEvents` 只声明 keyDown：鼠标事件留给 IMKit，点击 marked text 之外时由 IMKit 调 `commitComposition:`。
   - `main.swift` 先回答 `--version`/`--check-rime`/`--help`（不触碰 AppKit，`verify-bundle.sh` 可无头运行），未知 `--` 参数立即退出 2；否则先注册 `IMKServer`，再在 `applicationDidFinishLaunching` 中启动引擎，SIGTERM/SIGINT 时 `shutdown()` 释放锁。
-  - `noema-cli install` 先把包复制到 `--dest` 内的 staging 并只校验这份副本（Info.plist 标识、两个可执行文件、librime、`rime-default`、`codesign --verify --strict --deep`，ad-hoc 需 `--allow-adhoc`），在 per-dest `flock` 下快照旧进程（pid + 启动时间）后以两次 `rename(2)` 替换，拒绝软链与非 Noema 目标；仅默认目录才注册 TIS 并结束快照中的进程。`noema-cli repl` 默认使用退出即删的临时 `user_data_dir`。
+  - `noema-cli install` 先把包复制到 `--dest` 内的 staging 并只校验这份副本（Info.plist 标识与 `CFBundleExecutable`、两个可执行文件、librime、`rime-default`、`codesign --verify --strict --deep`；包本身与三个嵌套代码逐个 `codesign -dvv`，未加 `--allow-adhoc` 时任一为 ad-hoc 或无 `Authority=` 即拒绝；锁文件位于用户临时目录而非共享 `/tmp`），在 per-dest `flock` 下快照旧进程（pid + 启动时间；读路径前后各取一次身份并排除僵尸，pid 列表填满缓冲区时扩容重取）后以两次 `rename(2)` 替换，拒绝软链与非 Noema 目标；仅默认目录才注册 TIS 并结束快照中的进程。`noema-cli repl` 默认使用退出即删的临时 `user_data_dir`。
   - 任何热路径超时或异常一律 `return false` 直通 ASCII，永不吞键。
 - **`Noema.app`（伴生 Agent，LaunchAgent 常驻）**：集中持有 Accessibility / Microphone / Speech Recognition 等 TCC 授权，承载 Settings、Clipboard、Voice、AI HUD 等 UI 与后台能力。
 - **`noema-rime-deployer`（子进程）**：执行方案与词库编译，与输入热路径完全隔离（详见 [lexicon note](2026-11-23-lexicon-canonical-and-userdb-isolation.md)）。
@@ -58,8 +58,8 @@ Status: proposed
 - `NoemaIME` 目标的链接依赖与源码中不出现网络、AVFoundation/Speech、剪贴板监听或 AX 相关 API；其 `Info.plist` 不声明任何 TCC 用途字符串。
 - 在 Agent 未运行或 IPC 人为延迟 >20ms 时，按键仍能输出（直通 ASCII 或 Rime 本地结果），无吞键。
 - `IsSecureEventInputEnabled()` 为真时，所有按键直通且浮窗隐藏，引擎不接收按键，安全输入框不收到任何 marked text，上一客户端残留的 marked text 被清除（`InputSessionCoordinatorTests.secureInputPassesThroughWithoutTouchingTheSecureClient`，负控：去掉安全输入判断即失败）。
-- `InputSessionCoordinator` 在真实 `RimeEngine` 上：全拼提交、半选汉字的 UTF-16 光标、Esc/退格取消、无 `punctuator` 时 `,` 上屏"你好"并返回 `false`、ASCII 模式与 Caps Lock 直通、Safe Mode 与无引擎降级、乱序 `activate(B)`/`deactivate(A)` 不影响 B、失焦保留 `ascii_mode`、`commitComposition` 与 `hidePalettes`（`Tests/CRimeTests/InputSessionCoordinatorTests.swift`）；`NSEventKeyBridge` 用真实 `NSEvent` 测试，非 keyDown 事件在读取按键属性前即被拒绝。
-- `noema-cli install` 拒绝软链、非 Noema 目标、签名被篡改的包与未加 `--allow-adhoc` 的 ad-hoc 包，且不改动已安装的包；升级后目录中不留 staging 或旧包；`--reload` 结束替换前的旧进程；`reload` 只结束指定包路径的进程；`repl` 退出后删除临时目录，锁被占用时以 `userDataDirLocked` 直通（`Tests/CRimeTests/NoemaCLITests.swift`）。`NoemaIME --bogus` 立即退出 2。
+- `InputSessionCoordinator` 在真实 `RimeEngine` 上：全拼提交、半选汉字的 UTF-16 光标、Esc/退格取消、无 `punctuator` 时 `,` 上屏"你好"并返回 `false`、ASCII 模式与 Caps Lock 直通、Safe Mode 与无引擎降级、乱序 `activate(B)`/`deactivate(A)` 不影响 B、失焦保留 `ascii_mode`、安全输入下未激活的新会话零调用且 `commitComposition`/ASCII 切换不上屏、无提交时仍清 marked text、`commitComposition` 与 `hidePalettes`（`Tests/CRimeTests/InputSessionCoordinatorTests.swift`）；`NSEventKeyBridge` 用真实 `NSEvent` 测试，非 keyDown 事件在读取按键属性前即被拒绝。
+- `noema-cli install` 拒绝软链、非 Noema 目标、签名被篡改的包、删除 `rime-default` 后重签的包与未加 `--allow-adhoc` 的 ad-hoc 包，且不改动已安装的包；升级后目录中不留 staging 或旧包；`--reload` 结束替换前的旧进程；`reload` 只结束指定包路径的进程；`repl` 退出后删除临时目录，锁被占用时以 `userDataDirLocked` 直通（`Tests/CRimeTests/NoemaCLITests.swift`）。`NoemaIME --bogus` 立即退出 2。
 - `⌘C` 回退事务在 `changeCount` 未变时返回中止结果，不返回剪贴板旧内容（负控测试覆盖）。
 - AI 建议到达后，候选首位与到达前一致；建议只出现在 `✨` 槽位。
 - 带过期 `generationID` 的 IPC 响应被丢弃。

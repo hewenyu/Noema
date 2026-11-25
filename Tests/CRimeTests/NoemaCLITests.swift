@@ -172,6 +172,19 @@ extension LibrimeSerializedTests {
             #expect(try fixture.destEntries().isEmpty)
         }
 
+        /// A validly re-signed bundle without the shipped schema is still incomplete.
+        @Test func installRefusesAResignedBundleWithoutRimeDefault() throws {
+            let fixture = try BundleFixture()
+            try FileManager.default.removeItem(at: fixture.app.appending(path: "Contents/Resources/rime-default"))
+            let resigned = try Tool.run("/usr/bin/codesign", ["--force", "--sign", "-", "--timestamp=none", fixture.app.path])
+            try #require(resigned.status == 0, "codesign: \(resigned.stderr)")
+            let verify = try Tool.run("/usr/bin/codesign", ["--verify", "--strict", "--deep", fixture.app.path])
+            try #require(verify.status == 0, "the re-signed bundle must pass codesign: \(verify.stderr)")
+            let refused = try fixture.install()
+            #expect(refused.status == 1 && refused.stderr.contains("rime-default"), "stderr: \(refused.stderr)")
+            #expect(try fixture.destEntries().isEmpty)
+        }
+
         /// `--reload` stops the process running the *old* bundle: its pid is taken before the
         /// swap, because afterwards its executable no longer lives at the target path.
         @Test func installReloadStopsTheProcessOfTheReplacedBundle() throws {

@@ -20,12 +20,32 @@ enum IMEProcesses {
         return String(cString: resolved)
     }
 
-    /// `pbi_uid` and start time of `pid`, or nil when it is gone or unreadable.
-    static func bsdInfo(_ pid: pid_t) -> (uid: uid_t, identity: ProcessIdentity)? {
+    /// `pbi_uid`, start time, and zombie state of `pid`, or nil when it is gone or unreadable.
+    static func bsdInfo(_ pid: pid_t) -> (uid: uid_t, identity: ProcessIdentity, isZombie: Bool)? {
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
         guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
-        return (info.pbi_uid, ProcessIdentity(pid: pid, startSeconds: info.pbi_start_tvsec, startMicroseconds: info.pbi_start_tvusec))
+        let identity = ProcessIdentity(pid: pid, startSeconds: info.pbi_start_tvsec, startMicroseconds: info.pbi_start_tvusec)
+        return (info.pbi_uid, identity, info.pbi_status == UInt32(SZOMB))
+    }
+
+    /// Every pid on the system, retrying with a larger buffer (up to four times) while a
+    /// full buffer means the list may have been truncated; the last list is best effort.
+    static func allPIDs() -> [pid_t] {
+        var capacity = Int(proc_listallpids(nil, 0))
+        guard capacity > 0 else { return [] }
+        var pids: [pid_t] = []
+        for _ in 0..<4 {
+            capacity += max(64, capacity / 4)
+            var buffer = [pid_t](repeating: 0, count: capacity)
+            let count = Int(buffer.withUnsafeMutableBufferPointer { pointer in
+                proc_listallpids(pointer.baseAddress, Int32(pointer.count * MemoryLayout<pid_t>.size))
+            })
+            guard count > 0 else { return pids }
+            pids = Array(buffer.prefix(min(count, capacity)))
+            if count < capacity { break }
+        }
+        return pids
     }
 
     static func executablePath(_ pid: pid_t) -> String? {
@@ -37,31 +57,29 @@ enum IMEProcesses {
 
     /// Processes of the current user, other than this one, whose canonical executable path
     /// is `canonicalExecutable`.
+    /// is `canonicalExecutable`. The pid's identity is read before and after its path, so
+    /// a pid recycled in between is skipped rather than attributed the other's path.
     static func running(canonicalExecutable: String) -> [ProcessIdentity] {
-        let capacity = proc_listallpids(nil, 0)
-        guard capacity > 0 else { return [] }
-        var pids = [pid_t](repeating: 0, count: Int(capacity) + 64)
-        let count = pids.withUnsafeMutableBufferPointer { buffer in
-            proc_listallpids(buffer.baseAddress, Int32(buffer.count * MemoryLayout<pid_t>.size))
-        }
-        guard count > 0 else { return [] }
         let me = getpid()
         let uid = getuid()
         var found: [ProcessIdentity] = []
-        for pid in pids.prefix(Int(count)) where pid > 0 && pid != me {
-            guard let path = executablePath(pid),
+        for pid in allPIDs() where pid > 0 && pid != me {
+            guard let before = bsdInfo(pid), before.uid == uid, !before.isZombie,
+                  let path = executablePath(pid),
                   (canonicalPath(path) ?? path) == canonicalExecutable,
-                  let info = bsdInfo(pid), info.uid == uid
+                  let after = bsdInfo(pid), after.uid == uid, !after.isZombie,
+                  after.identity == before.identity
             else { continue }
-            found.append(info.identity)
+            found.append(before.identity)
         }
         return found
     }
 
-    /// True while `identity` (same pid and start time) is still alive.
+    /// True while `identity` (same pid and start time) is still running; an exited but
+    /// unreaped zombie counts as gone.
     static func isAlive(_ identity: ProcessIdentity) -> Bool {
         guard let info = bsdInfo(identity.pid) else { return false }
-        return info.identity == identity
+        return info.identity == identity && !info.isZombie
     }
 
     /// Sends SIGTERM to each process that is still the same process and still ours, then

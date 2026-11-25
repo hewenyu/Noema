@@ -40,6 +40,7 @@ jobs:
       - Sources/
       - Tests/
       - Resources/rime-default/
+      - Resources/IME/Info.plist.in
       - vendor/librime.lock
       - scripts/build/librime.sh
       - scripts/dev/test.sh

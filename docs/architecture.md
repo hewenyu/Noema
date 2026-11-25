@@ -46,14 +46,14 @@ Rationale: [process model note](../.agents/notes/proposed/architecture/2026-11-2
 
 IMKit creates one `NoemaInputController` per client session; it forwards every IMKit call, on the main thread, to the process-wide `InputSessionCoordinator` with its session token and an `IMKTextInput` adapter. `recognizedEvents` is key-down only, so IMKit keeps committing on a click outside the marked text. The coordinator:
 
-- passes every key through, before the engine sees it, while `IsSecureEventInputEnabled()` is true, and hides the panel;
+- passes every key through, before the engine sees it, while `IsSecureEventInputEnabled()` is true, and hides the panel; under secure input a commit or ASCII switch drops the composition and inserts nothing;
 - gives the composition to one token at a time: a late `deactivate` from a previous owner is ignored, and a new owner clears the old client's marked text with `clearComposition()`, never `resetSession()` (which resets `ascii_mode`);
 - returns `false` without an engine, in Safe Mode, and in idle ASCII mode;
 - inserts `committedText` first, then shows marked text with UTF-16 caret and selection or clears it, and returns `handled`.
 
 `EngineHost` registers the `IMKServer` first and boots `RimeEngine` after launch; a boot failure leaves every key passing through. The candidate panel plugs in through `CandidatePresenting` (`NoOpCandidatePresenter` today).
 
-`noema-cli install` validates a staged copy of the bundle inside `--dest` (identifiers, executables, librime, `rime-default`, strict signature; ad-hoc only with `--allow-adhoc`) and swaps it in with two renames under a `flock`; for `~/Library/Input Methods` it also registers the bundle and stops the `NoemaIME` processes found before the swap. `reload` stops this user's `NoemaIME` of one bundle; `repl` drives a real engine from stdin. The [`noema-cli` sources](../Sources/noema-cli/InstallCommand.swift) hold the details.
+`noema-cli install` validates a staged copy of the bundle inside `--dest` (identifiers, executables, librime, `rime-default`, strict signature; ad-hoc anywhere in the bundle or its nested code only with `--allow-adhoc`) and swaps it in with two renames under a `flock`; for `~/Library/Input Methods` it also registers the bundle and stops the `NoemaIME` processes found before the swap. `reload` stops this user's `NoemaIME` of one bundle; `repl` drives a real engine from stdin. The [`noema-cli` sources](../Sources/noema-cli/InstallCommand.swift) hold the details.
 
 ## Build pipeline
 

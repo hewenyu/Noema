@@ -36,10 +36,10 @@ final class NoemaInputController: IMKInputController {
         }
     }
 
+    // No client lookup: a detached client must not skip releasing the composition.
     override func deactivateServer(_ sender: Any!) {
-        withClient(sender, fallback: ()) { coordinator, token, client in
-            coordinator.deactivate(token: token, client: client)
-        }
+        let token = sessionToken
+        onMainActor(fallback: ()) { EngineHost.shared.coordinator.deactivate(token: token) }
         super.deactivateServer(sender)
     }
 

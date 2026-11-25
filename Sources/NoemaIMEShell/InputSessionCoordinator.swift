@@ -49,8 +49,9 @@ public final class InputSessionCoordinator {
     }
 
     /// A controller's client lost focus (`deactivateServer:`). Ignored unless `token` owns
-    /// the composition.
-    public func deactivate(token: UUID, client: any TextInputClient) {
+    /// the composition. Needs no client: the owner's client is the one that is cleared, so
+    /// a detached client proxy cannot keep a stale owner alive.
+    public func deactivate(token: UUID) {
         guard activeToken == token else { return }
         releaseActive()
     }
@@ -63,9 +64,14 @@ public final class InputSessionCoordinator {
     }
 
     /// IMKit asks the controller to commit (`commitComposition:`, e.g. a click outside the
-    /// marked text). Inserts what the engine commits and leaves nothing marked.
+    /// marked text). Inserts what the engine commits and leaves nothing marked. Under
+    /// secure input nothing is inserted: the composition is dropped instead.
     public func commitComposition(token: UUID, client: any TextInputClient) {
         guard activeToken == token else { return }
+        if isSecureInputEnabled() {
+            dropComposition()
+            return
+        }
         guard let engine = engineProvider(), !engine.currentState.isSafeMode else {
             if hasMarkedText { client.clearMarkedText() }
             hasMarkedText = false
@@ -73,13 +79,14 @@ public final class InputSessionCoordinator {
             return
         }
         let result = engine.commitComposition()
+        var didInsert = false
         if let committed = result.committedText, !committed.isEmpty {
             client.insertText(committed)
+            didInsert = true
         }
-        if result.state.isComposing || (result.committedText == nil && hasMarkedText) {
-            engine.clearComposition()
-            client.clearMarkedText()
-        }
+        if result.state.isComposing { engine.clearComposition() }
+        // insertText replaced the marked text; without an insert it is still there.
+        if hasMarkedText && !didInsert { client.clearMarkedText() }
         hasMarkedText = false
         candidatePresenter.hide()
     }
@@ -92,13 +99,17 @@ public final class InputSessionCoordinator {
 
     /// The user picked an input mode (`setValue:forTag:client:` with
     /// `kTextServiceInputModePropertyTag`). `zhHansInputModeID` keeps the engine's current
-    /// `ascii_mode`: Chinese is the schema default, and Shift toggling inside the engine
-    /// survives focus changes. `asciiInputModeID` commits any composition and turns
-    /// ASCII mode on. Unknown modes change nothing.
+    /// `ascii_mode`: Chinese is the schema default, and a focus change never resets it.
+    /// `asciiInputModeID` commits any composition (drops it under secure input, inserting
+    /// nothing) and turns ASCII mode on. Unknown modes change nothing.
     public func setInputMode(_ modeID: String, token: UUID, client: any TextInputClient) {
         guard modeID == Self.asciiInputModeID else { return }
         take(token: token, client: client)
-        commitComposition(token: token, client: client)
+        if isSecureInputEnabled() {
+            dropComposition()
+        } else {
+            commitComposition(token: token, client: client)
+        }
         engineProvider()?.setASCIIMode(true)
     }
 
@@ -118,11 +129,7 @@ public final class InputSessionCoordinator {
         if isSecureInputEnabled() {
             candidatePresenter.hide()
             if activeToken != token || hasMarkedText {
-                if hasMarkedText { activeClient?.clearMarkedText() }
-                hasMarkedText = false
-                if let engine = engineProvider(), engine.currentState.isComposing {
-                    engine.clearComposition()
-                }
+                dropComposition()
                 activeToken = token
                 activeClient = client
             }
@@ -197,16 +204,21 @@ public final class InputSessionCoordinator {
         hasMarkedText = false
     }
 
-    /// Clears the owner's marked text and the engine's composition (keeping `ascii_mode`),
-    /// hides the menu, and leaves no owner.
-    private func releaseActive() {
+    /// Clears the owner's marked text (only if the shell put it there) and the engine's
+    /// composition, keeping `ascii_mode`, and hides the menu. Inserts nothing.
+    private func dropComposition() {
         if hasMarkedText { activeClient?.clearMarkedText() }
+        hasMarkedText = false
         if let engine = engineProvider(), engine.currentState.isComposing {
             engine.clearComposition()
         }
         candidatePresenter.hide()
+    }
+
+    /// Drops the owner's composition and leaves no owner.
+    private func releaseActive() {
+        dropComposition()
         activeToken = nil
         activeClient = nil
-        hasMarkedText = false
     }
 }

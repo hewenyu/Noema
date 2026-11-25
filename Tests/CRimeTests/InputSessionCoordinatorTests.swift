@@ -143,6 +143,47 @@ extension LibrimeSerializedTests {
             #expect(password.calls == [.clear] && !harness.engine.currentState.isComposing)
         }
 
+        /// A key from a never-activated controller under secure input: the previous owner's
+        /// marked text is cleared, and the secure client receives no call at all.
+        @Test func secureKeyFromAnotherControllerNeverTouchesItsClient() throws {
+            var secure = false
+            let harness = try Harness(isSecureInputEnabled: { secure })
+            defer { harness.shutdown() }
+            let a = RecordingClient(), b = RecordingClient()
+            let tokenA = UUID(), tokenB = UUID()
+            for key in "nihao" { _ = harness.coordinator.handleKey(.text(key), token: tokenA, client: a) }
+            a.calls.removeAll()
+            secure = true
+            #expect(!harness.coordinator.handleKey(.text("x"), token: tokenB, client: b))
+            #expect(b.calls.isEmpty, "no insert, mark, or clear on the secure client")
+            #expect(a.calls == [.clear])
+            #expect(!harness.engine.currentState.isComposing && !harness.coordinator.hasMarkedText)
+        }
+
+        /// `commitComposition` and the ASCII mode switch under secure input drop the
+        /// composition instead of inserting it.
+        @Test func secureCommitCompositionInsertsNothing() throws {
+            var secure = false
+            let harness = try Harness(isSecureInputEnabled: { secure })
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            for key in "nihao" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            client.calls.removeAll()
+            secure = true
+            harness.coordinator.commitComposition(token: token, client: client)
+            #expect(client.calls == [.clear], "never insertText on a secure client")
+            #expect(!harness.engine.currentState.isComposing && !harness.coordinator.hasMarkedText)
+
+            secure = false
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            client.calls.removeAll()
+            secure = true
+            harness.coordinator.setInputMode(InputSessionCoordinator.asciiInputModeID, token: token, client: client)
+            #expect(client.calls == [.clear] && harness.engine.currentState.isASCIIMode)
+            #expect(!harness.engine.currentState.isComposing)
+        }
+
         // MARK: ASCII mode, Caps Lock
 
         @Test func asciiModePassesThroughWithoutCallingTheEngine() throws {
@@ -237,14 +278,14 @@ extension LibrimeSerializedTests {
             for key in "hao" { #expect(harness.coordinator.handleKey(.text(key), token: tokenB, client: b)) }
             let bCalls = b.calls
 
-            harness.coordinator.deactivate(token: tokenA, client: a)
+            harness.coordinator.deactivate(token: tokenA)
             harness.coordinator.controllerWillClose(token: tokenA)
             harness.coordinator.commitComposition(token: tokenA, client: a)
             #expect(a.calls == [.clear] && b.calls == bCalls)
             #expect(harness.coordinator.activeToken == tokenB && harness.coordinator.hasMarkedText)
             #expect(harness.engine.currentState.preedit == "hao")
 
-            harness.coordinator.deactivate(token: tokenB, client: b)
+            harness.coordinator.deactivate(token: tokenB)
             #expect(b.calls.last == .clear && harness.coordinator.activeToken == nil)
             #expect(!harness.engine.currentState.isComposing)
         }
@@ -271,7 +312,7 @@ extension LibrimeSerializedTests {
             harness.coordinator.activate(token: token, client: client)
             for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
             harness.engine.setASCIIMode(true)
-            harness.coordinator.deactivate(token: token, client: client)
+            harness.coordinator.deactivate(token: token)
             #expect(harness.engine.currentState.isASCIIMode, "ascii_mode survives deactivate")
             #expect(!harness.engine.currentState.isComposing)
 
@@ -311,6 +352,21 @@ extension LibrimeSerializedTests {
             #expect(!harness.coordinator.hasMarkedText && !harness.engine.currentState.isComposing)
             harness.coordinator.commitComposition(token: token, client: client)
             #expect(client.calls == [.insert("你好")])
+        }
+
+        /// Marked text with nothing left to commit (the engine's composition went away
+        /// underneath it) is still cleared: no insertText replaced it.
+        @Test func commitCompositionWithoutCommitClearsMarkedText() throws {
+            let harness = try Harness()
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            harness.engine.clearComposition()
+            client.calls.removeAll()
+            #expect(harness.coordinator.hasMarkedText)
+            harness.coordinator.commitComposition(token: token, client: client)
+            #expect(client.calls == [.clear] && !harness.coordinator.hasMarkedText)
         }
 
         @Test func hidePalettesKeepsTheComposition() throws {
