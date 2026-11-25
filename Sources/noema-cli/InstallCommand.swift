@@ -4,12 +4,17 @@ import NoemaCore
 
 /// `noema-cli install`: copy a built `NoemaIME.app` into an Input Methods directory.
 ///
-/// The bundle is copied into a staging directory inside `--dest` first and every check
-/// runs on that copy, so what was checked is exactly what is installed. The swap is two
-/// `rename(2)` calls under a per-destination `flock`, rolled back if the second fails; an
-/// existing target that is not a Noema bundle is never touched. Processes of the replaced
-/// bundle that are not stopped (`--no-reload`, or a reload timeout, which exits 1) go to
-/// the `PendingReloadStore` for a later `noema-cli reload`.
+/// Everything runs under a per-destination `flock`. Leftovers of an interrupted install are
+/// recovered first: a missing target comes back from its newest valid `.old.*` backup,
+/// then stale `.old.*` and `.install-staging.*` entries go. The bundle is copied into a
+/// staging directory inside `--dest` and every check runs on that copy, so what was
+/// checked is exactly what is installed. An upgrade swaps it in with one
+/// `renamex_np(RENAME_SWAP)`, so the target never disappears; only a file system without
+/// it gets two `rename(2)` calls, rolled back if the second fails. The swap, its cleanup,
+/// and the pending-reload ledger run with `SIGINT`/`SIGTERM`/`SIGHUP` held back until they
+/// finish. An existing target that is not a Noema bundle is never touched. Processes of the
+/// replaced bundle that are not stopped (`--no-reload`, or a reload timeout, which exits 1)
+/// go to the `PendingReloadStore` for a later `noema-cli reload`.
 enum InstallCommand {
     static let usage = """
         usage: noema-cli install [--bundle <path>] [--dest <dir>] [--allow-adhoc]
@@ -108,9 +113,17 @@ enum InstallCommand {
         default: throw CLIError("bundle is not a directory: \(bundlePath)")
         }
 
-        // 1. Stage a private copy inside dest (same file system, so the swap is a rename).
+        // 1. Lock the destination, then recover what an interrupted install left behind.
+        // Staging happens under the lock too, so every other staging directory is stale.
+        let lock = try IMEProcesses.lockDirectory(canonicalDest)
+        defer { close(lock) }
+        let target = "\(canonicalDest)/\(NoemaPaths.imeBundleName)"
         let tag = "\(getpid()).\(UUID().uuidString)"
-        let staging = "\(canonicalDest)/.\(NoemaPaths.imeBundleName).install-staging.\(tag)"
+        let stagingName = "\(stagingPrefix)\(tag)"
+        try recoverInterruptedInstalls(in: canonicalDest, keepingStaging: stagingName)
+
+        // 2. Stage a private copy inside dest (same file system, so the swap is a rename).
+        let staging = "\(canonicalDest)/\(stagingName)"
         guard mkdir(staging, 0o700) == 0 else {
             throw CLIError("cannot create staging directory \(staging): \(String(cString: strerror(errno)))")
         }
@@ -119,38 +132,65 @@ enum InstallCommand {
         let ditto = runTool("/usr/bin/ditto", [bundlePath, staged])
         guard ditto.status == 0 else { throw CLIError("ditto failed: \(ditto.stderr.trimmed)") }
 
-        // 2. Validate the staged copy, never the source.
+        // 3. Validate the staged copy, never the source.
         try validateBundle(staged)
         try validateSignature(staged, allowAdhoc: options.allowAdhoc)
 
-        // 3. Swap under the per-destination lock.
-        let target = "\(canonicalDest)/\(NoemaPaths.imeBundleName)"
+        // 4. Swap.
         let executable = "\(target)/Contents/MacOS/\(NoemaPaths.imeExecutableName)"
-        let lock = try IMEProcesses.lockDirectory(canonicalDest)
-        defer { close(lock) }
         try ensureReplaceable(target)
         // Before the swap: once renamed away, an old process's executable no longer has
         // the target path. Earlier `--no-reload` installs or timed-out reloads left theirs
         // in the pending-reload ledger.
         let pending = PendingReloadStore.load(canonicalBundle: target)
         let before = IMEProcesses.running(canonicalExecutable: executable)
-        let old = "\(canonicalDest)/.\(NoemaPaths.imeBundleName).old.\(tag)"
         let hadTarget = FileKind.of(target) != .missing
-        if hadTarget, rename(target, old) != 0 {
-            throw CLIError("cannot move the installed bundle aside: \(String(cString: strerror(errno)))")
-        }
-        if rename(staged, target) != 0 {
-            let reason = String(cString: strerror(errno))
-            if hadTarget, rename(old, target) != 0 {
-                throw CLIError("install failed (\(reason)) and the previous bundle stays at \(old)")
+        try withTerminationSignalsBlocked { () throws(CLIError) in
+            let old = "\(canonicalDest)/\(oldPrefix)\(tag)"
+            var movedAside = false
+            if hadTarget {
+                // One kernel operation: the target is never missing, even on SIGKILL, and
+                // the previous bundle lands at `staged`, deleted with `staging` below.
+                if renamex_np(staged, target, UInt32(RENAME_SWAP)) != 0 {
+                    let swapErrno = errno
+                    guard swapErrno == ENOTSUP || swapErrno == EINVAL else {
+                        throw CLIError("install swap failed, previous bundle kept: \(String(cString: strerror(swapErrno)))")
+                    }
+                    // No RENAME_SWAP on this file system: two renames, rolled back on failure.
+                    if rename(target, old) != 0 {
+                        let asideErrno = errno
+                        throw CLIError("cannot move the installed bundle aside: \(String(cString: strerror(asideErrno)))")
+                    }
+                    movedAside = true
+                    if rename(staged, target) != 0 {
+                        let installErrno = errno
+                        let reason = String(cString: strerror(installErrno))
+                        if rename(old, target) != 0 {
+                            throw CLIError("install failed (\(reason)) and the previous bundle stays at \(old)")
+                        }
+                        throw CLIError("install failed, previous bundle restored: \(reason)")
+                    }
+                }
+            } else if rename(staged, target) != 0 {
+                let installErrno = errno
+                throw CLIError("install failed: \(String(cString: strerror(installErrno)))")
             }
-            throw CLIError("install failed, previous bundle restored: \(reason)")
+            syncDirectory(canonicalDest)
+            if movedAside { try? fileManager.removeItem(atPath: old) }
+            try? fileManager.removeItem(atPath: staging)
+            // Record replaced processes before unblocking signals, even with `--reload`:
+            // if a signal kills us before step 5 finishes, `noema-cli reload` still finds them;
+            // a successful `--reload` clears the ledger below.
+            do throws(CLIError) {
+                try PendingReloadStore.save(pending + before, canonicalBundle: target)
+            } catch {
+                fputs("noema-cli install: warning: \(error.message)\n", stderr)
+            }
+            print("installed \(target)")
+            fflush(stdout)
         }
-        syncDirectory(canonicalDest)
-        if hadTarget { try? fileManager.removeItem(atPath: old) }
-        print("installed \(target)")
 
-        // 4. Register and reload.
+        // 5. Register and reload.
         if options.register {
             let status = IMEProcesses.register(bundle: URL(filePath: target, directoryHint: .isDirectory))
             if status == noErr {
@@ -159,15 +199,7 @@ enum InstallCommand {
                 fputs("noema-cli install: TISRegisterInputSource returned \(status)\n", stderr)
             }
         }
-        guard options.reload else {
-            // `noema-cli reload --bundle <target>` stops them later.
-            do {
-                try PendingReloadStore.save(pending + before, canonicalBundle: target)
-            } catch {
-                fputs("noema-cli install: warning: \(error.message)\n", stderr)
-            }
-            return
-        }
+        guard options.reload else { return }
         let after = IMEProcesses.running(canonicalExecutable: executable)
         let result = IMEProcesses.terminate(pending + before + after)
         guard result.remaining.isEmpty else {
@@ -193,12 +225,85 @@ enum InstallCommand {
         case .directory: break
         default: throw CLIError("\(target) is not a directory; refusing to replace it")
         }
-        let info = "\(target)/Contents/Info.plist"
-        guard FileKind.of(info) == .regular, let plist = readPlist(info),
-              plist["CFBundleIdentifier"] as? String == NoemaPaths.imeBundleID
-        else {
+        guard hasNoemaInfoPlist(target) else {
             throw CLIError("\(target) is not a Noema input method (CFBundleIdentifier is not \(NoemaPaths.imeBundleID)); refusing to replace it")
         }
+    }
+
+    /// A regular `Contents/Info.plist` with Noema's bundle identifier.
+    static func hasNoemaInfoPlist(_ app: String) -> Bool {
+        let info = "\(app)/Contents/Info.plist"
+        guard FileKind.of(info) == .regular, let plist = readPlist(info) else { return false }
+        return plist["CFBundleIdentifier"] as? String == NoemaPaths.imeBundleID
+    }
+
+    static let oldPrefix = ".\(NoemaPaths.imeBundleName).old."
+    static let stagingPrefix = ".\(NoemaPaths.imeBundleName).install-staging."
+
+    /// Undoes what a killed install left in `canonicalDest` (called under its lock). If the
+    /// target is missing, the newest `.old.*` backup that is a Noema bundle is renamed back;
+    /// if that fails every backup stays. Once the target is there (or nothing was valid),
+    /// every `.old.*` and `.install-staging.*` entry except `keepingStaging` is removed.
+    static func recoverInterruptedInstalls(in canonicalDest: String, keepingStaging: String) throws(CLIError) {
+        let target = "\(canonicalDest)/\(NoemaPaths.imeBundleName)"
+        let entries: [String]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(atPath: canonicalDest)
+        } catch {
+            throw CLIError("cannot list \(canonicalDest): \(error.localizedDescription)")
+        }
+        let leftovers = entries
+            .filter { ($0.hasPrefix(oldPrefix) || $0.hasPrefix(stagingPrefix)) && $0 != keepingStaging }
+            .sorted()
+        guard !leftovers.isEmpty else { return }
+        try withTerminationSignalsBlocked { () throws(CLIError) in
+            if FileKind.of(target) == .missing {
+                var newest: (path: String, mtime: timespec)?
+                for name in leftovers where name.hasPrefix(oldPrefix) {
+                    let path = "\(canonicalDest)/\(name)"
+                    var info = stat()
+                    guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, hasNoemaInfoPlist(path) else { continue }
+                    let mtime = info.st_mtimespec
+                    // Names are sorted, so on an equal mtime the later name wins.
+                    if let current = newest?.mtime, (mtime.tv_sec, mtime.tv_nsec) < (current.tv_sec, current.tv_nsec) { continue }
+                    newest = (path, mtime)
+                }
+                if let backup = newest?.path {
+                    if rename(backup, target) != 0 {
+                        let recoverErrno = errno
+                        throw CLIError("""
+                            cannot restore \(target) from the interrupted install's backup \(backup): \
+                            \(String(cString: strerror(recoverErrno)))
+                            """)
+                    }
+                    syncDirectory(canonicalDest)
+                    fputs("noema-cli install: recovered \(target) from an interrupted install\n", stderr)
+                }
+            }
+            for name in leftovers {
+                let path = "\(canonicalDest)/\(name)"
+                guard FileKind.of(path) != .missing else { continue }
+                do {
+                    try FileManager.default.removeItem(atPath: path)
+                } catch {
+                    fputs("noema-cli install: warning: cannot remove leftover \(path): \(error.localizedDescription)\n", stderr)
+                }
+            }
+            syncDirectory(canonicalDest)
+        }
+    }
+
+    /// Runs `body` with `SIGINT`, `SIGTERM`, and `SIGHUP` blocked, so one that arrives
+    /// mid-way stays pending until `body` has finished and is delivered then. Blocking the
+    /// calling thread is enough: Dispatch worker threads (the only others here) block them.
+    static func withTerminationSignalsBlocked<T>(_ body: () throws(CLIError) -> T) throws(CLIError) -> T {
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        for signalNumber in [SIGINT, SIGTERM, SIGHUP] { sigaddset(&mask, signalNumber) }
+        var previousMask = sigset_t()
+        sigprocmask(SIG_BLOCK, &mask, &previousMask)
+        defer { sigprocmask(SIG_SETMASK, &previousMask, nil) }
+        return try body()
     }
 
     static func validateBundle(_ app: String) throws(CLIError) {

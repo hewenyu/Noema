@@ -306,6 +306,66 @@ extension LibrimeSerializedTests {
             #expect(after.status == 0 && after.stdout.contains("stopped 0 NoemaIME process(es)"), "a dead pending process is pruned")
         }
 
+        /// Codex PR #18: a two-step swap killed between its renames left no `NoemaIME.app`,
+        /// only `.old.*` and `.install-staging.*`. The next install restores the backup
+        /// and removes every leftover; with a valid target present it just removes them.
+        @Test func installRecoversInterruptedOldBundleAndCleansLeftovers() throws {
+            let fixture = try BundleFixture()
+            let fm = FileManager.default
+            #expect(try fixture.install().status == 0)
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            let old = fixture.dest.appending(path: ".NoemaIME.app.old.99999.interrupted")
+            let staleStaging = fixture.dest.appending(path: ".NoemaIME.app.install-staging.99999.interrupted")
+            try fm.moveItem(at: target, to: old)
+            try fm.createDirectory(at: staleStaging.appending(path: "NoemaIME.app"), withIntermediateDirectories: true)
+
+            let recovered = try fixture.install()
+            #expect(recovered.status == 0, "stderr: \(recovered.stderr)")
+            #expect(recovered.stderr.contains("recovered \(fixture.canonicalDest)/NoemaIME.app from an interrupted install"),
+                    "stderr: \(recovered.stderr)")
+            #expect(try fixture.destEntries() == ["NoemaIME.app"], "no .old.* or .install-staging.* is left behind")
+            let verify = try Tool.run("/usr/bin/codesign", ["--verify", "--strict", "--deep", target.path])
+            #expect(verify.status == 0, "codesign: \(verify.stderr)")
+
+            // A valid target next to stale leftovers: they go, the target is replaced as usual.
+            try fm.copyItem(at: target, to: old)
+            try fm.createDirectory(at: staleStaging.appending(path: "NoemaIME.app"), withIntermediateDirectories: true)
+            let cleaned = try fixture.install()
+            #expect(cleaned.status == 0, "stderr: \(cleaned.stderr)")
+            #expect(!cleaned.stderr.contains("recovered"))
+            #expect(try fixture.destEntries() == ["NoemaIME.app"])
+            #expect(try Tool.run("/usr/bin/codesign", ["--verify", "--strict", "--deep", target.path]).status == 0)
+        }
+
+        /// Codex PR #18: SIGTERM right after the swap syscall (an interposed `renamex_np` or
+        /// `rename`) neither loses `NoemaIME.app` nor leaves `.old.*` or `.install-staging.*`:
+        /// the signal waits until the swap and its cleanup are done. `fallback` makes
+        /// `RENAME_SWAP` report `ENOTSUP`, so the signal lands between the two renames.
+        @Test(arguments: [false, true])
+        func installUpgradeSurvivesSigtermDuringSwapWithNoMissingAppOrLeftovers(fallback: Bool) throws {
+            let fixture = try BundleFixture()
+            #expect(try fixture.install().status == 0)
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            let interposer = try RenameInterposer(in: fixture.root)
+
+            var arguments = ["install", "--bundle", fixture.app.path, "--dest", fixture.dest.path]
+            arguments += ["--allow-adhoc", "--no-register", "--no-reload"]
+            var environment = ["DYLD_INSERT_LIBRARIES": interposer.dylib.path,
+                               "NOEMA_TEST_SIGTERM_MARKER": interposer.marker.path]
+            if fallback { environment["NOEMA_TEST_SWAP_ENOTSUP"] = "1" }
+            let run = try Tool.run(Tool.binary("noema-cli"), arguments, environment: environment)
+
+            let fired = try? String(contentsOf: interposer.marker, encoding: .utf8)
+            #expect(fired == (fallback ? "rename" : "renamex_np"), "the interposer must send SIGTERM; stderr: \(run.stderr)")
+            #expect(run.status == SIGTERM, "the held-back SIGTERM still ends the process; status \(run.status)")
+            #expect(run.stdout.contains("installed "), "the swap finished before the signal")
+            var info = stat()
+            #expect(lstat(target.path, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR, "NoemaIME.app must never go missing")
+            #expect(try fixture.destEntries() == ["NoemaIME.app"], "no .old.* or .install-staging.* is left behind")
+            let verify = try Tool.run("/usr/bin/codesign", ["--verify", "--strict", "--deep", target.path])
+            #expect(verify.status == 0, "codesign: \(verify.stderr)")
+        }
+
         @Test func reloadWithNothingRunningSucceeds() throws {
             let fixture = try BundleFixture()
             let run = try Tool.cli(["reload", "--bundle", fixture.app.path], stdin: "")
@@ -356,8 +416,10 @@ enum Tool {
         try run(binary("noema-cli"), arguments, stdin: stdin, cwd: cwd)
     }
 
+    /// `environment` is added to this process's environment.
     static func run(
-        _ executable: String, _ arguments: [String], stdin: String = "", cwd: URL? = nil
+        _ executable: String, _ arguments: [String], stdin: String = "", cwd: URL? = nil,
+        environment: [String: String] = [:]
     ) throws -> (status: Int32, stdout: String, stderr: String) {
         let root = FileManager.default.temporaryDirectory.appending(path: "noema-tool-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -370,6 +432,9 @@ enum Tool {
         process.executableURL = URL(filePath: executable)
         process.arguments = arguments
         if let cwd { process.currentDirectoryURL = cwd }
+        if !environment.isEmpty {
+            process.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
+        }
         process.standardInput = try FileHandle(forReadingFrom: input)
         process.standardOutput = try FileHandle(forWritingTo: output)
         process.standardError = try FileHandle(forWritingTo: errors)
@@ -573,12 +638,88 @@ final class SleeperProcess {
     deinit { kill() }
 }
 
+/// An arm64 dylib for `DYLD_INSERT_LIBRARIES` that interposes `renamex_np` and `rename`
+/// in `noema-cli` only: the first call that moves a `NoemaIME.app` into or out of place
+/// runs, then sends this process SIGTERM and writes which call it was to
+/// `$NOEMA_TEST_SIGTERM_MARKER`. With `NOEMA_TEST_SWAP_ENOTSUP=1`, `RENAME_SWAP` fails
+/// with `ENOTSUP` instead of running.
+final class RenameInterposer {
+    let root: URL
+    var dylib: URL { root.appending(path: "rename-interposer.dylib") }
+    var marker: URL { root.appending(path: "sigterm-sent") }
+
+    static let source = #"""
+        #include <errno.h>
+        #include <fcntl.h>
+        #include <signal.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <unistd.h>
+
+        static int fired;
+
+        static int is_bundle(const char *path) {
+            size_t n = path ? strlen(path) : 0, k = strlen("/NoemaIME.app");
+            return n >= k && strcmp(path + n - k, "/NoemaIME.app") == 0;
+        }
+
+        static void maybe_fire(const char *call, const char *from, const char *to) {
+            if (fired || strcmp(getprogname(), "noema-cli") != 0) return;
+            if (!is_bundle(from) && !is_bundle(to)) return;
+            const char *marker = getenv("NOEMA_TEST_SIGTERM_MARKER");
+            if (!marker) return;
+            fired = 1;
+            int saved = errno;
+            int fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+            if (fd >= 0) { write(fd, call, strlen(call)); close(fd); }
+            kill(getpid(), SIGTERM);
+            errno = saved;
+        }
+
+        static int my_rename(const char *from, const char *to) {
+            int result = rename(from, to);
+            maybe_fire("rename", from, to);
+            return result;
+        }
+
+        static int my_renamex_np(const char *from, const char *to, unsigned int flags) {
+            const char *enotsup = getenv("NOEMA_TEST_SWAP_ENOTSUP");
+            if ((flags & RENAME_SWAP) && enotsup && strcmp(enotsup, "1") == 0) { errno = ENOTSUP; return -1; }
+            int result = renamex_np(from, to, flags);
+            maybe_fire("renamex_np", from, to);
+            return result;
+        }
+
+        __attribute__((used, section("__DATA,__interpose")))
+        static const struct { const void *replacement, *original; } interposers[] = {
+            { (const void *)my_rename, (const void *)rename },
+            { (const void *)my_renamex_np, (const void *)renamex_np },
+        };
+        """#
+
+    init(in directory: URL) throws {
+        root = directory.appending(path: "interposer-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sourceURL = root.appending(path: "interposer.c")
+        try Self.source.write(to: sourceURL, atomically: true, encoding: .utf8)
+        let compiled = try Tool.run("/usr/bin/clang", ["-arch", "arm64", "-dynamiclib", "-O1", "-o", dylib.path, sourceURL.path])
+        try #require(compiled.status == 0, "clang: \(compiled.stderr)")
+    }
+}
+
 /// A real, ad-hoc signed `NoemaIME.app` assembled from the debug products, the vendored
 /// librime, the shipped schema, and the Info.plist template, plus an empty `--dest`.
 final class BundleFixture {
     let root: URL
     var app: URL { root.appending(path: "src/NoemaIME.app") }
     var dest: URL { root.appending(path: "Input Methods") }
+    /// `dest` with symlinks resolved (`/var` is `/private/var`), as `install` prints it.
+    var canonicalDest: String {
+        guard let resolved = realpath(dest.path, nil) else { return dest.path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
 
     init() throws {
         let fm = FileManager.default

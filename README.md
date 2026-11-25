@@ -30,7 +30,7 @@ scripts/build/verify-bundle.sh --require-signed     # 校验布局、Info.plist�
 安装到 `~/Library/Input Methods` 并让系统重新加载：
 
 ```sh
-.build/debug/noema-cli install                      # 先在暂存副本上校验 Info.plist、可执行文件与签名，再原子替换
+.build/debug/noema-cli install                      # 先在暂存副本上校验 Info.plist、可执行文件与签名，再以 RENAME_SWAP 原子替换；被中断的安装下次自动恢复
 .build/debug/noema-cli install --allow-adhoc        # 本机开发：接受 ad-hoc 签名的包
 .build/debug/noema-cli reload                       # 结束本用户该路径下（含 install --no-reload 留下）的 NoemaIME 进程，系统下次使用时重启；超时退出 1
 ```
