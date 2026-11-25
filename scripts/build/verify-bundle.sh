@@ -252,7 +252,8 @@ fi
 
 if deployer_output="$(env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH -u DYLD_INSERT_LIBRARIES \
   "${DEPLOYER}" --version 2>&1)"; then
-  [[ "${deployer_output}" == "noema-rime-deployer "* ]] \
+  deployer_version_re='^noema-rime-deployer [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+  [[ "${deployer_output}" != *$'\n'* && "${deployer_output}" =~ ${deployer_version_re} ]] \
     || bad "MacOS/noema-rime-deployer --version printed '${deployer_output}'"
 else
   status=$?

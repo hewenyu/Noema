@@ -16,8 +16,8 @@ Status: proposed
   - 启动 Safe Mode：若上一次启动在加载方案/词库时崩溃，下一次以最小方案启动并直通 ASCII，避免崩溃循环导致无法打字。
   - Safe Mode 的判定由 `BootGuard` 承担（`Sources/NoemaEngine/BootGuard.swift`）：先对 `<user_data_dir>/.noema-rime.lock` 取非阻塞 `flock`，拿不到即 `userDataDirLocked`，不读写哨兵也不打开 LevelDB；再读 `.noema-boot-guard`（`O_NOFOLLOW`，损坏、软链或非普通文件即 `bootGuardCorrupted`；锁文件被软链或目录占位同判 `bootGuardCorrupted`；`errno` 在 `open(2)` 返回后立即捕获），连续未完成启动达到阈值（默认 2）即 `bootCrashLoop`，否则以临时文件 + `fsync` + `rename(2)` 递增计数（写不进即 `userDataDirUnwritable`），加载成功后删除哨兵并 `fsync` 目录；只有持锁实例能删除哨兵（`disarm`/`clear`），未持锁实例返回 `false`。部署或建会话失败为 `engineInitFailed`。Safe Mode 下引擎零 `librime` 调用，所有按键 `handled: false`。
   - 进程内同一时刻只允许一个持有 `librime` 的 `RimeEngine`（第二个确定性抛错），`setup` 每进程只调一次：`librime` 是进程级单例，两个引擎会共享 deployer 与会话表。
-  - 宿主进程从不调用 `librime` 的 deployer：部署一律交给 `noema-rime-deployer` 子进程（60 秒超时），在 `user_data_dir/.deploy-staging.<pid>.<uuid>` 中隔离编译，宿主复核后以两次 `rename(2)` 原子切换 `build/`（第二步失败即回滚）；子进程失败、崩溃、超时、找不到或校验不过时旧 `build/` 逐字节不变，引擎进入 `engineInitFailed`。
-  - `build/.noema-deploy-manifest.json`（`DeployManifest`）记录输入清单（`shared_data_dir` 下全部文件递归 + `user_data_dir` 顶层 `*.custom.yaml`，含大小与 SHA256）、输出清单与方案 `translator/dictionary`。`build/` 仅当清单完整（`default.yaml`、方案、每个词典的 `.table.bin` 与 `.prism.bin`）且每个输出仍是 `build/` 内同大小同哈希的普通文件时可信；`deployIfNeeded` 在不可信或输入清单与当前不全等时重新部署（新增、修改、删除、改名都会改变清单），`neverDeploy` 直接进入 Safe Mode。
+  - 宿主进程从不调用 `librime` 的 deployer：部署一律交给 `noema-rime-deployer` 子进程（60 秒超时），在 `user_data_dir/.deploy-staging.<pid>.<uuid>` 中隔离编译，宿主复核后以两次 `rename(2)` 原子切换 `build/`（第二步失败即回滚；两步之间崩溃时，下次启动优先恢复通过校验、其次 mtime 最新的 `.build-old.*`，`fsync` 目录后才清理其余残留）；子进程拒绝软链或与 `user_data_dir`、`shared_data_dir` 相同的 staging，以及含 `/`、`..`、NUL 的方案或词典名；子进程失败、崩溃、超时、找不到或校验不过时旧 `build/` 逐字节不变，引擎进入 `engineInitFailed`。
+  - `build/.noema-deploy-manifest.json`（`DeployManifest`）记录输入清单（`shared_data_dir` 下全部文件递归 + `user_data_dir` 顶层 `*.custom.yaml`，含大小与 SHA256）、输出清单与方案引用的词典（`translator`、`reverse_lookup` 与带 tag 的 `script_translator`/`table_translator`）。输入无法完整盘点即失败而非跳过：`*.custom.yaml` 必须本身是普通文件（软链、目录、FIFO 一律拒绝，绝不跟随到 `user_data_dir` 之外），`shared_data_dir` 内软链只能指向普通文件。`build/` 仅当清单（≤ 16 MiB）列出非空的 `default.yaml`、方案与每个词典的 `.table.bin`、`.prism.bin`，且与 `build/` 实时盘点逐项全等（无未登记文件或软链）时可信；`deployIfNeeded` 在不可信或输入清单与当前不全等时重新部署（新增、修改、删除、改名都会改变清单），`neverDeploy` 直接进入 Safe Mode。
   - `KeyHandlingResult` 中 `handled` 与 `committedText` 相互独立：壳先上屏 `committedText`，再在 `handled == false` 时把当前键直通客户端。`librime` 提交组字并拒绝当前键（如无 `punctuator` 时 `nihao` 后按 `,`）时，引擎如实返回 `handled: false`，绝不因为有提交而吞键。
   - 内置最小拼音方案 `Resources/rime-default/`（`script_translator`，原创小词表）作为 `shared_data_dir` 随包分发；完整词库仍走 [lexicon note](2026-11-23-lexicon-canonical-and-userdb-isolation.md) 的下载与部署流程。
   - 密码框：`IsSecureEventInputEnabled()` 为真时立即直通并隐藏所有浮窗。
@@ -51,7 +51,7 @@ Status: proposed
 - AI 建议到达后，候选首位与到达前一致；建议只出现在 `✨` 槽位。
 - 带过期 `generationID` 的 IPC 响应被丢弃。
 - 单键处理 P95 `< 2ms`：真实 `librime` 上 500 个混合按键的基准测试（`singleKeyLatencyP95`）。
-- 部署失败（`default.yaml` 引用缺失方案、找不到 `noema-rime-deployer`）时旧 `build/` 所有文件逐字节不变；删除 `build/*.table.bin` 后 `deployIfNeeded` 自动重建、`neverDeploy` 进入 Safe Mode；删除 `*.custom.yaml` 或 `shared_data_dir` 子目录文件触发重新部署并真实生效；无 `punctuator` 方案中 `nihao` 后按 `,` 返回 `handled: false` 与 `committedText == "你好"`（`Tests/CRimeTests/RimeEngineTests.swift`）。
+- 部署失败（`default.yaml` 引用缺失方案、找不到 `noema-rime-deployer`）时旧 `build/` 所有文件逐字节不变；删除 `build/*.table.bin` 后 `deployIfNeeded` 自动重建、`neverDeploy` 进入 Safe Mode；删除 `*.custom.yaml` 或 `shared_data_dir` 子目录文件触发重新部署并真实生效；软链或目录形式的 `*.custom.yaml`、`shared_data_dir` 内软链目录均进入 Safe Mode 且不拷贝外部文件；`build/` 内未登记文件或软链触发重建；损坏且字典序靠前的 `.build-old.*` 不会盖过有效备份；无 `punctuator` 方案中 `nihao` 后按 `,` 返回 `handled: false` 与 `committedText == "你好"`（`Tests/CRimeTests/RimeEngineTests.swift`）。
 - 预置连续失败计数达到阈值、损坏哨兵、外部持有锁、只读目录、部署失败五种情况下，`RimeEngine` 进入对应 Safe Mode 原因且所有按键 `handled: false`；`recoverFromSafeMode()` 在条件解除后恢复输入（`Tests/CRimeTests/RimeEngineTests.swift`）。
 
 ## Risks

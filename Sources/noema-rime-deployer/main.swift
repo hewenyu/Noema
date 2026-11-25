@@ -5,14 +5,18 @@
 //        noema-rime-deployer --version
 //
 // `RimeEngine` runs this as a subprocess, so librime's deployer never runs in the input
-// method process and never writes the live `user_data_dir`. In the fresh, empty
-// `--staging-dir` it:
+// method process and never writes the live `user_data_dir`. `--schema` must be a plain
+// name (no `/`, `..`, or NUL). In the fresh, empty `--staging-dir`, which must be a real
+// directory (not a symlink) other than `--user-dir` and `--shared-dir`, it:
 //   1. copies only the top-level `*.custom.yaml` of `--user-dir` (never its userdbs, lock
-//      files, or `build/`), checking each copy against the input snapshot;
+//      files, or `build/`), each of which must be a regular file, never a symlink, and
+//      checks each copy against the input snapshot;
 //   2. points librime at `--shared-dir` and the staging directory and deploys;
 //   3. requires `staging/build/default.yaml`, `<schema>.schema.yaml`, and the
-//      `.table.bin`/`.prism.bin` of the schema's `translator/dictionary`, all non-empty,
-//      and loads the schema in a real session;
+//      `.table.bin`/`.prism.bin` of every dictionary the schema names
+//      (`translator/dictionary`, `reverse_lookup/dictionary`, and `<tag>/dictionary` of each
+//      `script_translator@<tag>`/`table_translator@<tag>`), all non-empty, and loads the
+//      schema in a real session;
 //   4. writes `staging/build/.noema-deploy-manifest.json` (`DeployManifest`).
 // Exit 0 only when every step succeeds and the inputs did not change while deploying;
 // 1 on any failure (reason on stderr), 64 on usage errors.
@@ -53,10 +57,33 @@ func parseOptions(_ arguments: [String]) -> Options {
         guard path.hasPrefix("/") else { fail("\(flag) must be absolute: \(path)", status: 64) }
         return URL(filePath: path, directoryHint: .isDirectory).standardizedFileURL
     }
+    let schemaID = values["--schema"]!
+    guard DeployManifest.isSafeName(schemaID) else { fail("--schema must be a plain name: \(schemaID)", status: 64) }
     return Options(
         shared: directory("--shared-dir"), user: directory("--user-dir"), staging: directory("--staging-dir"),
-        logs: directory("--log-dir"), schemaID: values["--schema"]!
+        logs: directory("--log-dir"), schemaID: schemaID
     )
+}
+
+/// The canonical path of an existing directory, or nil.
+func realDirectoryPath(_ url: URL) -> String? {
+    guard let resolved = realpath(url.path, nil) else { return nil }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
+/// `--staging-dir` must be a real directory itself (`lstat`, so never a symlink) and must
+/// not be `--user-dir` or `--shared-dir` under any other spelling.
+func checkStagingDirectory(_ options: Options) {
+    var info = stat()
+    guard lstat(options.staging.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
+        fail("--staging-dir must be a real directory, not a symlink: \(options.staging.path)")
+    }
+    guard let staging = realDirectoryPath(options.staging) else { fail("cannot resolve \(options.staging.path)") }
+    for (flag, url) in [("--user-dir", options.user), ("--shared-dir", options.shared)] {
+        guard let other = realDirectoryPath(url) else { fail("cannot resolve \(flag) \(url.path)") }
+        guard other != staging else { fail("--staging-dir must differ from \(flag): \(options.staging.path)") }
+    }
 }
 
 func requireNoThrow<T>(_ what: String, _ body: () throws -> T) -> T {
@@ -74,7 +101,8 @@ func copyCustomPatches(_ options: Options, expected inputs: [DeployManifest.Mani
     for name in names {
         let source = options.user.appending(path: name)
         let target = options.staging.appending(path: name)
-        let data = requireNoThrow("reading \(source.path)") { try Data(contentsOf: source) }
+        // O_NOFOLLOW | O_NONBLOCK, fstat S_IFREG, size cap: never a link out of --user-dir.
+        let data = requireNoThrow("reading \(source.path)") { try DeployManifest.readRegularFile(source) }
         requireNoThrow("writing \(target.path)") { try data.write(to: target, options: .withoutOverwriting) }
         let (size, digest) = requireNoThrow("hashing \(target.path)") { try DeployManifest.hashFile(target, followSymlink: false) }
         guard inputs.contains(DeployManifest.ManifestEntry(relativePath: "user/\(name)", size: size, sha256: digest)) else {
@@ -107,14 +135,35 @@ func withTraits<T>(_ options: Options, _ body: (inout RimeTraits) -> T) -> T {
     return body(&traits)
 }
 
-/// The compiled schema's `translator/dictionary`, if it names one.
+/// Every dictionary the compiled schema names, deduplicated in order: `translator/dictionary`,
+/// `reverse_lookup/dictionary`, and `<tag>/dictionary` of each `script_translator@<tag>` or
+/// `table_translator@<tag>` in `engine/translators`. Each must be a plain name.
 func requiredDictionaries(api: UnsafeMutablePointer<RimeApi>, schemaID: String) -> [String] {
     var config = RimeConfig()
     guard api.pointee.schema_open(schemaID, &config) != 0 else { fail("cannot open compiled schema \(schemaID)") }
     defer { _ = api.pointee.config_close(&config) }
-    guard let value = api.pointee.config_get_cstring(&config, "translator/dictionary") else { return [] }
-    let dictionary = String(cString: value)
-    return dictionary.isEmpty ? [] : [dictionary]
+    func string(_ key: String) -> String? {
+        api.pointee.config_get_cstring(&config, key).map { String(cString: $0) }
+    }
+    var namespaces = ["translator", "reverse_lookup"]
+    let translators = api.pointee.config_list_size(&config, "engine/translators")
+    for index in 0..<translators {
+        guard let component = string("engine/translators/@\(index)") else { continue }
+        for prefix in ["script_translator@", "table_translator@"] where component.hasPrefix(prefix) {
+            let tag = String(component.dropFirst(prefix.count))
+            guard DeployManifest.isSafeName(tag) else { fail("translator tag is not a plain name: \(component)") }
+            namespaces.append(tag)
+        }
+    }
+    var dictionaries: [String] = []
+    for namespace in namespaces {
+        guard let dictionary = string("\(namespace)/dictionary"), !dictionary.isEmpty else { continue }
+        guard DeployManifest.isSafeName(dictionary) else {
+            fail("\(namespace)/dictionary is not a plain name: \(dictionary)")
+        }
+        if !dictionaries.contains(dictionary) { dictionaries.append(dictionary) }
+    }
+    return dictionaries
 }
 
 /// Opens a session on the staged build and requires librime to report `schemaID` active.
@@ -133,9 +182,11 @@ func schemaLoads(api: UnsafeMutablePointer<RimeApi>, schemaID: String) -> Bool {
 func deploy(_ options: Options) {
     let fileManager = FileManager.default
     guard noema_rime_engine_api_available(), let api = noema_rime_get_api(),
-          api.pointee.schema_open != nil, api.pointee.config_close != nil, api.pointee.config_get_cstring != nil
+          api.pointee.schema_open != nil, api.pointee.config_close != nil, api.pointee.config_get_cstring != nil,
+          api.pointee.config_list_size != nil
     else { fail("librime API table lacks members the deployer requires") }
     // The staging directory must be fresh: never deploy over anything, least of all a live build.
+    checkStagingDirectory(options)
     let existing = requireNoThrow("listing \(options.staging.path)") { try fileManager.contentsOfDirectory(atPath: options.staging.path) }
     guard existing.isEmpty else { fail("--staging-dir must be an empty directory: \(options.staging.path)") }
     requireNoThrow("creating \(options.logs.path)") { try fileManager.createDirectory(at: options.logs, withIntermediateDirectories: true) }

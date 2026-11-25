@@ -33,7 +33,9 @@ extension RimeEngine {
 
     /// Locates `noema-rime-deployer`: beside the main executable (the app bundle's
     /// `Contents/MacOS`), beside the image holding this code, and, when that image is a
-    /// SwiftPM `.xctest` bundle, in the build directory holding the bundle.
+    /// SwiftPM `.xctest` bundle, in the build directory holding the bundle. A candidate counts
+    /// only when it is (or links to) a regular file and `access(X_OK)` allows running it, so a
+    /// directory of that name never shadows the real executable.
     public nonisolated static func locateDeployer() -> URL? {
         var directories: [URL] = []
         if let executable = Bundle.main.executableURL {
@@ -50,7 +52,12 @@ extension RimeEngine {
         }
         return directories.lazy
             .map { $0.appending(path: deployerExecutableName) }
-            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+            .first { isExecutableRegularFile($0.path) }
+    }
+
+    nonisolated static func isExecutableRegularFile(_ path: String) -> Bool {
+        var info = stat()
+        return stat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG && access(path, X_OK) == 0
     }
 
     // MARK: - Steps
@@ -105,7 +112,9 @@ extension RimeEngine {
         if exited.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()
             if exited.wait(timeout: .now() + 2) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
+                if process.processIdentifier > 0, process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
                 exited.wait()
             }
             return false
@@ -129,22 +138,51 @@ extension RimeEngine {
         return true
     }
 
-    /// After a crash mid-deployment: put back a build that was moved aside but never
-    /// replaced, and remove leftover staging directories and old builds.
+    /// After a crash mid-deployment: when `build/` is missing, put back the best build that
+    /// was moved aside but never replaced (one that passes `DeployManifest.validated`, else
+    /// any, newest modification time first), make that rename durable, and only then remove
+    /// every other leftover staging directory and old build.
     private func recoverInterruptedDeployments() {
         let fileManager = FileManager.default
         let user = configuration.userDataDir
         guard let names = try? fileManager.contentsOfDirectory(atPath: user.path) else { return }
         let build = user.appending(path: "build")
         var info = stat()
-        var hasBuild = lstat(build.path, &info) == 0
-        for name in names.sorted() where name.hasPrefix(Self.oldBuildPrefix) || name.hasPrefix(Self.stagingPrefix) {
-            let url = user.appending(path: name)
-            if !hasBuild, name.hasPrefix(Self.oldBuildPrefix), rename(url.path, build.path) == 0 {
-                hasBuild = true
-                continue
+        if lstat(build.path, &info) != 0 {
+            let candidates = names.filter { $0.hasPrefix(Self.oldBuildPrefix) }.compactMap { name -> OldBuild? in
+                let url = user.appending(path: name)
+                var candidate = stat()
+                guard lstat(url.path, &candidate) == 0, candidate.st_mode & S_IFMT == S_IFDIR else { return nil }
+                return OldBuild(
+                    name: name,
+                    isValid: DeployManifest.validated(buildDir: url, schemaID: configuration.schemaID) != nil,
+                    modified: candidate.st_mtimespec)
             }
+            if let best = candidates.max(by: { $0.isWorse(than: $1) }),
+               rename(user.appending(path: best.name).path, build.path) == 0 {
+                syncDirectory(user)
+            }
+        }
+        for name in names where name.hasPrefix(Self.oldBuildPrefix) || name.hasPrefix(Self.stagingPrefix) {
+            let url = user.appending(path: name)
+            var leftover = stat()
+            // The restored build no longer exists under its old name.
+            guard lstat(url.path, &leftover) == 0 else { continue }
             try? fileManager.removeItem(at: url)
+        }
+    }
+
+    /// A `.build-old.*` candidate for recovery, ranked valid first, then newest.
+    private struct OldBuild {
+        var name: String
+        var isValid: Bool
+        var modified: timespec
+
+        func isWorse(than other: OldBuild) -> Bool {
+            if isValid != other.isValid { return !isValid }
+            if modified.tv_sec != other.modified.tv_sec { return modified.tv_sec < other.modified.tv_sec }
+            if modified.tv_nsec != other.modified.tv_nsec { return modified.tv_nsec < other.modified.tv_nsec }
+            return name < other.name
         }
     }
 

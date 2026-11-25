@@ -124,6 +124,112 @@ import Testing
         #expect(DeployManifest.validated(buildDir: build, schemaID: "s") == nil)
     }
 
+    @Test(arguments: ["symlink", "directory", "fifo"])
+    func nonRegularCustomPatchFailsTheSnapshot(_ kind: String) throws {
+        defer { cleanUp() }
+        let evil = user.appending(path: "evil.custom.yaml")
+        switch kind {
+        case "symlink":
+            try FileManager.default.createSymbolicLink(at: evil, withDestinationURL: URL(filePath: "/etc/hosts"))
+        case "directory":
+            try FileManager.default.createDirectory(at: evil, withIntermediateDirectories: false)
+        default:
+            try #require(mkfifo(evil.path, 0o600) == 0)
+        }
+        #expect(throws: DeployManifest.Failure.notRegular(evil.path)) {
+            try DeployManifest.userCustomPatchNames(in: user)
+        }
+        #expect(throws: DeployManifest.Failure.notRegular(evil.path)) {
+            try DeployManifest.inputs(sharedDataDir: shared, userDataDir: user)
+        }
+        #expect(throws: DeployManifest.Failure.self) { try DeployManifest.readRegularFile(evil) }
+    }
+
+    @Test func symlinkedSharedFileIsAnInputButAnythingElseLinkedFails() throws {
+        defer { cleanUp() }
+        let outside = root.appending(path: "outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        try write("-- linked\n", to: outside.appending(path: "linked.lua"))
+        let file = shared.appending(path: "linked.lua")
+        try FileManager.default.createSymbolicLink(at: file, withDestinationURL: outside.appending(path: "linked.lua"))
+        #expect(try DeployManifest.inputs(sharedDataDir: shared, userDataDir: user).contains { $0.relativePath == "shared/linked.lua" })
+        try FileManager.default.removeItem(at: file)
+
+        let directory = shared.appending(path: "linked-dir")
+        try FileManager.default.createSymbolicLink(at: directory, withDestinationURL: outside)
+        #expect(throws: DeployManifest.Failure.notRegular(directory.path)) {
+            try DeployManifest.inputs(sharedDataDir: shared, userDataDir: user)
+        }
+        try FileManager.default.removeItem(at: directory)
+
+        let dangling = shared.appending(path: "lua/dangling.lua")
+        try FileManager.default.createSymbolicLink(at: dangling, withDestinationURL: root.appending(path: "missing.lua"))
+        #expect(throws: DeployManifest.Failure.notRegular(dangling.path)) {
+            try DeployManifest.inputs(sharedDataDir: shared, userDataDir: user)
+        }
+        try FileManager.default.removeItem(at: dangling)
+
+        let fifo = outside.appending(path: "pipe")
+        try #require(mkfifo(fifo.path, 0o600) == 0)
+        let linkedFIFO = shared.appending(path: "pipe.yaml")
+        try FileManager.default.createSymbolicLink(at: linkedFIFO, withDestinationURL: fifo)
+        #expect(throws: DeployManifest.Failure.notRegular(linkedFIFO.path)) {
+            try DeployManifest.inputs(sharedDataDir: shared, userDataDir: user)
+        }
+    }
+
+    @Test(arguments: ["file", "symlink", "directory"])
+    func unlistedEntryInBuildFailsValidation(_ kind: String) throws {
+        defer { cleanUp() }
+        try writeManifest()
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s") != nil)
+        let extra = build.appending(path: "extra.yaml")
+        switch kind {
+        case "file": try write("extra: true\n", to: extra)
+        case "symlink": try FileManager.default.createSymbolicLink(at: extra, withDestinationURL: build.appending(path: "default.yaml"))
+        default:
+            try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: false)
+            try write("nested\n", to: extra.appending(path: "nested.yaml"))
+        }
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s") == nil)
+    }
+
+    @Test(arguments: ["default.yaml", "s.schema.yaml", "d.table.bin", "d.prism.bin"])
+    func emptyRequiredOutputFailsValidation(_ name: String) throws {
+        defer { cleanUp() }
+        try write("", to: build.appending(path: name))
+        try writeManifest()
+        #expect(try DeployManifest.outputs(buildDir: build).contains { $0.relativePath == name && $0.size == 0 })
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s") == nil)
+    }
+
+    @Test func oversizedManifestFailsValidation() throws {
+        defer { cleanUp() }
+        try writeManifest()
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s") != nil)
+        let manifest = build.appending(path: DeployManifest.fileName)
+        let handle = try FileHandle(forWritingTo: manifest)
+        try handle.truncate(atOffset: UInt64(DeployManifest.maxReadSize) + 1)
+        try handle.close()
+        #expect(throws: DeployManifest.Failure.tooLarge(manifest.path)) { try DeployManifest.readRegularFile(manifest) }
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s") == nil)
+        let small = build.appending(path: "default.yaml")
+        #expect(throws: DeployManifest.Failure.tooLarge(small.path)) { try DeployManifest.readRegularFile(small, maxSize: 4) }
+        #expect(try DeployManifest.readRegularFile(small) == Data("compiled default.yaml\n".utf8))
+    }
+
+    @Test func unsafeDictionaryNameFailsValidation() throws {
+        defer { cleanUp() }
+        try writeManifest(dictionaries: ["d", "../d"])
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s") == nil)
+    }
+
+    @Test(arguments: [("noema_pinyin", true), ("rime_ice.extended", true), ("", false), ("a/b", false),
+                      ("..", false), ("../x", false), ("x..y", false), ("x\0y", false)])
+    func safeNames(_ name: String, _ safe: Bool) {
+        #expect(DeployManifest.isSafeName(name) == safe)
+    }
+
     @Test func wrongVersionOrCorruptManifestFailsValidation() throws {
         defer { cleanUp() }
         try writeManifest { $0.version = 2 }

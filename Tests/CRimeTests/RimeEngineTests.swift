@@ -438,6 +438,205 @@ extension LibrimeSerializedTests {
             #expect(engine.safeModeReason == .engineInitFailed)
         }
 
+        /// A `*.custom.yaml` that is a symlink (here to `/etc/hosts`) or a directory is never
+        /// followed or skipped: the snapshot and the deployer both refuse it, the engine enters
+        /// Safe Mode, and nothing from outside `user_data_dir` reaches a staging directory.
+        @Test(arguments: ["symlink", "directory"])
+        func nonRegularCustomPatchIsRefused(_ kind: String) throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let before = try workspace.buildSnapshot()
+            let evil = workspace.user.appending(path: "evil.custom.yaml")
+            if kind == "symlink" {
+                try FileManager.default.createSymbolicLink(at: evil, withDestinationURL: URL(filePath: "/etc/hosts"))
+            } else {
+                try FileManager.default.createDirectory(at: evil, withIntermediateDirectories: false)
+            }
+            #expect(throws: DeployManifest.Failure.notRegular(evil.path)) {
+                try DeployManifest.inputs(sharedDataDir: workspace.shared, userDataDir: workspace.user)
+            }
+            let engine = try workspace.engine(policy: .forceDeploy)
+            #expect(engine.safeModeReason == .engineInitFailed)
+            engine.shutdown()
+            #expect(try workspace.buildSnapshot() == before)
+            #expect(try workspace.deployLeftovers().isEmpty)
+
+            // The deployer refuses it on its own, too, and copies nothing.
+            let staging = workspace.root.appending(path: "staging")
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+            let run = try workspace.runDeployer(staging: staging)
+            #expect(run.status == 1, "\(run.stderr)")
+            #expect(run.stderr.contains("evil.custom.yaml"), "\(run.stderr)")
+            #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
+        }
+
+        /// `--staging-dir` must be a real directory distinct from `--user-dir` and
+        /// `--shared-dir`; a symlink to a fresh directory, or the user dir itself, is refused
+        /// before anything is copied or deployed.
+        @Test func deployerRefusesASymlinkedOrAliasedStagingDirectory() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try FileManager.default.createDirectory(at: workspace.user, withIntermediateDirectories: true)
+            try "patch: {}\n".write(to: workspace.user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            let target = workspace.root.appending(path: "target")
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+            let link = workspace.root.appending(path: "staging-link")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            let emptyUser = workspace.root.appending(path: "empty-user")
+            try FileManager.default.createDirectory(at: emptyUser, withIntermediateDirectories: false)
+            let emptyShared = workspace.root.appending(path: "empty-shared")
+            try FileManager.default.createDirectory(at: emptyShared, withIntermediateDirectories: false)
+
+            let symlinked = try workspace.runDeployer(staging: link)
+            #expect(symlinked.status == 1 && symlinked.stderr.contains("not a symlink"), "\(symlinked.stderr)")
+            #expect(try FileManager.default.contentsOfDirectory(atPath: target.path).isEmpty)
+            // Same directory as --user-dir (empty, so only the alias check can refuse it),
+            // spelled differently; then the same as --shared-dir.
+            let aliasedUser = try workspace.runDeployer(
+                user: emptyUser, staging: URL(filePath: emptyUser.path + "/./"))
+            #expect(aliasedUser.status == 1 && aliasedUser.stderr.contains("differ from --user-dir"), "\(aliasedUser.stderr)")
+            let aliasedShared = try workspace.runDeployer(shared: emptyShared, user: emptyUser, staging: emptyShared)
+            #expect(aliasedShared.status == 1 && aliasedShared.stderr.contains("differ from --shared-dir"), "\(aliasedShared.stderr)")
+            #expect(try FileManager.default.contentsOfDirectory(atPath: emptyUser.path).isEmpty)
+
+            // Positive control: a real, distinct, empty staging directory deploys.
+            let staging = workspace.root.appending(path: "staging")
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+            let good = try workspace.runDeployer(staging: staging)
+            #expect(good.status == 0, "\(good.stderr)")
+            #expect(DeployManifest.validated(buildDir: staging.appending(path: "build"), schemaID: "noema_pinyin") != nil)
+        }
+
+        @Test(arguments: ["../noema_pinyin", "a/b", ".."])
+        func deployerRefusesAnUnsafeSchemaID(_ schemaID: String) throws {
+            let workspace = try EngineWorkspace()
+            let staging = workspace.root.appending(path: "staging")
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: workspace.user, withIntermediateDirectories: true)
+            let run = try workspace.runDeployer(staging: staging, schemaID: schemaID)
+            #expect(run.status != 0, "\(run.stderr)")
+            #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
+        }
+
+        /// The deployer requires the compiled files of every dictionary the schema names,
+        /// including a tagged translator's `<tag>/dictionary`: one librime never compiled
+        /// fails the deployment, one shared with `translator/dictionary` is required once.
+        @Test(arguments: [("noema_pinyin", true), ("ghost_dict", false)])
+        func taggedTranslatorDictionaryIsRequired(_ dictionary: String, _ deploys: Bool) throws {
+            let workspace = try EngineWorkspace()
+            try FileManager.default.createDirectory(at: workspace.user, withIntermediateDirectories: true)
+            try """
+            patch:
+              engine/translators/@next: table_translator@extra
+              extra/dictionary: \(dictionary)
+
+            """.write(to: workspace.user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(engine.isSafeMode == !deploys)
+            if deploys {
+                #expect(try workspace.manifest().requiredDictionaries == ["noema_pinyin"])
+            } else {
+                let log = try String(contentsOf: workspace.logs.appending(path: "noema-rime-deployer.log"), encoding: .utf8)
+                #expect(log.contains("ghost_dict.table.bin"), "\(log)")
+            }
+        }
+
+        /// A symlinked directory in `sharedDataDir` would be followed by librime but cannot be
+        /// inventoried, so it is refused instead of silently left out of the inputs.
+        @Test func symlinkedSharedDirectoryIsRefused() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.engine().shutdown()
+            let outside = workspace.root.appending(path: "outside-lua")
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+            try "-- outside\n".write(to: outside.appending(path: "x.lua"), atomically: true, encoding: .utf8)
+            let link = workspace.shared.appending(path: "lua")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+            #expect(throws: DeployManifest.Failure.notRegular(link.path)) {
+                try DeployManifest.inputs(sharedDataDir: workspace.shared, userDataDir: workspace.user)
+            }
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == .engineInitFailed)
+        }
+
+        /// An unlisted file or symlink inside `build/` makes it untrusted: deployIfNeeded
+        /// rebuilds a clean one, neverDeploy refuses it.
+        @Test(arguments: ["file", "symlink"])
+        func unlistedEntryInBuildIsAnUntrustedBuild(_ kind: String) throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let deployed = try workspace.deploymentID()
+            let extra = workspace.user.appending(path: "build/extra.yaml")
+            func plant() throws {
+                if kind == "file" {
+                    try "extra: true\n".write(to: extra, atomically: true, encoding: .utf8)
+                } else {
+                    try FileManager.default.createSymbolicLink(at: extra, withDestinationURL: URL(filePath: "/etc/hosts"))
+                }
+            }
+            try plant()
+            #expect(DeployManifest.validated(buildDir: workspace.user.appending(path: "build"), schemaID: "noema_pinyin") == nil)
+            let rebuilt = try workspace.engine()
+            #expect(!rebuilt.isSafeMode)
+            #expect(try workspace.deploymentID() != deployed, "deployIfNeeded must rebuild")
+            var info = stat()
+            #expect(lstat(extra.path, &info) != 0, "the rebuilt build/ holds no extra entry")
+            rebuilt.type("nihao")
+            #expect(rebuilt.currentState.candidates.first?.text == "你好")
+            rebuilt.shutdown()
+
+            try plant()
+            let refused = try workspace.engine(policy: .neverDeploy)
+            defer { refused.shutdown() }
+            #expect(refused.safeModeReason == .engineInitFailed)
+        }
+
+        /// A crash between the two renames of a switch can leave no `build/` and several
+        /// `.build-old.*`. Recovery restores the valid one even when a corrupt one sorts
+        /// first and is newer, and removes the rest.
+        @Test func interruptedSwitchRestoresTheValidOldBuild() throws {
+            let workspace = try EngineWorkspace()
+            try workspace.engine().shutdown()
+            let deployed = try workspace.deploymentID()
+            let build = workspace.user.appending(path: "build")
+            let valid = workspace.user.appending(path: ".build-old.99999.zzz")
+            let corrupt = workspace.user.appending(path: ".build-old.1.aaa")
+            try FileManager.default.copyItem(at: build, to: corrupt)
+            let prism = corrupt.appending(path: "noema_pinyin.prism.bin")
+            var bytes = try Data(contentsOf: prism)
+            bytes[bytes.count / 2] ^= 0xFF
+            try bytes.write(to: prism)
+            try #require(rename(build.path, valid.path) == 0)
+            try workspace.setModificationDate(Date(timeIntervalSinceNow: -3600), of: valid)
+            try workspace.setModificationDate(Date(), of: corrupt)
+
+            let engine = try workspace.engine(policy: .neverDeploy)
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+            #expect(try workspace.deploymentID() == deployed, "the valid old build is restored, not redeployed")
+            #expect(try workspace.deployLeftovers().isEmpty, "the corrupt leftover is removed")
+            engine.type("nihao")
+            #expect(engine.currentState.candidates.first?.text == "你好")
+        }
+
+        /// With no valid old build, recovery restores the newest one (neverDeploy then
+        /// refuses it), never the first by name.
+        @Test func interruptedSwitchWithoutAValidOldBuildRestoresTheNewest() throws {
+            let workspace = try EngineWorkspace()
+            try FileManager.default.createDirectory(at: workspace.user, withIntermediateDirectories: true)
+            for (name, age) in [("1.aaa", 7200.0), ("2.zzz", 60.0), ("3.mmm", 3600.0)] {
+                let directory = workspace.user.appending(path: ".build-old.\(name)")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                try name.write(to: directory.appending(path: "marker"), atomically: true, encoding: .utf8)
+                try workspace.setModificationDate(Date(timeIntervalSinceNow: -age), of: directory)
+            }
+            let engine = try workspace.engine(policy: .neverDeploy)
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == .engineInitFailed)
+            #expect(try String(contentsOf: workspace.user.appending(path: "build/marker"), encoding: .utf8) == "2.zzz")
+            #expect(try workspace.deployLeftovers().isEmpty)
+        }
+
         // MARK: Lifecycle
 
         @Test func onlyOneLiveEngineAtATime() throws {
@@ -758,6 +957,30 @@ final class EngineWorkspace {
     func deployLeftovers() throws -> [String] {
         try FileManager.default.contentsOfDirectory(atPath: user.path)
             .filter { $0.hasPrefix(".deploy-staging.") || $0.hasPrefix(".build-old.") }
+    }
+
+    func setModificationDate(_ date: Date, of url: URL) throws {
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+    }
+
+    /// Runs the real `noema-rime-deployer` with this workspace's directories (overridable).
+    func runDeployer(
+        shared: URL? = nil, user: URL? = nil, staging: URL, schemaID: String = "noema_pinyin"
+    ) throws -> (status: Int32, stderr: String) {
+        let deployer = try #require(RimeEngine.locateDeployer())
+        let process = Process()
+        process.executableURL = deployer
+        process.arguments = [
+            "--shared-dir", (shared ?? self.shared).path, "--user-dir", (user ?? self.user).path,
+            "--staging-dir", staging.path, "--log-dir", logs.path, "--schema", schemaID,
+        ]
+        let errors = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errors
+        try process.run()
+        let data = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     func sentinelFailures() throws -> Int {

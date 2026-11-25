@@ -6,12 +6,16 @@ import Foundation
 /// `build/.noema-deploy-manifest.json` and checked by `RimeEngine` before it trusts a build.
 ///
 /// - `inputs`: every regular file under `sharedDataDir` (recursively, as `shared/<path>`) and
-///   every top-level `*.custom.yaml` in `userDataDir` (as `user/<name>`), sorted by path. Any
+///   every top-level `*.custom.yaml` in `userDataDir` (as `user/<name>`), sorted by path. A
+///   symlink in `sharedDataDir` must resolve to a regular file; a `*.custom.yaml` must be a
+///   regular file itself; anything else fails the snapshot instead of being skipped. Any
 ///   added, changed, deleted, or renamed input changes this list, so `deployIfNeeded`
 ///   redeploys exactly when `inputs` differs from a fresh `DeployManifest.inputs(...)`.
-/// - `outputs`: every regular file under `build/` except the manifest itself, sorted by path.
-/// - `requiredDictionaries`: the compiled schema's `translator/dictionary`; each needs
-///   `<dict>.table.bin` and `<dict>.prism.bin` among `outputs`.
+/// - `outputs`: every regular file under `build/` except the manifest itself, sorted by path;
+///   `build/` holds nothing else (no extra files, no symlinks).
+/// - `requiredDictionaries`: the compiled schema's dictionaries (`translator/dictionary`,
+///   `reverse_lookup/dictionary`, and `<tag>/dictionary` of each tagged script or table
+///   translator); each needs non-empty `<dict>.table.bin` and `<dict>.prism.bin` among `outputs`.
 public struct DeployManifest: Codable, Equatable, Sendable {
     public struct ManifestEntry: Codable, Hashable, Sendable {
         /// `/`-separated, relative, without `.` or `..` components.
@@ -55,7 +59,12 @@ public struct DeployManifest: Codable, Equatable, Sendable {
         case unreadable(String)
         /// A path that must be a regular file or a real directory is something else.
         case notRegular(String)
+        /// A file is larger than the caller allows.
+        case tooLarge(String)
     }
+
+    /// Default size cap of `readRegularFile`: manifests and `*.custom.yaml` patches.
+    public static let maxReadSize = 16 << 20
 
     // MARK: Required outputs
 
@@ -67,9 +76,11 @@ public struct DeployManifest: Codable, Equatable, Sendable {
 
     // MARK: Inputs
 
-    /// The current deploy inputs on disk. Symlinked files are hashed through to their
-    /// target; symlinked directories are not descended. Throws when anything is unreadable,
-    /// so a doubtful input set is never mistaken for an unchanged one.
+    /// The current deploy inputs on disk. A symlink under `sharedDataDir` to a regular file
+    /// is hashed through to its target; a symlink to anything else (a directory, a FIFO, a
+    /// dangling link) fails, since librime would follow it where this walk cannot. Throws
+    /// when anything is unreadable, so a doubtful input set is never mistaken for an
+    /// unchanged one.
     public static func inputs(sharedDataDir: URL, userDataDir: URL) throws(Failure) -> [ManifestEntry] {
         var entries: [ManifestEntry] = []
         for relative in try regularFiles(under: sharedDataDir, followingFileSymlinks: true) {
@@ -77,13 +88,15 @@ public struct DeployManifest: Codable, Equatable, Sendable {
             entries.append(ManifestEntry(relativePath: "shared/\(relative)", size: size, sha256: digest))
         }
         for name in try userCustomPatchNames(in: userDataDir) {
-            let (size, digest) = try hashFile(userDataDir.appending(path: name))
+            let (size, digest) = try hashFile(userDataDir.appending(path: name), followSymlink: false)
             entries.append(ManifestEntry(relativePath: "user/\(name)", size: size, sha256: digest))
         }
         return entries.sorted { $0.relativePath < $1.relativePath }
     }
 
-    /// Top-level `*.custom.yaml` names in `userDataDir` that are (or link to) regular files.
+    /// Top-level `*.custom.yaml` names in `userDataDir`. Each must be a regular file itself
+    /// (`lstat`): a symlink, directory, FIFO, or socket by that name fails with `.notRegular`,
+    /// so a link never pulls a file from outside `userDataDir` into a deployment.
     public static func userCustomPatchNames(in userDataDir: URL) throws(Failure) -> [String] {
         let names: [String]
         do {
@@ -93,9 +106,11 @@ public struct DeployManifest: Codable, Equatable, Sendable {
         }
         var patches: [String] = []
         for name in names.sorted() where name.hasSuffix(".custom.yaml") {
+            let path = userDataDir.appending(path: name).path
             var info = stat()
-            guard stat(userDataDir.appending(path: name).path, &info) == 0 else { throw .unreadable(name) }
-            if info.st_mode & S_IFMT == S_IFREG { patches.append(name) }
+            guard lstat(path, &info) == 0 else { throw .unreadable(path) }
+            guard info.st_mode & S_IFMT == S_IFREG else { throw .notRegular(path) }
+            patches.append(name)
         }
         return patches
     }
@@ -115,33 +130,24 @@ public struct DeployManifest: Codable, Equatable, Sendable {
 
     // MARK: Validation
 
-    /// The manifest in `buildDir` when the build is complete and intact: the manifest
-    /// decodes with `version == 1` and `schemaID`, lists `default.yaml`, the schema, and both
-    /// compiled files of every required dictionary, and every listed output is still a
-    /// regular file inside `buildDir` with the recorded size and SHA-256. Nil otherwise.
+    /// The manifest in `buildDir` when the build is complete and intact: the manifest is a
+    /// regular file of at most `maxReadSize` bytes, decodes with `version == 1` and
+    /// `schemaID`, lists `default.yaml`, the schema, and both compiled files of every required
+    /// dictionary, each non-empty, and equals a fresh `outputs(buildDir:)` exactly, so every
+    /// listed file is still a regular file with the recorded size and SHA-256 and `build/`
+    /// holds no unlisted file and no symlink. Nil otherwise.
     public static func validated(buildDir: URL, schemaID: String) -> DeployManifest? {
         guard isRealDirectory(buildDir.path),
               let data = try? readRegularFile(buildDir.appending(path: fileName)),
               let manifest = try? JSONDecoder().decode(DeployManifest.self, from: data),
-              manifest.version == currentVersion, manifest.schemaID == schemaID
+              manifest.version == currentVersion, manifest.schemaID == schemaID,
+              isSafeName(schemaID), manifest.requiredDictionaries.allSatisfy(isSafeName)
         else { return nil }
-        let listed = Set(manifest.outputs.map(\.relativePath))
-        guard listed.count == manifest.outputs.count,
-              requiredOutputPaths(schemaID: schemaID, dictionaries: manifest.requiredDictionaries)
-                .allSatisfy(listed.contains)
+        let sizes = Dictionary(manifest.outputs.map { ($0.relativePath, $0.size) }, uniquingKeysWith: { _, _ in 0 })
+        guard requiredOutputPaths(schemaID: schemaID, dictionaries: manifest.requiredDictionaries)
+                .allSatisfy({ (sizes[$0] ?? 0) > 0 }),
+              let actual = try? outputs(buildDir: buildDir), actual == manifest.outputs
         else { return nil }
-        for entry in manifest.outputs {
-            guard let components = safeComponents(entry.relativePath), entry.relativePath != fileName else { return nil }
-            // Every parent inside build/ must be a real directory, never a symlink out of it.
-            var parent = buildDir
-            for component in components.dropLast() {
-                parent = parent.appending(path: component)
-                guard isRealDirectory(parent.path) else { return nil }
-            }
-            guard let (size, digest) = try? hashFile(buildDir.appending(path: entry.relativePath), followSymlink: false),
-                  size == entry.size, digest == entry.sha256
-            else { return nil }
-        }
         return manifest
     }
 
@@ -183,18 +189,32 @@ public struct DeployManifest: Codable, Equatable, Sendable {
         return (size, hasher.finalize().map { String(format: "%02x", $0) }.joined())
     }
 
-    /// Contents of a regular file; a symlink or anything else fails.
-    static func readRegularFile(_ url: URL) throws(Failure) -> Data {
+    /// Contents of a regular file of at most `maxSize` bytes. A symlink or any other kind of
+    /// entry fails with `.notRegular` (opened `O_NOFOLLOW | O_NONBLOCK`, so a FIFO never
+    /// blocks); a larger file, or one that grows past `maxSize` while read, fails with `.tooLarge`.
+    public static func readRegularFile(_ url: URL, maxSize: Int = maxReadSize) throws(Failure) -> Data {
         let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
-        guard descriptor >= 0 else { throw .unreadable(url.path) }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        guard descriptor >= 0 else {
+            throw errno == ELOOP ? .notRegular(url.path) : .unreadable(url.path)
+        }
+        defer { close(descriptor) }
         var info = stat()
         guard fstat(descriptor, &info) == 0 else { throw .unreadable(url.path) }
         guard info.st_mode & S_IFMT == S_IFREG else { throw .notRegular(url.path) }
-        do {
-            return try handle.readToEnd() ?? Data()
-        } catch {
-            throw .unreadable(url.path)
+        guard info.st_size <= maxSize else { throw .tooLarge(url.path) }
+        var data = Data()
+        let chunk = 1 << 16
+        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: chunk, alignment: 1)
+        defer { buffer.deallocate() }
+        while true {
+            let count = read(descriptor, buffer.baseAddress, chunk)
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw .unreadable(url.path)
+            }
+            if count == 0 { return data }
+            guard data.count + count <= maxSize else { throw .tooLarge(url.path) }
+            data.append(contentsOf: UnsafeRawBufferPointer(rebasing: buffer[0..<count]))
         }
     }
 
@@ -203,18 +223,16 @@ public struct DeployManifest: Codable, Equatable, Sendable {
         return lstat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR
     }
 
-    /// Path components of a manifest path, or nil when it is empty, absolute, or holds
-    /// an empty, `.`, or `..` component.
-    static func safeComponents(_ path: String) -> [Substring]? {
-        guard !path.isEmpty, !path.hasPrefix("/") else { return nil }
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
-        return components
+    /// Whether `name` (a schema ID or dictionary name) can be joined into a file name inside
+    /// one directory: non-empty, and free of `/`, `..`, and NUL.
+    public static func isSafeName(_ name: String) -> Bool {
+        !name.isEmpty && !name.contains("/") && !name.contains("..") && !name.utf8.contains(0)
     }
 
     /// Relative paths of the regular files under `root`, sorted. Directories are walked
     /// with `lstat`, so a symlinked directory is never descended. A symlink to a regular
-    /// file counts when `followingFileSymlinks`; any other entry kind fails the walk.
+    /// file counts when `followingFileSymlinks`; a symlink to anything else (a directory, a
+    /// FIFO, a socket, a device, nothing) and any other entry kind fail with `.notRegular`.
     static func regularFiles(under root: URL, followingFileSymlinks: Bool) throws(Failure) -> [String] {
         guard isRealDirectory(root.path) else { throw .notRegular(root.path) }
         var result: [String] = []
@@ -239,10 +257,15 @@ public struct DeployManifest: Codable, Equatable, Sendable {
                     result.append(child)
                 case S_IFLNK where followingFileSymlinks:
                     var target = stat()
-                    guard stat(path, &target) == 0 else { throw .unreadable(path) }
-                    // A linked directory is not descended (librime would follow it, but
-                    // a cycle could not be bounded); a linked file is an input.
-                    if target.st_mode & S_IFMT == S_IFREG { result.append(child) }
+                    guard stat(path, &target) == 0 else {
+                        // Dangling or looping: there is no regular file to hash.
+                        if [ENOENT, ELOOP, ENOTDIR].contains(errno) { throw .notRegular(path) }
+                        throw .unreadable(path)
+                    }
+                    // librime would follow a linked directory, but this walk cannot bound
+                    // a cycle, so its contents could never be inputs: refuse it outright.
+                    guard target.st_mode & S_IFMT == S_IFREG else { throw .notRegular(path) }
+                    result.append(child)
                 default:
                     throw .notRegular(path)
                 }
