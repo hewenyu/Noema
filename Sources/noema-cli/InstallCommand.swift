@@ -13,8 +13,10 @@ import NoemaCore
 /// it gets two `rename(2)` calls, rolled back if the second fails. The swap, its cleanup,
 /// and the pending-reload ledger run with `SIGINT`/`SIGTERM`/`SIGHUP` held back until they
 /// finish. An existing target that is not a Noema bundle is never touched. Processes of the
-/// replaced bundle that are not stopped (`--no-reload`, or a reload timeout, which exits 1)
-/// go to the `PendingReloadStore` for a later `noema-cli reload`.
+/// replaced bundle go to the `PendingReloadStore` before the swap, and those started during
+/// it (found in the replaced bundle) before that bundle is deleted, so a later
+/// `noema-cli reload` stops whatever `--no-reload`, a reload timeout (exit 1), or a
+/// `SIGKILL` left running.
 enum InstallCommand {
     static let usage = """
         usage: noema-cli install [--bundle <path>] [--dest <dir>] [--allow-adhoc]
@@ -127,7 +129,9 @@ enum InstallCommand {
         guard mkdir(staging, 0o700) == 0 else {
             throw CLIError("cannot create staging directory \(staging): \(String(cString: strerror(errno)))")
         }
-        defer { try? fileManager.removeItem(atPath: staging) }
+        // Kept only when the replaced bundle in it still has processes nobody recorded.
+        var keepStaging = false
+        defer { if !keepStaging { try? fileManager.removeItem(atPath: staging) } }
         let staged = "\(staging)/\(NoemaPaths.imeBundleName)"
         let ditto = runTool("/usr/bin/ditto", [bundlePath, staged])
         guard ditto.status == 0 else { throw CLIError("ditto failed: \(ditto.stderr.trimmed)") }
@@ -141,11 +145,13 @@ enum InstallCommand {
         try ensureReplaceable(target)
         // Before the swap: once renamed away, an old process's executable no longer has
         // the target path. Earlier `--no-reload` installs or timed-out reloads left theirs
-        // in the pending-reload ledger.
+        // in the pending-reload ledger. The ledger is written before the swap (a write-ahead
+        // log), so a SIGKILL right after it cannot lose them.
         let pending = PendingReloadStore.load(canonicalBundle: target)
         let before = IMEProcesses.running(canonicalExecutable: executable)
         let hadTarget = FileKind.of(target) != .missing
-        try withTerminationSignalsBlocked { () throws(CLIError) in
+        try PendingReloadStore.save(pending + before, canonicalBundle: target)
+        let replacedProcesses = try withTerminationSignalsBlocked { () throws(CLIError) -> [ProcessIdentity] in
             let old = "\(canonicalDest)/\(oldPrefix)\(tag)"
             var movedAside = false
             if hadTarget {
@@ -176,18 +182,33 @@ enum InstallCommand {
                 throw CLIError("install failed: \(String(cString: strerror(installErrno)))")
             }
             syncDirectory(canonicalDest)
+            // A process started from the target after `before` was taken now runs from the
+            // replaced bundle: find it there and record it before that bundle is deleted.
+            var replaced = pending + before
+            if hadTarget {
+                let replacedBundle = movedAside ? old : staged
+                let raw = "\(replacedBundle)/Contents/MacOS/\(NoemaPaths.imeExecutableName)"
+                let duringSwap = IMEProcesses.running(canonicalExecutable: IMEProcesses.canonicalPath(raw) ?? raw)
+                if !duringSwap.isEmpty {
+                    replaced += duringSwap
+                    do throws(CLIError) {
+                        try PendingReloadStore.save(replaced, canonicalBundle: target)
+                    } catch {
+                        // Keep the replaced bundle: a later install or reload finds them in it.
+                        keepStaging = true
+                        throw CLIError("""
+                            installed \(target), but cannot record the processes of the replaced bundle \
+                            \(replacedBundle) (\(error.message)); retry with noema-cli reload --bundle \(target)
+                            """)
+                    }
+                }
+            }
             if movedAside { try? fileManager.removeItem(atPath: old) }
             try? fileManager.removeItem(atPath: staging)
-            // Record replaced processes before unblocking signals, even with `--reload`:
-            // if a signal kills us before step 5 finishes, `noema-cli reload` still finds them;
-            // a successful `--reload` clears the ledger below.
-            do throws(CLIError) {
-                try PendingReloadStore.save(pending + before, canonicalBundle: target)
-            } catch {
-                fputs("noema-cli install: warning: \(error.message)\n", stderr)
-            }
+            syncDirectory(canonicalDest)
             print("installed \(target)")
             fflush(stdout)
+            return replaced
         }
 
         // 5. Register and reload.
@@ -201,7 +222,7 @@ enum InstallCommand {
         }
         guard options.reload else { return }
         let after = IMEProcesses.running(canonicalExecutable: executable)
-        let result = IMEProcesses.terminate(pending + before + after)
+        let result = IMEProcesses.terminate(replacedProcesses + after)
         guard result.remaining.isEmpty else {
             do {
                 try PendingReloadStore.save(result.remaining, canonicalBundle: target)
@@ -242,8 +263,9 @@ enum InstallCommand {
 
     /// Undoes what a killed install left in `canonicalDest` (called under its lock). If the
     /// target is missing, the newest `.old.*` backup that is a Noema bundle is renamed back;
-    /// if that fails every backup stays. Once the target is there (or nothing was valid),
-    /// every `.old.*` and `.install-staging.*` entry except `keepingStaging` is removed.
+    /// if that fails every backup stays. Processes still running from the remaining
+    /// leftover bundles go to the `PendingReloadStore` (if that fails, every leftover stays);
+    /// then every `.old.*` and `.install-staging.*` entry except `keepingStaging` is removed.
     static func recoverInterruptedInstalls(in canonicalDest: String, keepingStaging: String) throws(CLIError) {
         let target = "\(canonicalDest)/\(NoemaPaths.imeBundleName)"
         let entries: [String]
@@ -278,6 +300,20 @@ enum InstallCommand {
                     }
                     syncDirectory(canonicalDest)
                     fputs("noema-cli install: recovered \(target) from an interrupted install\n", stderr)
+                }
+            }
+            // Their bundles are about to go: record what still runs from them first (a
+            // SIGKILL right after the swap can leave a replaced bundle's processes here).
+            let stranded = IMEProcesses.runningInLeftoverBundles(in: canonicalDest, excluding: keepingStaging)
+            if !stranded.isEmpty {
+                let pending = PendingReloadStore.load(canonicalBundle: target)
+                do throws(CLIError) {
+                    try PendingReloadStore.save(pending + stranded, canonicalBundle: target)
+                } catch {
+                    throw CLIError("""
+                        cannot record the processes still running from an interrupted install's bundles, \
+                        leftovers kept: \(error.message)
+                        """)
                 }
             }
             for name in leftovers {

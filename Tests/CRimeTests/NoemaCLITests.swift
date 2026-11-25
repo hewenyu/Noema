@@ -366,6 +366,73 @@ extension LibrimeSerializedTests {
             #expect(verify.status == 0, "codesign: \(verify.stderr)")
         }
 
+        /// Codex PR #18: a `NoemaIME` started from the target after the `before` snapshot but
+        /// before `RENAME_SWAP` ends up in the replaced bundle, out of reach of both `before`
+        /// and `after`. The interposer starts it there; the post-swap rescan of the replaced
+        /// bundle must record and stop it (`--reload`), or leave it for `reload` (`--no-reload`).
+        @Test(arguments: [true, false])
+        func installReloadStopsOldProcessLaunchedBetweenSnapshotAndSwap(reload: Bool) throws {
+            let fixture = try BundleFixture()
+            #expect(try fixture.install().status == 0)
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            try SleeperProcess.compile(to: target.appending(path: "Contents/MacOS/NoemaIME"))
+            let interposer = try SwapInterposer(in: fixture.root)
+            defer { interposer.killSpawned() }
+
+            var arguments = ["install", "--bundle", fixture.app.path, "--dest", fixture.dest.path]
+            arguments += ["--allow-adhoc", "--no-register", reload ? "--reload" : "--no-reload"]
+            let run = try Tool.run(Tool.binary("noema-cli"), arguments, environment: [
+                "DYLD_INSERT_LIBRARIES": interposer.dylib.path, "NOEMA_TEST_SPAWN_BEFORE_SWAP": interposer.marker.path,
+            ])
+            let old = try #require(interposer.spawnedPID(), "the interposer must start the old process; stderr: \(run.stderr)")
+            #expect(run.status == 0, "stderr: \(run.stderr)")
+            #expect(try fixture.destEntries() == ["NoemaIME.app"])
+            if reload {
+                #expect(run.stdout.contains("reloaded: stopped 1 NoemaIME process(es)"), "stdout: \(run.stdout)")
+            } else {
+                #expect(!run.stdout.contains("reloaded"))
+                usleep(200_000)
+                #expect(kill(old, 0) == 0, "--no-reload leaves the old process alone")
+                let later = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+                #expect(later.status == 0, "stderr: \(later.stderr)")
+                #expect(later.stdout.contains("reload: stopped 1 NoemaIME process(es)"), "stdout: \(later.stdout)")
+            }
+            #expect(SlowDeployer.waitForDeath(old), "the old process must be stopped")
+        }
+
+        /// Codex PR #18: `SIGKILL` (which no mask holds back) right after `RENAME_SWAP` leaves
+        /// the old bundle, still running, in `.install-staging.*`. The ledger written before the
+        /// swap, and the next install's rescue of leftover bundles, keep it for `reload`.
+        @Test func installKilledWithSigkillAfterSwapStillAllowsReloadToStopOldProcess() throws {
+            let fixture = try BundleFixture()
+            #expect(try fixture.install().status == 0)
+            let target = fixture.dest.appending(path: "NoemaIME.app")
+            let old = try SleeperProcess(at: target.appending(path: "Contents/MacOS/NoemaIME"))
+            defer { old.kill() }
+            let interposer = try SwapInterposer(in: fixture.root)
+
+            var arguments = ["install", "--bundle", fixture.app.path, "--dest", fixture.dest.path]
+            arguments += ["--allow-adhoc", "--no-register", "--reload"]
+            let killed = try Tool.run(Tool.binary("noema-cli"), arguments, environment: [
+                "DYLD_INSERT_LIBRARIES": interposer.dylib.path, "NOEMA_TEST_SIGKILL_AFTER_SWAP": interposer.marker.path,
+            ])
+            #expect((try? String(contentsOf: interposer.marker, encoding: .utf8)) == "swapped", "stderr: \(killed.stderr)")
+            #expect(killed.status == SIGKILL, "status \(killed.status)")
+            #expect(try fixture.bundleIdentifier(at: target) == NoemaPaths.imeBundleID, "the new bundle is in place")
+            #expect(try fixture.destEntries().contains { $0.hasPrefix(".NoemaIME.app.install-staging.") })
+            #expect(old.process.isRunning)
+
+            let retry = try fixture.install()
+            #expect(retry.status == 0, "stderr: \(retry.stderr)")
+            #expect(try fixture.destEntries() == ["NoemaIME.app"], "the killed install's staging directory is gone")
+            #expect(old.process.isRunning, "--no-reload leaves the old process alone")
+            let reload = try Tool.cli(["reload", "--bundle", target.path], stdin: "")
+            #expect(reload.status == 0, "stderr: \(reload.stderr)")
+            #expect(reload.stdout.contains("reload: stopped 1 NoemaIME process(es)"), "stdout: \(reload.stdout)")
+            #expect(old.waitForSIGTERMExit())
+            #expect(try fixture.destEntries() == ["NoemaIME.app"])
+        }
+
         @Test func reloadWithNothingRunningSucceeds() throws {
             let fixture = try BundleFixture()
             let run = try Tool.cli(["reload", "--bundle", fixture.app.path], stdin: "")
@@ -705,6 +772,111 @@ final class RenameInterposer {
         try Self.source.write(to: sourceURL, atomically: true, encoding: .utf8)
         let compiled = try Tool.run("/usr/bin/clang", ["-arch", "arm64", "-dynamiclib", "-O1", "-o", dylib.path, sourceURL.path])
         try #require(compiled.status == 0, "clang: \(compiled.stderr)")
+    }
+}
+
+/// An arm64 dylib for `DYLD_INSERT_LIBRARIES` that interposes `renamex_np` in
+/// `noema-cli` only, around its first `RENAME_SWAP` onto a `NoemaIME.app`:
+/// - `NOEMA_TEST_SPAWN_BEFORE_SWAP=<marker>`: first starts `<target>/Contents/MacOS/NoemaIME`
+///   (default signals, empty mask, `/dev/null` stdio, no `DYLD_*`), waits for its readiness
+///   file, writes its pid to `<marker>`, then swaps;
+/// - `NOEMA_TEST_SIGKILL_AFTER_SWAP=<marker>`: swaps, writes `swapped` to `<marker>`, and
+///   sends this process `SIGKILL`.
+final class SwapInterposer {
+    let root: URL
+    var dylib: URL { root.appending(path: "swap-interposer.dylib") }
+    var marker: URL { root.appending(path: "marker") }
+
+    static let source = #"""
+        #include <errno.h>
+        #include <fcntl.h>
+        #include <signal.h>
+        #include <spawn.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <unistd.h>
+
+        static int fired;
+
+        static void write_file(const char *path, const char *text) {
+            char temporary[4096];
+            snprintf(temporary, sizeof temporary, "%s.tmp", path);
+            int fd = open(temporary, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+            if (fd < 0) return;
+            write(fd, text, strlen(text));
+            close(fd);
+            rename(temporary, path);
+        }
+
+        static void spawn_old(const char *target, const char *marker) {
+            char executable[4096], ready[4096];
+            snprintf(executable, sizeof executable, "%s/Contents/MacOS/NoemaIME", target);
+            snprintf(ready, sizeof ready, "%s.ready", marker);
+            posix_spawnattr_t attributes;
+            posix_spawnattr_init(&attributes);
+            sigset_t none, all;
+            sigemptyset(&none);
+            sigfillset(&all);
+            posix_spawnattr_setsigmask(&attributes, &none);
+            posix_spawnattr_setsigdefault(&attributes, &all);
+            posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT);
+            posix_spawn_file_actions_t actions;
+            posix_spawn_file_actions_init(&actions);
+            for (int fd = 0; fd < 3; fd++) {
+                posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0);
+            }
+            char *argv[] = { executable, "--ready", ready, 0 };
+            char *envp[] = { "PATH=/usr/bin:/bin", 0 };
+            pid_t pid = 0;
+            if (posix_spawn(&pid, executable, &actions, &attributes, argv, envp) != 0) return;
+            for (int i = 0; i < 1000 && access(ready, F_OK) != 0; i++) usleep(10000);
+            if (access(ready, F_OK) != 0) return;
+            char text[32];
+            snprintf(text, sizeof text, "%d", (int)pid);
+            write_file(marker, text);
+        }
+
+        static int my_renamex_np(const char *from, const char *to, unsigned int flags) {
+            size_t n = to ? strlen(to) : 0, k = strlen("/NoemaIME.app");
+            int armed = !fired && (flags & RENAME_SWAP) && n >= k && strcmp(to + n - k, "/NoemaIME.app") == 0
+                && strcmp(getprogname(), "noema-cli") == 0;
+            const char *spawn = getenv("NOEMA_TEST_SPAWN_BEFORE_SWAP");
+            const char *sigkill = getenv("NOEMA_TEST_SIGKILL_AFTER_SWAP");
+            if (armed) fired = 1;
+            if (armed && spawn) spawn_old(to, spawn);
+            int result = renamex_np(from, to, flags);
+            if (armed && sigkill && result == 0) {
+                write_file(sigkill, "swapped");
+                kill(getpid(), SIGKILL);
+            }
+            return result;
+        }
+
+        __attribute__((used, section("__DATA,__interpose")))
+        static const struct { const void *replacement, *original; } interposers[] = {
+            { (const void *)my_renamex_np, (const void *)renamex_np },
+        };
+        """#
+
+    init(in directory: URL) throws {
+        root = directory.appending(path: "swap-interposer-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sourceURL = root.appending(path: "interposer.c")
+        try Self.source.write(to: sourceURL, atomically: true, encoding: .utf8)
+        let compiled = try Tool.run("/usr/bin/clang", ["-arch", "arm64", "-dynamiclib", "-O1", "-o", dylib.path, sourceURL.path])
+        try #require(compiled.status == 0, "clang: \(compiled.stderr)")
+    }
+
+    /// The pid the interposer started (`NOEMA_TEST_SPAWN_BEFORE_SWAP`), if it did.
+    func spawnedPID() -> pid_t? {
+        guard let text = try? String(contentsOf: marker, encoding: .utf8) else { return nil }
+        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Never leaks the started process, whatever the test's outcome.
+    func killSpawned() {
+        if let pid = spawnedPID(), pid > 0 { kill(pid, SIGKILL) }
     }
 }
 

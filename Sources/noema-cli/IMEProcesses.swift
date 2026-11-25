@@ -75,6 +75,30 @@ enum IMEProcesses {
         return found
     }
 
+    /// Processes running from a bundle an interrupted install left in `canonicalDest`:
+    /// `.NoemaIME.app.old.*` or `.NoemaIME.app.install-staging.*/NoemaIME.app`, except the
+    /// staging directory `excluding`. Only a regular executable reached without symlinks counts.
+    static func runningInLeftoverBundles(in canonicalDest: String, excluding: String? = nil) -> [ProcessIdentity] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: canonicalDest) else { return [] }
+        var found: [ProcessIdentity] = []
+        for name in entries.sorted() where name != excluding {
+            let bundle: String
+            if name.hasPrefix(InstallCommand.oldPrefix) {
+                bundle = "\(canonicalDest)/\(name)"
+            } else if name.hasPrefix(InstallCommand.stagingPrefix) {
+                bundle = "\(canonicalDest)/\(name)/\(NoemaPaths.imeBundleName)"
+            } else {
+                continue
+            }
+            let executable = "\(bundle)/Contents/MacOS/\(NoemaPaths.imeExecutableName)"
+            guard FileKind.of(bundle) == .directory, FileKind.of(executable) == .regular,
+                  canonicalPath(executable) == executable
+            else { continue }
+            found += running(canonicalExecutable: executable)
+        }
+        return found
+    }
+
     /// True while `identity` (same pid and start time) is still running; an exited but
     /// unreaped zombie counts as gone.
     static func isAlive(_ identity: ProcessIdentity) -> Bool {

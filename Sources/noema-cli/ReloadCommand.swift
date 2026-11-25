@@ -14,8 +14,8 @@ enum ReloadCommand {
 
         Sends SIGTERM to this user's NoemaIME processes whose executable is
         <bundle>/Contents/MacOS/NoemaIME, and to those of a replaced copy that an
-        earlier install left running, and waits up to 3 s for them to exit; exits 1
-        if any is still running.
+        earlier install left running or left behind, and waits up to 3 s for them to
+        exit; exits 1 if any is still running.
         """
 
     static func run(_ arguments: [String]) -> Int32 {
@@ -49,9 +49,10 @@ enum ReloadCommand {
         // The same lock and ledger key as `install`: the canonical bundle and its parent.
         let canonicalBundle = IMEProcesses.canonicalPath(bundlePath) ?? bundlePath
         let parent = URL(filePath: canonicalBundle).deletingLastPathComponent().fileSystemPath
+        let canonicalParent = IMEProcesses.canonicalPath(parent) ?? parent
         let lock: Int32
         do {
-            lock = try IMEProcesses.lockDirectory(IMEProcesses.canonicalPath(parent) ?? parent)
+            lock = try IMEProcesses.lockDirectory(canonicalParent)
         } catch {
             fputs("noema-cli reload: \(error.message)\n", stderr)
             return error.status
@@ -61,7 +62,10 @@ enum ReloadCommand {
         let canonical = IMEProcesses.canonicalPath(executable) ?? executable
         let pending = PendingReloadStore.load(canonicalBundle: canonicalBundle)
         let running = IMEProcesses.running(canonicalExecutable: canonical)
-        let result = IMEProcesses.terminate(pending + running)
+        // A SIGKILLed install can leave a replaced bundle (with live processes) beside it.
+        let leftover = URL(filePath: canonicalBundle).lastPathComponent == NoemaPaths.imeBundleName
+            ? IMEProcesses.runningInLeftoverBundles(in: canonicalParent) : []
+        let result = IMEProcesses.terminate(pending + running + leftover)
         guard result.remaining.isEmpty else {
             do {
                 try PendingReloadStore.save(result.remaining, canonicalBundle: canonicalBundle)
