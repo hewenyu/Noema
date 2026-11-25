@@ -57,15 +57,27 @@ func checkRime() -> Int32 {
     }
 }
 
-/// Boots the engine after launch and shuts it down on termination.
+/// Boots the engine after launch and shuts it down on termination. AppKit termination
+/// (logout, `terminate(_:)`) mid-boot answers `.terminateLater` until the cancelled boot has
+/// removed its staging directory and disarmed the boot sentinel (bounded at 1 s), so an
+/// interrupted boot never counts toward `bootCrashLoop`.
 @MainActor
 final class InputMethodAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         EngineHost.shared.boot()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let waiting = BootTerminationCoordinator.beginShutdown(
+            shutdown: { EngineHost.shared.shutdown() },
+            onComplete: { sender.reply(toApplicationShouldTerminate: true) }
+        )
+        return waiting ? .terminateLater : .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        EngineHost.shared.shutdown()
+        // Defense in depth: a no-op once applicationShouldTerminate has finished.
+        BootTerminationCoordinator.awaitShutdownSynchronously { EngineHost.shared.shutdown() }
     }
 }
 
@@ -83,14 +95,15 @@ func runInputMethodServer() -> Never {
         signal(signalNumber, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
         source.setEventHandler {
-            let bootTask = MainActor.assumeIsolated { EngineHost.shared.shutdown() }
-            guard let bootTask else { exit(0) }
-            // Let the cancelled boot task finish staging cleanup and disarm the sentinel,
-            // bounded well under `noema-cli reload`'s 3 s wait.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { exit(0) }
-            Task { @MainActor in
-                await bootTask.value
-                exit(0)
+            // Let a cancelled boot finish staging cleanup and disarm the sentinel, bounded
+            // well under `noema-cli reload`'s 3 s wait. During an AppKit `.terminateLater`
+            // this awaits the same boot task.
+            MainActor.assumeIsolated {
+                let waiting = BootTerminationCoordinator.beginShutdown(
+                    shutdown: { EngineHost.shared.shutdown() },
+                    onComplete: { exit(0) }
+                )
+                if !waiting { exit(0) }
             }
         }
         source.resume()
@@ -111,7 +124,7 @@ func runInputMethodServer() -> Never {
     app.run()
     // NSApplication.run returns only after stop(_:); keep everything alive until then.
     withExtendedLifetime((server, delegate, signalSources)) {}
-    EngineHost.shared.shutdown()
+    BootTerminationCoordinator.awaitShutdownSynchronously { EngineHost.shared.shutdown() }
     exit(0)
 }
 

@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 import NoemaCore
@@ -126,6 +127,102 @@ extension LibrimeSerializedTests {
             #expect(!engine.isSafeMode)
         }
 
+        /// AppKit termination mid-boot (`applicationShouldTerminate` → `.terminateLater`, then
+        /// `reply(toApplicationShouldTerminate:)` exits): the reply waits for the cancelled
+        /// boot's cleanup, so two interrupted boots in a row on the same `user_data_dir` leave
+        /// no armed sentinel and the third boot types normally instead of `bootCrashLoop`.
+        /// The process "exits" when the reply fires: the sentinel is restored to its bytes at
+        /// that moment, as if the cleanup still pending had never run.
+        @Test func appKitTerminateLaterCleansUpRepeatedBootInterruptionsWithoutCrashLoop() async throws {
+            let workspace = try EngineWorkspace()
+            for round in 1...2 {
+                let pidFile = workspace.root.appending(path: "deployer-\(round).pid")
+                let wrapper = try workspace.deployerScript("echo $$ > '\(pidFile.path)'\nexec /bin/sleep 15")
+                let host = try await InterruptibleBoot(configuration: workspace.configuration(deployerURL: wrapper), pidFile: pidFile)
+                let pid = try #require(host.deployerPID)
+                #expect(kill(pid, 0) == 0, "round \(round): the deployer is running")
+
+                let delegate = TerminationDelegateDouble(shutdown: host.shutdown)
+                let clock = ContinuousClock()
+                let asked = clock.now
+                var exitSnapshot: ExitSnapshot?
+                var replies = 0
+                let reply = delegate.applicationShouldTerminate { terminate in
+                    replies += 1
+                    #expect(terminate)
+                    exitSnapshot = ExitSnapshot(workspace: workspace, deployerPID: pid)
+                }
+                #expect(reply == .terminateLater, "round \(round): a running boot defers termination")
+                while exitSnapshot == nil, clock.now - asked < .seconds(5) {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                #expect(clock.now - asked < .seconds(2), "round \(round): the reply is bounded")
+                let snapshot = try #require(exitSnapshot)
+                // Past the 1 s fallback: the reply still fired exactly once.
+                try await Task.sleep(for: .milliseconds(1200))
+                #expect(replies == 1)
+                #expect(!snapshot.deployerAlive, "round \(round): the deployer was stopped")
+                #expect(snapshot.stagingLeftovers.isEmpty, "round \(round): staging was removed")
+                #expect(snapshot.sentinel == nil, "round \(round): the boot sentinel was disarmed")
+
+                await host.boot.value
+                try snapshot.restoreSentinel(in: workspace)
+            }
+
+            let engine = try await RimeEngine.start(configuration: workspace.configuration())
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode, "two AppKit-terminated boots are not a crash loop")
+            let coordinator = InputSessionCoordinator(
+                engineProvider: { engine }, candidatePresenter: RecordingPresenter(), isSecureInputEnabled: { false })
+            let client = RecordingClient()
+            let token = UUID()
+            for key in "nihao" { #expect(coordinator.handleKey(.text(key), token: token, client: client)) }
+            #expect(coordinator.handleKey(.key(VirtualKeyCode.space, " "), token: token, client: client))
+            #expect(client.calls.last == .insert("你好"))
+        }
+
+        /// The synchronous exits (`applicationWillTerminate`, after `NSApplication.run()`
+        /// returns) pump the main run loop until the cancelled boot has cleaned up. It runs as
+        /// a run-loop block, like an AppKit event handler, not inside a main-queue job.
+        @Test func synchronousShutdownAwaitCleansUpPostRunLoopBoot() async throws {
+            let workspace = try EngineWorkspace()
+            try workspace.writeSentinel(#"{"consecutiveFailures":1,"lastAttemptEpoch":1}"#)
+            let pidFile = workspace.root.appending(path: "deployer.pid")
+            let wrapper = try workspace.deployerScript("echo $$ > '\(pidFile.path)'\nexec /bin/sleep 15")
+            let host = try await InterruptibleBoot(configuration: workspace.configuration(deployerURL: wrapper), pidFile: pidFile)
+            let pid = try #require(host.deployerPID)
+
+            let user = workspace.user, sentinel = workspace.sentinel
+            let clock = ContinuousClock()
+            let began = clock.now
+            let snapshot: ExitSnapshot = await withCheckedContinuation { continuation in
+                RunLoop.main.perform {
+                    MainActor.assumeIsolated {
+                        BootTerminationCoordinator.awaitShutdownSynchronously(shutdown: host.shutdown)
+                        continuation.resume(returning: ExitSnapshot(user: user, sentinel: sentinel, deployerPID: pid))
+                    }
+                }
+            }
+            #expect(clock.now - began < .seconds(2))
+            #expect(!snapshot.deployerAlive, "the deployer was stopped")
+            #expect(snapshot.stagingLeftovers.isEmpty, "staging was removed")
+            #expect(snapshot.sentinel == nil, "the boot sentinel was disarmed before exit")
+            await host.boot.value
+            // Nothing booting: returns at once without pumping.
+            let idle = clock.now
+            BootTerminationCoordinator.awaitShutdownSynchronously(shutdown: { nil })
+            #expect(clock.now - idle < .milliseconds(50))
+        }
+
+        /// No boot running: `.terminateNow` at once, and the deferred reply never fires.
+        @Test func terminateNowWhenNotBooting() async throws {
+            var replies = 0
+            let delegate = TerminationDelegateDouble(shutdown: { nil })
+            #expect(delegate.applicationShouldTerminate { _ in replies += 1 } == .terminateNow)
+            try await Task.sleep(for: .milliseconds(1200))
+            #expect(replies == 0)
+        }
+
         /// A Safe Mode decision returns at once and runs no deployer.
         @Test func crashLoopReturnsSafeModeWithoutDeploying() async throws {
             let workspace = try EngineWorkspace()
@@ -144,6 +241,84 @@ extension LibrimeSerializedTests {
 @MainActor
 final class EngineSlot {
     var engine: RimeEngine?
+}
+
+/// What `EngineHost` does around a boot, against a workspace: `RimeEngine.start` in a
+/// `Task<Void, Never>`, and a `shutdown` that stops the deployer, cancels the task, and
+/// returns it. Initialization waits until the (slow) deployer has written its pid.
+@MainActor
+final class InterruptibleBoot {
+    let boot: Task<Void, Never>
+    let cancellation: DeployCancellation
+    private(set) var deployerPID: pid_t?
+    private(set) var shutDown = false
+
+    init(configuration: RimeEngineConfiguration, pidFile: URL) async throws {
+        let cancellation = DeployCancellation()
+        self.cancellation = cancellation
+        boot = Task { @MainActor in
+            if let engine = try? await RimeEngine.start(configuration: configuration, cancellation: cancellation) {
+                Issue.record("a cancelled boot must not return an engine")
+                engine.shutdown()
+            }
+        }
+        let clock = ContinuousClock()
+        let start = clock.now
+        while !FileManager.default.fileExists(atPath: pidFile.path), clock.now - start < .seconds(10) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let text = try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        deployerPID = pid_t(text)
+    }
+
+    func shutdown() -> Task<Void, Never>? {
+        if shutDown { return boot }
+        shutDown = true
+        cancellation.cancelTerminatingDeployer()
+        boot.cancel()
+        return boot
+    }
+}
+
+/// `InputMethodAppDelegate.applicationShouldTerminate`, with `reply` standing in for
+/// `NSApplication.reply(toApplicationShouldTerminate:)`.
+@MainActor
+struct TerminationDelegateDouble {
+    let shutdown: () -> Task<Void, Never>?
+
+    func applicationShouldTerminate(reply: @escaping @MainActor (Bool) -> Void) -> NSApplication.TerminateReply {
+        let waiting = BootTerminationCoordinator.beginShutdown(shutdown: shutdown, onComplete: { reply(true) })
+        return waiting ? .terminateLater : .terminateNow
+    }
+}
+
+/// The workspace at the moment the process would exit.
+struct ExitSnapshot {
+    let deployerAlive: Bool
+    let stagingLeftovers: [String]
+    let sentinel: Data?
+
+    init(workspace: EngineWorkspace, deployerPID: pid_t) {
+        self.init(user: workspace.user, sentinel: workspace.sentinel, deployerPID: deployerPID)
+    }
+
+    init(user: URL, sentinel: URL, deployerPID: pid_t) {
+        deployerAlive = kill(deployerPID, 0) == 0
+        stagingLeftovers = ((try? FileManager.default.contentsOfDirectory(atPath: user.path)) ?? ["<unreadable>"])
+            .filter { $0.hasPrefix(".deploy-staging.") || $0.hasPrefix(".build-old.") || $0 == "<unreadable>" }
+        self.sentinel = try? Data(contentsOf: sentinel)
+    }
+
+    /// Puts the sentinel back as it was at exit, undoing cleanup that ran only because the
+    /// test process kept running.
+    func restoreSentinel(in workspace: EngineWorkspace) throws {
+        if let sentinel {
+            try sentinel.write(to: workspace.sentinel)
+        } else if FileManager.default.fileExists(atPath: workspace.sentinel.path) {
+            try FileManager.default.removeItem(at: workspace.sentinel)
+        }
+    }
 }
 
 extension EngineWorkspace {

@@ -12,6 +12,9 @@ final class EngineHost {
         case uninitialized
         /// `RimeEngine.start` is running; any deployment runs off the main actor.
         case booting(Task<Void, Never>, DeployCancellation)
+        /// `shutdown()` cancelled the boot; the task is still removing staging and
+        /// disarming the boot sentinel. Every later `shutdown()` returns the same task.
+        case shuttingDown(Task<Void, Never>)
         case ready(RimeEngine)
         case unavailable(String)
     }
@@ -63,8 +66,15 @@ final class EngineHost {
     }
 
     private func finishBoot(_ outcome: Result<RimeEngine, NoemaError>) {
-        guard case .booting = state else {
+        switch state {
+        case .booting:
+            break
+        case .shuttingDown:
             // shutdown() ran while booting: never publish an engine.
+            if case .success(let engine) = outcome { engine.shutdown() }
+            state = .unavailable("shut down")
+            return
+        case .uninitialized, .ready, .unavailable:
             if case .success(let engine) = outcome { engine.shutdown() }
             return
         }
@@ -85,25 +95,31 @@ final class EngineHost {
     /// Finalizes librime and releases the user-data lock; while booting, cancels the boot
     /// and stops a running `noema-rime-deployer` before returning (SIGTERM, SIGKILL after
     /// `deployerGrace`), so exiting right after leaves no orphan. Returns the cancelled
-    /// boot task if one was running, so a caller can await its staging/sentinel cleanup
-    /// before exiting. Idempotent.
+    /// boot task while it is still cleaning up — also to every later call, so SIGTERM during
+    /// an AppKit `.terminateLater` awaits the same task — so the caller can await its
+    /// staging/sentinel cleanup before exiting (`BootTerminationCoordinator`). Idempotent.
     @discardableResult
     func shutdown(deployerGrace: Duration = .milliseconds(500)) -> Task<Void, Never>? {
-        let cancelledTask: Task<Void, Never>?
         switch state {
-        case .unavailable: return nil
+        case .unavailable:
+            return nil
+        case .shuttingDown(let task):
+            return task
         case .uninitialized:
-            cancelledTask = nil
+            state = .unavailable("shut down")
+            log.info("RimeEngine shut down")
+            return nil
         case .booting(let task, let cancellation):
             cancellation.cancelTerminatingDeployer(grace: deployerGrace)
             task.cancel()
-            cancelledTask = task
+            state = .shuttingDown(task)
+            log.info("RimeEngine boot cancelled; awaiting cleanup")
+            return task
         case .ready(let engine):
             engine.shutdown()
-            cancelledTask = nil
+            state = .unavailable("shut down")
+            log.info("RimeEngine shut down")
+            return nil
         }
-        state = .unavailable("shut down")
-        log.info("RimeEngine shut down")
-        return cancelledTask
     }
 }
