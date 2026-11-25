@@ -79,9 +79,17 @@ enum ReplCommand {
 }
 
 /// One repl run: the engine, the temporary directory it owns, and the line interpreter.
+///
+/// The engine boots through `RimeEngine.start(configuration:cancellation:)` after the
+/// SIGINT/SIGTERM handlers are installed, so a signal during deployment stops the deployer,
+/// lets the boot remove its staging directory and disarm the boot guard, and only then
+/// removes the ephemeral directory and exits `128 + signal`.
 @MainActor
 final class ReplSession {
-    private let engine: RimeEngine
+    private var engine: RimeEngine?
+    private var bootTask: Task<Void, Never>?
+    private let bootCancellation = DeployCancellation()
+    private let engineConfiguration: RimeEngineConfiguration
     private let ephemeralRoot: URL?
     private var signalSources: [any DispatchSourceSignal] = []
     private var isTornDown = false
@@ -115,33 +123,49 @@ final class ReplSession {
             user = root.appending(path: "user", directoryHint: .isDirectory)
             logs = configuration.logDir ?? root.appending(path: "log", directoryHint: .isDirectory)
         }
-        do {
-            engine = try RimeEngine(configuration: RimeEngineConfiguration(
-                sharedDataDir: shared, userDataDir: user, logDir: logs,
-                schemaID: configuration.schemaID, deployerURL: deployer))
-        } catch {
-            if let ephemeralRoot { try? fileManager.removeItem(at: ephemeralRoot) }
-            throw CLIError("engine unavailable: \(error)")
-        }
+        engineConfiguration = RimeEngineConfiguration(
+            sharedDataDir: shared, userDataDir: user, logDir: logs,
+            schemaID: configuration.schemaID, deployerURL: deployer)
         fputs("noema repl: schema \(configuration.schemaID), user dir \(user.path)\(ephemeralRoot == nil ? "" : " (ephemeral)"); :help for help\n", stderr)
+        fflush(stderr)
     }
 
-    /// Prints the Safe Mode banner, then reads stdin on a background thread and runs each
-    /// line on the main queue, in order, until `:quit`, EOF, or a signal.
+    /// Installs the signal handlers, boots the engine off the main actor, then prints the
+    /// Safe Mode banner and reads stdin on a background thread, running each line on the
+    /// main queue, in order, until `:quit`, EOF, or a signal.
     func start() -> Never {
-        if let reason = engine.safeModeReason { emit("[safe-mode: \(reason.rawValue)]") }
-        flush()
+        ReplSession.current = self
         for signalNumber in [SIGINT, SIGTERM] {
             signal(signalNumber, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
             source.setEventHandler {
-                MainActor.assumeIsolated { ReplSession.current?.teardown() }
-                exit(128 + signalNumber)
+                MainActor.assumeIsolated { ReplSession.current?.handleTerminationSignal(signalNumber) }
             }
             source.resume()
             signalSources.append(source)
         }
-        ReplSession.current = self
+        let configuration = engineConfiguration
+        let cancellation = bootCancellation
+        bootTask = Task { @MainActor [weak self] in
+            do {
+                let engine = try await RimeEngine.start(configuration: configuration, cancellation: cancellation)
+                guard let self, !self.isTornDown else { return engine.shutdown() }
+                self.engine = engine
+                self.bootTask = nil
+                self.startReading()
+            } catch {
+                // A signal owns teardown and exit once it has cancelled the boot.
+                guard let self, !self.isTornDown else { return }
+                fputs("noema-cli repl: engine unavailable: \(error)\n", stderr)
+                self.finish(status: 1)
+            }
+        }
+        dispatchMain()
+    }
+
+    private func startReading() {
+        if let reason = engine?.safeModeReason { emit("[safe-mode: \(reason.rawValue)]") }
+        flush()
         let reader = Thread {
             while let line = readLine(strippingNewline: true) {
                 DispatchQueue.main.async { MainActor.assumeIsolated { ReplSession.current?.handle(line) } }
@@ -152,10 +176,38 @@ final class ReplSession {
             }
         }
         reader.start()
-        dispatchMain()
     }
 
     static var current: ReplSession?
+
+    /// SIGINT/SIGTERM. During boot: stop the deployer, cancel the boot, and wait for it to
+    /// clean up (staging, boot guard, lock) before removing the ephemeral directory; a 1 s
+    /// fallback exits regardless. Once running: shut the engine down. Exits `128 + signal`.
+    func handleTerminationSignal(_ signalNumber: Int32) {
+        guard !isTornDown else { return }
+        isTornDown = true
+        let status = 128 + signalNumber
+        guard let task = bootTask else {
+            engine?.shutdown()
+            cleanupEphemeral()
+            flush()
+            exit(status)
+        }
+        bootTask = nil
+        bootCancellation.cancelTerminatingDeployer(grace: .milliseconds(500))
+        task.cancel()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            MainActor.assumeIsolated { ReplSession.current?.cleanupEphemeral() }
+            fflush(stdout)
+            exit(status)
+        }
+        Task { @MainActor in
+            await task.value
+            self.cleanupEphemeral()
+            self.flush()
+            exit(status)
+        }
+    }
 
     func finish(status: Int32) -> Never {
         teardown()
@@ -167,18 +219,23 @@ final class ReplSession {
     func teardown() {
         guard !isTornDown else { return }
         isTornDown = true
-        engine.shutdown()
-        if let ephemeralRoot { try? FileManager.default.removeItem(at: ephemeralRoot) }
+        engine?.shutdown()
+        cleanupEphemeral()
         flush()
+    }
+
+    private func cleanupEphemeral() {
+        if let ephemeralRoot { try? FileManager.default.removeItem(at: ephemeralRoot) }
     }
 
     // MARK: - Lines
 
     func handle(_ rawLine: String) {
+        guard let engine, !isTornDown else { return }
         defer { flush() }
         let line = rawLine.trimmingCharacters(in: .newlines)
         if line.hasPrefix(":") {
-            command(line.dropFirst().split(separator: " ", omittingEmptySubsequences: true).map(String.init))
+            command(line.dropFirst().split(separator: " ", omittingEmptySubsequences: true).map(String.init), engine: engine)
             return
         }
         guard !line.isEmpty else { return }
@@ -186,10 +243,10 @@ final class ReplSession {
         for (name, event) in Self.keys(in: line) {
             report(engine.processKey(event), key: name)
         }
-        printState()
+        printState(engine)
     }
 
-    private func command(_ words: [String]) {
+    private func command(_ words: [String], engine: RimeEngine) {
         switch (words.first ?? "", Array(words.dropFirst())) {
         case ("select", let rest):
             guard rest.count == 1, let number = Int(rest[0]), number >= 1 else {
@@ -198,26 +255,26 @@ final class ReplSession {
             let result = engine.selectCandidate(at: number - 1)
             if !result.handled { emit("ERROR: no candidate \(number) on this page") }
             report(result, key: nil)
-            printState()
+            printState(engine)
         case ("page", ["next"]), ("page", ["prev"]):
             engine.changePage(backward: words[1] == "prev")
-            printState()
+            printState(engine)
         case ("ascii", ["on"]), ("ascii", ["off"]):
             engine.setASCIIMode(words[1] == "on")
             emit("ASCII: \(engine.currentState.isASCIIMode ? "on" : "off")")
         case ("commit", []):
             report(engine.commitComposition(), key: nil)
-            printState()
+            printState(engine)
         case ("clear", []):
             engine.clearComposition()
-            printState()
+            printState(engine)
         case ("reset", []):
             engine.resetSession()
-            printState()
+            printState(engine)
         case ("state", []):
             let state = engine.currentState
             emit("STATE: composing=\(state.isComposing) ascii=\(state.isASCIIMode) schema=\(state.schemaID ?? "-") safe-mode=\(state.safeModeReason?.rawValue ?? "none")")
-            printState()
+            printState(engine)
         case ("help", []):
             emit(ReplCommand.helpText)
         case ("quit", []), ("q", []):
@@ -232,7 +289,7 @@ final class ReplSession {
         if let key, !result.handled { emit("PASSTHROUGH: \(key)") }
     }
 
-    private func printState() {
+    private func printState(_ engine: RimeEngine) {
         let state = engine.currentState
         guard state.isComposing else { return emit("IDLE") }
         emit("PREEDIT: \(state.preedit) [caret \(state.caretUTF16Offset)]")

@@ -99,6 +99,11 @@ public final class RimeEngine: TypingEngine {
         cancellation: DeployCancellation = DeployCancellation()
     ) async throws(NoemaError) -> RimeEngine {
         let engine = try RimeEngine(claiming: configuration)
+        // Cancelled before boot: touch no boot guard and spawn no deployer.
+        if cancellation.isCancelled || Task.isCancelled {
+            engine.abandonBoot()
+            throw .engineUnavailable(reason: "boot cancelled")
+        }
         guard engine.beginBoot(clearingSentinel: false) else { return engine }
         let prepared = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in

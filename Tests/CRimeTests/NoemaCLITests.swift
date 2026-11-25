@@ -64,6 +64,52 @@ extension LibrimeSerializedTests {
             #expect(missingDeployer.status == 1 && missingDeployer.stderr.contains("--deployer"))
         }
 
+        /// Codex PR #18: SIGTERM while the deployer runs stops it, and the boot removes its
+        /// staging directory and boot guard before the ephemeral directory goes.
+        @Test func replSignalDuringEphemeralDeployCleansUpDeployerAndTempDir() throws {
+            let deployer = try SlowDeployer()
+            let repl = try ReplProcess(["repl", "--ephemeral", "--shared-dir", EngineWorkspace.shippedSharedData.path,
+                                        "--deployer", deployer.wrapper.path])
+            let root = try #require(repl.waitForEphemeralRoot())
+            let pid = try #require(deployer.waitForPID(), "the slow deployer never started")
+            #expect(FileManager.default.fileExists(atPath: root))
+
+            kill(repl.process.processIdentifier, SIGTERM)
+            #expect(repl.waitForExit(seconds: 3), "noema-cli repl did not exit after SIGTERM")
+            #expect(repl.process.terminationReason == .exit && repl.process.terminationStatus == 128 + SIGTERM,
+                    "status \(repl.process.terminationStatus), stderr: \(repl.stderr)")
+            #expect(SlowDeployer.waitForDeath(pid), "deployer \(pid) was orphaned")
+            #expect(!FileManager.default.fileExists(atPath: root), "ephemeral directory \(root) must be removed")
+        }
+
+        /// Codex PR #18: two signals during deployment on a persistent --user-dir are
+        /// cancellations, not crashes, so the third run boots normally.
+        @Test func replRepeatedSignalsDuringPersistentDeployDoNotTripCrashLoop() throws {
+            let workspace = try EngineWorkspace()
+            let fm = FileManager.default
+            for attempt in 1...2 {
+                let deployer = try SlowDeployer()
+                let repl = try ReplProcess(["repl", "--user-dir", workspace.user.path, "--log-dir", workspace.logs.path,
+                                            "--shared-dir", EngineWorkspace.shippedSharedData.path,
+                                            "--deployer", deployer.wrapper.path])
+                let pid = try #require(deployer.waitForPID(), "attempt \(attempt): the slow deployer never started")
+                kill(repl.process.processIdentifier, SIGTERM)
+                #expect(repl.waitForExit(seconds: 3), "attempt \(attempt): noema-cli repl did not exit")
+                #expect(repl.process.terminationReason == .exit && repl.process.terminationStatus == 128 + SIGTERM)
+                #expect(SlowDeployer.waitForDeath(pid), "attempt \(attempt): deployer \(pid) was orphaned")
+                let entries = try fm.contentsOfDirectory(atPath: workspace.user.path)
+                #expect(!entries.contains { $0.hasPrefix(".deploy-staging.") }, "attempt \(attempt): \(entries)")
+                #expect(!entries.contains(BootGuard.sentinelFileName), "attempt \(attempt): boot guard left armed")
+            }
+            let run = try Tool.cli(
+                ["repl", "--user-dir", workspace.user.path, "--log-dir", workspace.logs.path,
+                 "--shared-dir", EngineWorkspace.shippedSharedData.path],
+                stdin: "nihao<space>\n:quit\n")
+            #expect(run.status == 0, "stderr: \(run.stderr)")
+            #expect(run.stdout.split(separator: "\n").contains("COMMIT: 你好"), "stdout: \(run.stdout)")
+            #expect(!run.stdout.contains("bootCrashLoop") && !run.stdout.contains("safe-mode"), "stdout: \(run.stdout)")
+        }
+
         // MARK: NoemaIME probes
 
         @Test func imeProbesAnswerWithoutStartingTheServer() throws {
@@ -334,6 +380,109 @@ enum Tool {
     }
 }
 
+/// A `--deployer` that never finishes: a shell wrapper that records its PID, then `exec`s
+/// the compiled sleeper (same PID), which sleeps until a signal or 60 s.
+final class SlowDeployer {
+    let root: URL
+    var wrapper: URL { root.appending(path: "slow-deployer") }
+    var pidFile: URL { root.appending(path: "pid") }
+
+    init() throws {
+        let fm = FileManager.default
+        root = fm.temporaryDirectory.appending(path: "noema-slow-deployer-\(UUID().uuidString)")
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        let sleeper = root.appending(path: "sleeper")
+        try SleeperProcess.compile(to: sleeper)
+        let script = """
+            #!/bin/sh
+            echo $$ > '\(root.path)/pid.tmp' && mv '\(root.path)/pid.tmp' '\(pidFile.path)'
+            exec '\(sleeper.path)'
+            """
+        try script.write(to: wrapper, atomically: true, encoding: .utf8)
+        try #require(chmod(wrapper.path, 0o755) == 0)
+    }
+
+    deinit {
+        if let text = try? String(contentsOf: pidFile, encoding: .utf8), let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            kill(pid, SIGKILL)
+        }
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    /// The running deployer's PID, once it has started (up to 10 s).
+    func waitForPID() -> pid_t? {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(10)
+        while clock.now < deadline {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+               let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) { return pid }
+            usleep(10_000)
+        }
+        return nil
+    }
+
+    /// True once `pid` no longer exists (up to 2 s).
+    static func waitForDeath(_ pid: pid_t) -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(2)
+        while clock.now < deadline {
+            if kill(pid, 0) != 0, errno == ESRCH { return true }
+            usleep(10_000)
+        }
+        return false
+    }
+}
+
+/// A real `noema-cli` started with an open stdin pipe (so it never sees EOF) and its
+/// stderr in a file.
+final class ReplProcess {
+    let process = Process()
+    private let stdin = Pipe()
+    private let root: URL
+    private var stderrURL: URL { root.appending(path: "stderr") }
+    var stderr: String { (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? "" }
+
+    init(_ arguments: [String]) throws {
+        let fm = FileManager.default
+        root = fm.temporaryDirectory.appending(path: "noema-repl-process-\(UUID().uuidString)")
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        fm.createFile(atPath: stderrURL.path, contents: nil)
+        process.executableURL = URL(filePath: try Tool.binary("noema-cli"))
+        process.arguments = arguments
+        process.standardInput = stdin
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = try FileHandle(forWritingTo: stderrURL)
+        try process.run()
+    }
+
+    deinit {
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        process.waitUntilExit()
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    /// The ephemeral root from the startup banner (up to 10 s).
+    func waitForEphemeralRoot() -> String? {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(10)
+        while clock.now < deadline {
+            let text = stderr
+            if let range = text.range(of: "user dir "), let end = text.range(of: "/user (ephemeral)") {
+                return String(text[range.upperBound..<end.lowerBound])
+            }
+            usleep(10_000)
+        }
+        return nil
+    }
+
+    func waitForExit(seconds: Int) -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(seconds)
+        while process.isRunning, clock.now < deadline { usleep(10_000) }
+        return !process.isRunning
+    }
+}
+
 /// A plain `arm64` C program compiled into `executable` and started: it writes a
 /// readiness file, then sleeps until a signal (SIGTERM, unless `ignoringSIGTERM`) or 60 s.
 /// Compiled rather than a copied `/bin/sleep`, whose re-signed arm64e platform copy
@@ -361,19 +510,28 @@ final class SleeperProcess {
 
     let process = Process()
 
-    init(at executable: URL, ignoringSIGTERM: Bool = false) throws {
+    /// Compiles and ad-hoc signs the sleeper into `executable` without starting it.
+    static func compile(to executable: URL) throws {
         let fm = FileManager.default
-        let work = fm.temporaryDirectory.appending(path: "noema-sleeper-\(UUID().uuidString)")
+        let work = fm.temporaryDirectory.appending(path: "noema-sleeper-src-\(UUID().uuidString)")
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
         let sourceURL = work.appending(path: "sleeper.c")
-        try Self.source.write(to: sourceURL, atomically: true, encoding: .utf8)
+        try source.write(to: sourceURL, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? fm.removeItem(at: executable)
         let compiled = try Tool.run("/usr/bin/clang", ["-arch", "arm64", "-O1", "-o", executable.path, sourceURL.path])
         try #require(compiled.status == 0, "clang: \(compiled.stderr)")
         let signed = try Tool.run("/usr/bin/codesign", ["--force", "--sign", "-", executable.path])
         try #require(signed.status == 0, "codesign: \(signed.stderr)")
+    }
+
+    init(at executable: URL, ignoringSIGTERM: Bool = false) throws {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appending(path: "noema-sleeper-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+        try Self.compile(to: executable)
 
         let ready = work.appending(path: "ready")
         process.executableURL = executable

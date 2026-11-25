@@ -101,6 +101,31 @@ extension LibrimeSerializedTests {
             #expect(engine.currentState.candidates.first?.text == "你好")
         }
 
+        /// Cancelled before it starts: the boot guard is not touched and no deployer runs.
+        @Test func bootCancelledBeforeStartTouchesNothing() async throws {
+            let workspace = try EngineWorkspace()
+            let record = #"{"consecutiveFailures":1,"lastAttemptEpoch":1}"#
+            try workspace.writeSentinel(record)
+            let marker = workspace.root.appending(path: "deployer-ran")
+            let wrapper = try workspace.deployerScript("touch '\(marker.path)'\nexit 1")
+            let cancellation = DeployCancellation()
+            cancellation.cancel()
+            do {
+                let engine = try await RimeEngine.start(
+                    configuration: workspace.configuration(policy: .forceDeploy, deployerURL: wrapper), cancellation: cancellation)
+                engine.shutdown()
+                Issue.record("a cancelled boot must not return an engine")
+            } catch {
+                #expect(error == .engineUnavailable(reason: "boot cancelled"))
+            }
+            #expect(try String(contentsOf: workspace.sentinel, encoding: .utf8) == record, "the boot guard was touched")
+            #expect(!FileManager.default.fileExists(atPath: marker.path))
+            // The claim was released.
+            let engine = try await RimeEngine.start(configuration: workspace.configuration())
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+        }
+
         /// A Safe Mode decision returns at once and runs no deployer.
         @Test func crashLoopReturnsSafeModeWithoutDeploying() async throws {
             let workspace = try EngineWorkspace()
