@@ -36,18 +36,26 @@ let package = Package(
         .target(name: "NoemaIPC"),
         .target(name: "NoemaEngine", dependencies: ["CRime", "NoemaCore"]),
         .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine"]),
+        // Engine-independent IMKit shell logic: session coordination, NSEvent bridging, and
+        // the text-client and candidate-presenter seams. Zero TCC, like NoemaIME.
+        .target(name: "NoemaIMEShell", dependencies: ["NoemaCore"]),
         // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
-        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine"]),
+        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell"]),
         // Isolated Rime deployment subprocess, bundled beside NoemaIME in Contents/MacOS.
         // RimeEngine runs it; librime's deployer never runs in the input method process.
         .executableTarget(name: "noema-rime-deployer", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
         .testTarget(name: "NoemaCoreTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaText"]),
         // Pure engine logic (key mapping, boot guard); never initializes librime.
         .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine"]),
+        // NSEvent bridging and other shell logic that needs no engine.
+        .testTarget(name: "NoemaIMEShellTests", dependencies: ["NoemaCore", "NoemaIMEShell"]),
         // Every test that initializes librime: one top-level serialized suite.
-        // Depends on noema-rime-deployer so every `swift test` builds the deployer that
-        // RimeEngine spawns from the build directory.
-        .testTarget(name: "CRimeTests", dependencies: ["CRime", "NoemaCore", "NoemaEngine", "noema-rime-deployer"]),
+        // Depends on noema-rime-deployer, noema-cli, and NoemaIME so every `swift test` builds the
+        // deployer RimeEngine spawns and the executables the end-to-end tests run.
+        .testTarget(
+            name: "CRimeTests",
+            dependencies: ["CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "noema-rime-deployer", "noema-cli", "NoemaIME"]
+        ),
     ],
     // Swift 6 language mode: complete strict-concurrency checking for every Swift target.
     swiftLanguageModes: [.v6]

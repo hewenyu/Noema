@@ -11,6 +11,9 @@ let usage = """
     commands:
       version      print the Noema version
       check-rime   print the linked librime version and required module status
+      install      install NoemaIME.app into ~/Library/Input Methods (install --help)
+      reload       stop running NoemaIME processes so macOS relaunches them (reload --help)
+      repl         type into a real Rime engine from stdin (repl --help)
     """
 
 func printError(_ message: String) {
@@ -43,6 +46,12 @@ case "version":
     exit(0)
 case "check-rime":
     exit(checkRime())
+case "install":
+    exit(InstallCommand.run(Array(arguments.dropFirst())))
+case "reload":
+    exit(ReloadCommand.run(Array(arguments.dropFirst())))
+case "repl":
+    ReplCommand.run(Array(arguments.dropFirst()))
 case "-h", "--help", "help":
     print(usage)
     exit(0)

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Mechanical boundary checks for AGENTS.md standing rules 1, 5, and 6.
 #
-#   1. Sources/NoemaIME imports no networking, audio/speech, AX, event-tap, pasteboard,
-#      or screen-capture frameworks and calls none of those APIs (thin shell, zero TCC).
-#      Carbon/HIToolbox and InputMethodKit stay allowed: IsSecureEventInputEnabled()
-#      lives in Carbon.
+#   1. Sources/NoemaIME and Sources/NoemaIMEShell (the IMKit shell and its library) import
+#      no networking, audio/speech, AX, event-tap, pasteboard, or screen-capture frameworks
+#      and call none of those APIs (thin shell, zero TCC). Each directory must exist and
+#      hold source files. Carbon/HIToolbox and InputMethodKit stay allowed:
+#      IsSecureEventInputEnabled() lives in Carbon.
 #   2. No .xcassets/.xib/.storyboard/.xcodeproj/.xcworkspace anywhere, no `import XCTest`,
 #      and no xcodebuild invocation in Sources, Tests, Resources, scripts, .kiln, or
 #      Package.swift (Markdown prose is skipped). Pure CommandLineTools build.
@@ -292,17 +293,20 @@ report_hits() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. NoemaIME stays a thin IMKit shell
+# 1. NoemaIME and NoemaIMEShell stay a thin IMKit shell
 # ---------------------------------------------------------------------------
 
-if [[ ! -d Sources/NoemaIME ]]; then
-  bad "Sources/NoemaIME is missing"
-elif [[ -z "$(find Sources/NoemaIME -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print -quit)" ]]; then
-  bad "Sources/NoemaIME has no source files to scan"
-else
-  report_hits "NoemaIME must not use networking/audio/AX/pasteboard APIs (AGENTS.md rule 1)" \
-    node -e "${LEXER}" -- ime < <(find Sources/NoemaIME -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print0)
-fi
+IME_SOURCE_DIRS=(Sources/NoemaIME Sources/NoemaIMEShell)
+for dir in "${IME_SOURCE_DIRS[@]}"; do
+  if [[ ! -d "${dir}" || -L "${dir}" ]]; then
+    bad "${dir} is missing or a symlink"
+  elif [[ -z "$(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print -quit)" ]]; then
+    bad "${dir} has no source files to scan"
+  else
+    report_hits "${dir} must not use networking/audio/AX/pasteboard APIs (AGENTS.md rule 1)" \
+      node -e "${LEXER}" -- ime < <(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print0)
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # 2. Pure CommandLineTools: no Xcode-only artifacts, XCTest, or xcodebuild
@@ -348,4 +352,4 @@ if (( failures > 0 )); then
   printf '[check-imports] %d violation(s)\n' "${failures}" >&2
   exit 1
 fi
-printf '[check-imports] ok: NoemaIME imports, CLT-only artifacts, CLAUDE.md aliases, Kiln boundary\n'
+printf '[check-imports] ok: NoemaIME/NoemaIMEShell imports, CLT-only artifacts, CLAUDE.md aliases, Kiln boundary\n'
