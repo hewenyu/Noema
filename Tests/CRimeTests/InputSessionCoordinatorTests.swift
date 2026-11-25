@@ -409,6 +409,143 @@ extension LibrimeSerializedTests {
             #expect(!harness.coordinator.handleNSEvent(mouse, token: token, client: client))
             #expect(client.calls.count == count && harness.engine.currentState.preedit == "ni")
         }
+
+        // MARK: Inline preedit disabled (panel draws the preedit)
+
+        /// A client in `inlinePreeditDisabledBundleIDs` never receives marked text: the
+        /// panel gets every state with `rendersPreeditInPanel`, and commits still insert.
+        @Test func inlinePreeditDisabledClientGetsNoMarkedText() throws {
+            let harness = try Harness(inlinePreeditDisabledBundleIDs: [RecordingClient.bundleID])
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            for key in "nihao" { #expect(harness.coordinator.handleKey(.text(key), token: token, client: client)) }
+            #expect(client.calls.isEmpty && !harness.coordinator.hasMarkedText)
+            #expect(harness.presenter.lastState?.preedit == "ni hao")
+            #expect(harness.presenter.lastOptions == CandidatePresentationOptions(rendersPreeditInPanel: true, sessionToken: token))
+            #expect(harness.coordinator.handleKey(.key(VirtualKeyCode.space, " "), token: token, client: client))
+            #expect(client.calls == [.insert("你好")] && harness.presenter.lastState == nil)
+
+            // Escape cancels without a clear: the client never had marked text.
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            #expect(harness.coordinator.handleKey(.key(VirtualKeyCode.escape, "\u{1B}"), token: token, client: client))
+            #expect(client.calls == [.insert("你好")] && !harness.engine.currentState.isComposing)
+
+            // Other clients keep inline marked text.
+            let other = RecordingClient(bundleIdentifier: "dev.noema.tests.inline")
+            #expect(harness.coordinator.handleKey(.text("n"), token: UUID(), client: other))
+            #expect(other.calls == [.mark("n", caret: 1, selection: 0..<1)])
+            #expect(harness.presenter.lastOptions?.rendersPreeditInPanel == false)
+        }
+
+        /// Secure input turning on for the *same* session drops a composition that has no
+        /// marked text (panel-only preedit): nothing may survive into the secure field.
+        @Test func secureInputDropsPanelOnlyCompositionOfTheSameSession() throws {
+            var secure = false
+            let harness = try Harness(
+                isSecureInputEnabled: { secure }, inlinePreeditDisabledBundleIDs: [RecordingClient.bundleID])
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            harness.coordinator.activate(token: token, client: client)
+            for key in "ni" { #expect(harness.coordinator.handleKey(.text(key), token: token, client: client)) }
+            #expect(harness.engine.currentState.isComposing && !harness.coordinator.hasMarkedText)
+
+            secure = true
+            #expect(!harness.coordinator.handleKey(.text("x"), token: token, client: client))
+            #expect(!harness.engine.currentState.isComposing, "the stale composition is dropped")
+            #expect(client.calls.isEmpty && harness.presenter.lastState == nil)
+
+            secure = false
+            #expect(harness.coordinator.handleKey(.text("h"), token: token, client: client))
+            #expect(harness.presenter.lastState?.preedit == "h", "no stale ni prefix")
+        }
+
+        // MARK: Panel clicks
+
+        @Test func clickingACandidateCommitsIt() throws {
+            let harness = try Harness()
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            for key in "nihao" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let shown = try #require(harness.presenter.lastState)
+            client.calls.removeAll()
+            let hides = harness.presenter.hideCount
+            #expect(harness.coordinator.selectCandidate(at: 0, expectedGenerationID: shown.generationID))
+            #expect(client.calls == [.insert(shown.candidates[0].text)])
+            #expect(!harness.engine.currentState.isComposing && !harness.coordinator.hasMarkedText)
+            #expect(harness.presenter.hideCount == hides + 1)
+            #expect(!harness.coordinator.selectCandidate(at: 0), "nothing left to select")
+        }
+
+        /// Clicking the first candidate of a partial segment keeps composing the rest:
+        /// marked text and the panel both refresh, exactly as the number key would.
+        @Test func clickingAPartialCandidateRefreshesMarkedTextAndPanel() throws {
+            let harness = try Harness()
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            for key in "nihao" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            for code in [VirtualKeyCode.leftArrow, VirtualKeyCode.leftArrow, VirtualKeyCode.rightArrow] {
+                _ = harness.coordinator.handleKey(.key(code, "", .function), token: token, client: client)
+            }
+            let shown = try #require(harness.presenter.lastState)
+            client.calls.removeAll()
+            #expect(harness.coordinator.selectCandidate(at: 0, expectedGenerationID: shown.generationID))
+            #expect(client.calls == [.mark("你hao", caret: 4, selection: 1..<4)])
+            #expect(harness.coordinator.hasMarkedText)
+            let refreshed = try #require(harness.presenter.lastState)
+            #expect(refreshed.preedit == "你hao" && refreshed.generationID > shown.generationID)
+            #expect(refreshed.candidates.first?.text == "好")
+        }
+
+        /// A click on a panel the engine has moved past, under secure input, or with an
+        /// index off the page changes nothing.
+        @Test func staleSecureAndOffPageClicksAreIgnored() throws {
+            var secure = false
+            let harness = try Harness(isSecureInputEnabled: { secure })
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            #expect(!harness.coordinator.selectCandidate(at: 0), "no owner yet")
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let stale = try #require(harness.presenter.lastState).generationID
+            _ = harness.coordinator.handleKey(.text("h"), token: token, client: client)
+            let preedit = harness.engine.currentState.preedit
+            client.calls.removeAll()
+            #expect(!harness.coordinator.selectCandidate(at: 0, expectedGenerationID: stale))
+            #expect(!harness.coordinator.changePage(backward: false, expectedGenerationID: stale))
+            #expect(client.calls.isEmpty && harness.engine.currentState.preedit == preedit)
+
+            let current = harness.engine.currentState.generationID
+            #expect(!harness.coordinator.selectCandidate(at: 99, expectedGenerationID: current))
+            #expect(client.calls.isEmpty && harness.engine.currentState.isComposing)
+
+            secure = true
+            #expect(!harness.coordinator.selectCandidate(at: 0, expectedGenerationID: current))
+            #expect(!harness.coordinator.changePage(backward: false, expectedGenerationID: current))
+            #expect(client.calls.isEmpty && harness.engine.currentState.preedit == preedit)
+            #expect(harness.engine.currentState.generationID == current, "the engine never saw the click")
+        }
+
+        @Test func pagingFromThePanelRefreshesCandidates() throws {
+            let harness = try Harness()
+            defer { harness.shutdown() }
+            let client = RecordingClient()
+            let token = UUID()
+            #expect(!harness.coordinator.changePage(backward: false), "nothing to page")
+            for key in "shi" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let first = try #require(harness.presenter.lastState)
+            #expect(first.pageIndex == 0 && !first.isLastPage)
+            client.calls.removeAll()
+            #expect(harness.coordinator.changePage(backward: false, expectedGenerationID: first.generationID))
+            let second = try #require(harness.presenter.lastState)
+            #expect(second.pageIndex == 1 && second.candidates != first.candidates)
+            #expect(client.calls == [.mark("shi", caret: 3, selection: 0..<3)])
+            #expect(harness.coordinator.changePage(backward: true, expectedGenerationID: second.generationID))
+            #expect(harness.presenter.lastState?.pageIndex == 0)
+        }
     }
 }
 
@@ -422,8 +559,14 @@ final class RecordingClient: TextInputClient {
         case clear
     }
 
+    static let bundleID = "dev.noema.tests.client"
+
     var calls: [Call] = []
-    var clientBundleIdentifier: String? { "dev.noema.tests.client" }
+    let clientBundleIdentifier: String?
+
+    init(bundleIdentifier: String? = RecordingClient.bundleID) {
+        clientBundleIdentifier = bundleIdentifier
+    }
 
     func insertText(_ text: String) { calls.append(.insert(text)) }
 
@@ -437,12 +580,19 @@ final class RecordingClient: TextInputClient {
 @MainActor
 final class RecordingPresenter: CandidatePresenting {
     var lastState: CompositionState?
+    var lastOptions: CandidatePresentationOptions?
+    var updateCount = 0
     var hideCount = 0
 
-    func update(state: CompositionState, client: any TextInputClient) { lastState = state }
+    func update(state: CompositionState, client: any TextInputClient, options: CandidatePresentationOptions) {
+        lastState = state
+        lastOptions = options
+        updateCount += 1
+    }
     func hide() {
         hideCount += 1
         lastState = nil
+        lastOptions = nil
     }
 }
 
@@ -455,7 +605,11 @@ final class Harness {
     let coordinator: InputSessionCoordinator
     private var isUp = true
 
-    init(withoutPunctuator: Bool = false, isSecureInputEnabled: @escaping @MainActor () -> Bool = { false }) throws {
+    init(
+        withoutPunctuator: Bool = false,
+        isSecureInputEnabled: @escaping @MainActor () -> Bool = { false },
+        inlinePreeditDisabledBundleIDs: Set<String> = []
+    ) throws {
         if withoutPunctuator {
             workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
             try workspace.replaceInSharedFile("noema_pinyin.schema.yaml", "    - punctuator\n", with: "")
@@ -466,7 +620,8 @@ final class Harness {
         try #require(!engine.isSafeMode)
         self.engine = engine
         coordinator = InputSessionCoordinator(
-            engineProvider: { [engine] in engine }, candidatePresenter: presenter, isSecureInputEnabled: isSecureInputEnabled)
+            engineProvider: { [engine] in engine }, candidatePresenter: presenter, isSecureInputEnabled: isSecureInputEnabled,
+            inlinePreeditDisabledBundleIDs: inlinePreeditDisabledBundleIDs)
     }
 
     func shutdown() {

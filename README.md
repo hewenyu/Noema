@@ -3,8 +3,8 @@
 Noema 是一个自用的原生中文输入法，基于 `librime`，由轻量的 IMKit 输入法壳与伴生 Agent App 组成。
 
 - 目标平台：macOS 26+，Apple Silicon（arm64）。
-- 当前状态：SwiftPM 多模块骨架（`NoemaCore`、`NoemaEngine`、`NoemaIMEShell`、`NoemaText`、`NoemaIPC`、`noema-cli`、`NoemaIME`、`noema-rime-deployer`），链接从源码构建的自包含 `librime.1.dylib`（含 `librime-lua`、`librime-octagram`）。`NoemaEngine` 的 `RimeEngine` 通过 `TypingEngine` 协议提供无界面的拼音输入（内置最小方案 `Resources/rime-default`、崩溃循环 Safe Mode、单写者目录锁），方案编译只在 `noema-rime-deployer` 子进程的隔离 staging 目录中进行，经 `DeployManifest`（输入与产物 SHA256 清单）校验后原子切换 `build/`，失败时旧 `build/` 不变；均由真实 librime 集成测试覆盖。`NoemaIME.app` 已是可用的 IMKit 薄壳：`NoemaInputController` 把按键交给 `RimeEngine`，以预编辑（marked text）显示拼音、上屏提交文本；安全输入、Safe Mode、ASCII 模式、引擎启动中（部署在主线程之外进行）与引擎不认的键一律直通，绝不吞键。候选窗尚未接入（Issue #6），也尚无伴生 App。`noema-cli install|reload|repl` 负责安装、重载与命令行试打。
-- 架构地图：[docs/architecture.md](docs/architecture.md)。
+- 当前状态：SwiftPM 多模块骨架（`NoemaCore`、`NoemaEngine`、`NoemaIMEShell`、`NoemaUI`、`NoemaText`、`NoemaIPC`、`noema-cli`、`NoemaIME`、`noema-rime-deployer`），链接从源码构建的自包含 `librime.1.dylib`（含 `librime-lua`、`librime-octagram`）。`NoemaEngine` 的 `RimeEngine` 通过 `TypingEngine` 协议提供无界面的拼音输入（内置最小方案 `Resources/rime-default`、崩溃循环 Safe Mode、单写者目录锁），方案编译只在 `noema-rime-deployer` 子进程的隔离 staging 目录中进行，经 `DeployManifest`（输入与产物 SHA256 清单）校验后原子切换 `build/`，失败时旧 `build/` 不变；均由真实 librime 集成测试覆盖。`NoemaIME.app` 已是可用的 IMKit 薄壳：`NoemaInputController` 把按键交给 `RimeEngine`，以预编辑（marked text）显示拼音、上屏提交文本；安全输入、Safe Mode、ASCII 模式、引擎启动中（部署在主线程之外进行）与引擎不认的键一律直通，绝不吞键。候选窗（`NoemaUI`）用 CoreText 排版、`NSGlassEffectView` 作背景，不抢焦点、不闪烁，跟随亮暗色，在光标旁放置（光标位置无效时用同一窗口上次的有效位置），支持点击选词、展开与滚轮翻页；可按应用关闭内联预编辑，改由候选窗绘制。尚无伴生 App。`noema-cli install|reload|repl` 负责安装、重载与命令行试打。
+- 架构地图：[docs/architecture.md](docs/architecture.md)；真机冒烟清单：[docs/runbooks/smoke-checklist.md](docs/runbooks/smoke-checklist.md)。
 
 ## 构建与测试
 

@@ -10,6 +10,7 @@ This file defines where each kind of fact lives and how documentation is written
 | `docs/AGENTS.md` | This standard: tiers, writing rules, budgets | Repo-wide rules the root already carries |
 | [`docs/architecture.md`](architecture.md) | Map of components, module graph, build and CI pipeline, seams | Type definitions, per-module detail, decision rationale |
 | `README.md` | What Noema is, its current state, and the commands to build and test it | Rationale, rules restated from `AGENTS.md` |
+| `docs/runbooks/` | Manual procedures run on a real machine, as checklists (e.g. [smoke-checklist.md](runbooks/smoke-checklist.md)) | Automated checks, rationale |
 | Script headers | Each script's usage, options, and exit codes (`scripts/**`) | Design rationale |
 | `.agents/notes/` | Decision rationale and rejected alternatives | Current-state reference |
 

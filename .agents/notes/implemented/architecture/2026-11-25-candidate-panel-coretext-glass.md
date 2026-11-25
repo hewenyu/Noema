@@ -1,0 +1,35 @@
+# Agent Note: CoreText candidate panel on NSGlassEffectView with caret fault tolerance, not SwiftUI or per-keystroke resizing
+
+Status: implemented
+
+## Problem
+
+M1 需要一个真正可用的候选窗（Issue #6）：每次按键都要在 2 ms 预算内刷新、不闪烁、不抢焦点，跟随亮暗色外观，并能在 Chrome、VS Code、Spotlight 等客户端里放在光标旁。IMKit 客户端报告的光标矩形并不可靠：Chrome/Electron 常返回 `.zero`，竖直光标宽度为 0，右到左文本给出负宽度，副屏坐标为负；同一应用的多个窗口光标互不相关。输入法进程必须保持零 TCC（AGENTS.md 规则 1），不能用 AX 读光标位置。
+
+## Decision
+
+- **模块**：新 `NoemaUI` 库（依赖 `NoemaCore`、`NoemaIMEShell`）实现 `CandidatePresenting`，受 `check-imports.sh` 同样的零 TCC 扫描；只用 `AppKit`、`CoreText`、`QuartzCore`、`CoreGraphics`，不用 `ApplicationServices`。
+- **布局与绘制**：`CandidateLayoutEngine` 用 CoreText（`CTFontCreateUIFontForLanguage(.system, …, "zh-Hans")`，系统级联覆盖 Apple Color Emoji 与拉丁文）测量标签、候选、注释与浮动预编辑（`CTLineGetOffsetForStringIndex` 定位光标），产出纯值 `CandidatePanelLayout`（`Sendable`、`Hashable`，不含 `CTLine`/`CTFont`/`CGColor`），可无头测试。单行折叠时圆角为高度一半（胶囊）；展开为每行一个候选的列表，或有浮动预编辑时，圆角固定 14 pt。过宽时先丢注释，再按水位线截断候选并加"…"，截断按字素簇进行，不拆 ZWJ 表情。
+- **视图**：`CandidatePanelView` 与其子视图全部 `isFlipped`，布局、高亮 `CAShapeLayer`、CoreText 绘制与点击命中共用自上而下坐标；每次 `CTLineDraw` 前围绕基线反转文本矩阵。蓝色胶囊高亮在文本视图下方的独立宿主视图里（图层自身的 sublayer 会盖住其 `draw(_:)` 内容），关闭隐式动画更新。动态颜色只在 `effectiveAppearance.performAsCurrentDrawingAppearance` 内解析，`draw(_:)` 与 `viewDidChangeEffectiveAppearance()` 都会解析。
+- **零闪烁**：`WidthHysteresis` 把宽度向上量化到 32 pt 档位，同一组合与同一模式内只增不减，`hide()` 与模式切换时重置；展开按钮钉在量化宽度的尾部。控制器复用一个 `NSPanel`，只在隐藏 → 可见时 `orderFrontRegardless()`，frame 变化时才 `setFrame`，图层修改都在关闭动作的 `CATransaction` 里，`animationBehavior = .none`。
+- **窗口**：`NonActivatingCandidatePanel` 的 `canBecomeKey`/`canBecomeMain` 为 false，`.nonactivatingPanel`；层级为客户端窗口层级 + 1，至少 `.popUpMenu`，至多屏保层级，因此浮在 Spotlight/Raycast 之上。背景默认 `NSGlassEffectView`（无窗口阴影），`.visualEffect` 模式用 `NSVisualEffectView`（`.hudWindow`，有阴影）。
+- **光标容错**：`CaretPositionResolver` 拒绝 `nil`、非有限值与恰为 `.zero` 的矩形，先 `standardized`，用至少 1×1 并外扩 2 pt 的探针判断是否在某块屏上，高度为 0 时补 `fallbackLineHeight`。有效矩形按 `uniqueClientIdentifier`（缺省时用会话令牌）缓存，最多 32 个、LRU 淘汰；当前矩形无效时用同一客户端的缓存，两者都没有才用 `NSEvent.mouseLocation`。默认放在光标下方，越过可见区底部时翻到上方，再夹到可见区内；水平夹取保证窄屏上 `lo <= hi`。查询锚定在标记文本下标 0，光标在预编辑内移动时窗口不动。
+- **会话协调**：`InputSessionCoordinator` 接受 `inlinePreeditDisabledBundleIDs`（`NoemaIME` 从 IME 包的 `InlinePreeditDisabledBundleIDs` 默认值读取）：这些客户端不收标记文本，由面板绘制预编辑。安全输入在同一会话下也会清掉没有标记文本的组合。面板点击经 `selectCandidate(at:expectedGenerationID:)`、滚动经 `changePage(backward:expectedGenerationID:)` 进入与按键相同的 `applyResult`，代次不符（面板已过期）或安全输入时什么都不做。`EngineHost` 只在 IMKit 首次使用协调器时创建面板，`--version`、`--check-rime` 与提前的 `shutdown()` 不会创建窗口。
+
+## Alternatives considered
+
+- **SwiftUI `NSHostingView` 候选窗。** Rejected：每次按键要经过 SwiftUI 的 diff、布局与隐式动画，难以控制在 2 ms 内，也难以保证不闪；文本测量不可在无窗口的测试里复现。CoreText 加 `CAShapeLayer` 让测量成为可单测的纯函数，绘制路径完全可控。
+- **纯色或手绘半透明图层作为背景。** Rejected：与 macOS 26 的 Liquid Glass 系统外观不一致，亮暗色与壁纸取色都要自己模拟。`NSGlassEffectView` 是系统材质；`NSVisualEffectView` 保留为同一布局的后备。
+- **每次按键按内容精确调整窗口宽度。** Rejected：连续输入 `nihaoshijie` 时宽度逐键抖动，按钮跟着跳；量化档位加单调增长让大多数按键不改 frame，`setFrame` 次数显著减少。
+- **自下而上的坐标（不翻转视图），手工换算 y。** Rejected：布局、命中测试与图层路径要各自做 `height - y` 换算，容易错位一像素且难测；翻转视图只需在 `CTLineDraw` 周围局部反转文本矩阵，彩色表情也能正确绘制。
+- **按 `bundleIdentifier` 缓存光标位置。** Rejected：Chrome、VS Code 的多个窗口共享一个 bundle ID，一个窗口的光标会把另一个窗口的候选窗放错位置。`uniqueClientIdentifier` 区分窗口与文档。
+- **用 `screen.frame.intersects(caretRect)` 判断光标是否在屏上。** Rejected：CoreGraphics 把宽度为 0 的矩形视为空，合法的竖直光标会被判无效，候选窗退回鼠标位置；1×1 探针加 2 pt 容差在屏幕边缘也成立。
+- **用 AX（`AXUIElement`）读取光标位置。** Rejected：需要辅助功能授权，违反零 TCC（规则 1），`check-imports.sh` 也会拒绝。
+- **把高亮画在 `draw(_:)` 里。** Rejected：高亮随选择移动时整块重绘；独立 `CAShapeLayer` 只改路径，并可关闭隐式动画，避免从原点滑入的闪烁。
+
+## Consequences
+
+- `NoemaUITests` 用真实 CoreText 字体无头测试布局、迟滞与光标放置；`CRimeTests` 用真实 `RimeEngine` 测试面板点击、翻页、浮动预编辑与同会话安全输入。窗口、外观切换与各客户端的光标行为只能在真机上验证，见 [smoke checklist](../../../../docs/runbooks/smoke-checklist.md)。
+- IMKit 只在有标记文本时因点击外部而调用 `commitComposition`；关闭内联预编辑的客户端里，点击外部可能保留组合，直到下一次按键或焦点变化。
+- `NSGlassEffectView` 要求 macOS 26，与平台下限一致；`.visualEffect` 只在代码中切换，尚无用户设置。
+- 展开列表只显示当前页（`page_size`）；翻页靠滚轮或 `-`/`=` 键。
