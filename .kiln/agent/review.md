@@ -18,7 +18,7 @@ Run these from the checkout and report each result with its exit status:
 ```sh
 scripts/governance/check.sh
 scripts/dev/test.sh
-scripts/build/bundle.sh --sign - --out dist && scripts/build/verify-bundle.sh dist/NoemaIME.app
+scripts/build/bundle.sh --sign - --out dist && scripts/build/verify-bundle.sh dist
 ```
 
 `scripts/dev/test.sh` and `scripts/build/bundle.sh` need `vendor-out/librime`; build it with `scripts/build/librime.sh` when it is missing. Never run bare `swift test`, never sign with a certificate, and never pass `--require-signed`.

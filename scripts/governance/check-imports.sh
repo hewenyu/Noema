@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Mechanical boundary checks for AGENTS.md standing rules 1, 5, and 6.
 #
-#   1. Sources/NoemaIME, Sources/NoemaIMEShell, and Sources/NoemaUI (the IMKit shell, its
-#      library, and the candidate panel) import no networking, audio/speech, AX, event-tap,
-#      pasteboard, or screen-capture frameworks and call none of those APIs (thin shell,
-#      zero TCC). Each directory must exist and
+#   1. Sources/NoemaIME, Sources/NoemaIMEShell, Sources/NoemaUI, and Sources/NoemaIPC (the
+#      IMKit shell, its library, the candidate panel, and the IPC library it links) import
+#      no networking, audio/speech, AX, event-tap, pasteboard, or screen-capture frameworks
+#      and call none of those APIs (thin shell, zero TCC). Each directory must exist and
 #      hold source files. Carbon/HIToolbox and InputMethodKit stay allowed:
 #      IsSecureEventInputEnabled() lives in Carbon.
 #   2. No .xcassets/.xib/.storyboard/.xcodeproj/.xcworkspace anywhere, no `import XCTest`,
@@ -294,10 +294,10 @@ report_hits() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. NoemaIME, NoemaIMEShell, and NoemaUI stay a thin IMKit shell
+# 1. NoemaIME, NoemaIMEShell, NoemaUI, and NoemaIPC stay a thin IMKit shell
 # ---------------------------------------------------------------------------
 
-IME_SOURCE_DIRS=(Sources/NoemaIME Sources/NoemaIMEShell Sources/NoemaUI)
+IME_SOURCE_DIRS=(Sources/NoemaIME Sources/NoemaIMEShell Sources/NoemaUI Sources/NoemaIPC)
 for dir in "${IME_SOURCE_DIRS[@]}"; do
   if [[ ! -d "${dir}" || -L "${dir}" ]]; then
     bad "${dir} is missing or a symlink"
@@ -353,4 +353,4 @@ if (( failures > 0 )); then
   printf '[check-imports] %d violation(s)\n' "${failures}" >&2
   exit 1
 fi
-printf '[check-imports] ok: NoemaIME/NoemaIMEShell/NoemaUI imports, CLT-only artifacts, CLAUDE.md aliases, Kiln boundary\n'
+printf '[check-imports] ok: NoemaIME/NoemaIMEShell/NoemaUI/NoemaIPC imports, CLT-only artifacts, CLAUDE.md aliases, Kiln boundary\n'
