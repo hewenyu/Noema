@@ -131,6 +131,7 @@ public struct UserDBGuardian {
         case exportFailed(String)
         case importFailed(String)
         case store(LearningStoreError)
+        case cancelled
     }
 
     public struct SnapshotMetadata: Codable, Sendable, Hashable {
@@ -159,6 +160,9 @@ public struct UserDBGuardian {
     public let codeFormat: UserDictCodeFormat
 
     public static let quarantineDirectoryName = ".quarantine"
+    /// Entries imported per `levers.importUserDict` call so large projections can stop
+    /// promptly when a boot is cancelled without advancing the watermark halfway.
+    public static let importBatchSize = 2_000
 
     public init(
         schemaSet: SchemaSetID, userDataDir: URL, snapshotsDir: URL, levers: any UserDictLevers,
@@ -203,16 +207,22 @@ public struct UserDBGuardian {
     /// Imports the store entries changed after the watermark of `(schemaSet, dictName)` and
     /// advances it; other userdbs of the set keep their own. A watermark ahead of the store
     /// (a replaced store) or of another `codeFormat` replays everything. Returns how many
-    /// entries were imported.
+    /// entries were imported. When `isCancelled()` becomes true mid-projection, throws
+    /// `.cancelled` without advancing the watermark so the next run finishes cleanly.
     @discardableResult
-    public func project(_ dictName: String, store: LearningStore) throws(Failure) -> Int {
+    public func project(
+        _ dictName: String, store: LearningStore, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> Int {
         try requirePlainName(dictName)
+        if isCancelled() { throw .cancelled }
         let latest = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
         let mark = try storeCall { () throws(LearningStoreError) in try store.watermark(for: schemaSet, dictName: dictName) }
         var since = mark?.codeFormat == codeFormat.rawValue ? mark?.lastRevision ?? 0 : 0
         if since > latest { since = 0 }
         let entries = try storeCall { () throws(LearningStoreError) in try store.entriesSince(revision: since) }
-        let imported = entries.isEmpty ? 0 : try importEntries(entries, into: dictName)
+        if isCancelled() { throw .cancelled }
+        let imported = entries.isEmpty ? 0 : try importEntries(entries, into: dictName, isCancelled: isCancelled)
+        if isCancelled() { throw .cancelled }
         try setWatermark(dictName, store: store, lastRevision: latest)
         return imported
     }
@@ -220,14 +230,25 @@ public struct UserDBGuardian {
     // MARK: Recovery
 
     /// Quarantines `<dict>.userdb` (when present) and rebuilds it: verified snapshot plus
-    /// replay, else every store entry. Throws when the rebuilt userdb still cannot export.
-    public func recover(_ dictName: String, store: LearningStore?) throws(Failure) -> RecoveryReport {
+    /// replay, else every store entry. Throws when the rebuilt userdb still cannot export,
+    /// or `.cancelled` when `isCancelled()` flips true (leaving watermark and snapshot
+    /// untouched so the next run completes the recovery).
+    public func recover(
+        _ dictName: String, store: LearningStore?, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> RecoveryReport {
         try requirePlainName(dictName)
+        if isCancelled() { throw .cancelled }
         var quarantined = try quarantine(dictName)
+        // Drop any stale watermark before touching the rebuilt userdb: if recovery is
+        // cancelled or crashes after importing a snapshot or partial batch, the next boot
+        // must replay every store entry instead of trusting the pre-corruption watermark.
+        if let store {
+            try storeCall { () throws(LearningStoreError) in try store.resetWatermark(for: schemaSet, dictName: dictName) }
+        }
         var method = RecoveryMethod.fullRebuild
         var imported = 0
         var revision: Int64 = 0
-        if let (snapshot, metadata) = Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir) {
+        if !isCancelled(), let (snapshot, metadata) = Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir) {
             let count = levers.importUserDict(dictName, from: snapshot)
             if count >= 0 {
                 method = .snapshotAndReplay
@@ -239,46 +260,55 @@ public struct UserDBGuardian {
                 quarantined = quarantined ?? again
             }
         }
+        if isCancelled() { throw .cancelled }
         if let store {
             let latest = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
             if revision > latest { revision = 0 }
             let entries = try storeCall { () throws(LearningStoreError) in
                 method == .snapshotAndReplay ? try store.entriesSince(revision: revision) : try store.allEntries()
             }
-            if !entries.isEmpty { imported += try importEntries(entries, into: dictName) }
+            if isCancelled() { throw .cancelled }
+            if !entries.isEmpty { imported += try importEntries(entries, into: dictName, isCancelled: isCancelled) }
+            if isCancelled() { throw .cancelled }
             try setWatermark(dictName, store: store, lastRevision: latest)
             revision = latest
         }
+        if isCancelled() { throw .cancelled }
         let exported = try withProbe { probe in levers.exportUserDict(dictName, to: probe) }
         guard exported >= 0 else { throw .exportFailed("\(dictName) still fails to export after recovery") }
-        _ = try? writeSnapshot(dictName, learningRevision: revision)
+        if !isCancelled() { _ = try? writeSnapshot(dictName, learningRevision: revision) }
         return RecoveryReport(method: method, quarantined: quarantined, imported: imported, exported: exported)
     }
 
     /// Health check, then the cheapest fix: incremental projection and a fresh snapshot when
     /// healthy; a full re-projection when diverged; the recovery ladder when corrupt; a
     /// rebuild from the store when missing and the store has entries.
-    public func maintain(_ dictName: String, store: LearningStore?) throws(Failure) -> MaintenanceOutcome {
+    public func maintain(
+        _ dictName: String, store: LearningStore?, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> MaintenanceOutcome {
+        if isCancelled() { throw .cancelled }
         switch try checkHealth(dictName, store: store) {
         case .healthy:
             guard let store else { return .healthy(projected: 0) }
-            let projected = try project(dictName, store: store)
+            let projected = try project(dictName, store: store, isCancelled: isCancelled)
+            if isCancelled() { throw .cancelled }
             let revision = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
             if projected > 0 || Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir)?.1.codeFormat != codeFormat {
-                _ = try? writeSnapshot(dictName, learningRevision: revision)
+                if !isCancelled() { _ = try? writeSnapshot(dictName, learningRevision: revision) }
             }
             return .healthy(projected: projected)
         case .diverged:
             guard let store else { return .nothingToDo }
+            if isCancelled() { throw .cancelled }
             try storeCall { () throws(LearningStoreError) in try store.resetWatermark(for: schemaSet, dictName: dictName) }
-            return .reprojected(imported: try project(dictName, store: store))
+            return .reprojected(imported: try project(dictName, store: store, isCancelled: isCancelled))
         case .corrupted:
-            return .recovered(try recover(dictName, store: store))
+            return .recovered(try recover(dictName, store: store, isCancelled: isCancelled))
         case .missing:
             guard let store, try storeCall({ () throws(LearningStoreError) in try store.stats() }).entryCount > 0 else {
                 return .nothingToDo
             }
-            return .recovered(try recover(dictName, store: store))
+            return .recovered(try recover(dictName, store: store, isCancelled: isCancelled))
         }
     }
 
@@ -361,17 +391,28 @@ public struct UserDBGuardian {
 
     // MARK: Helpers
 
-    private func importEntries(_ entries: [LearnedEntry], into dictName: String) throws(Failure) -> Int {
-        let count = try withProbe { probe throws(Failure) -> Int in
-            do {
-                try FileSafety.writeAtomically(Self.importTSV(entries, codeFormat: codeFormat), to: probe)
-            } catch {
-                throw .io("writing the import of \(dictName): \(error)")
+    private func importEntries(
+        _ entries: [LearnedEntry], into dictName: String, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> Int {
+        var total = 0
+        var start = 0
+        while start < entries.count {
+            if isCancelled() { throw .cancelled }
+            let end = min(start + Self.importBatchSize, entries.count)
+            let chunk = Array(entries[start..<end])
+            let count = try withProbe { probe throws(Failure) -> Int in
+                do {
+                    try FileSafety.writeAtomically(Self.importTSV(chunk, codeFormat: codeFormat), to: probe)
+                } catch {
+                    throw .io("writing the import of \(dictName): \(error)")
+                }
+                return levers.importUserDict(dictName, from: probe)
             }
-            return levers.importUserDict(dictName, from: probe)
+            guard count >= 0 else { throw .importFailed(dictName) }
+            total += count
+            start = end
         }
-        guard count >= 0 else { throw .importFailed(dictName) }
-        return count
+        return total
     }
 
     /// Runs `body` with a fresh `0600` file in a private temporary directory under

@@ -1553,6 +1553,94 @@ extension LibrimeSerializedTests {
             next.shutdown()
         }
 
+        /// Codex PR #21 round 10: normal cancellations (`cancelAndFinishCleanup`) during large
+        /// boot userdb maintenance must never leave `.noema-boot-guard` armed and trip
+        /// `bootCrashLoop` on a subsequent launch — both on the normal cooperative chunked stop
+        /// (within `cleanupWait`) and when `cleanupWait` elapses before the in-flight C call
+        /// returns.
+        @Test func repeatedNormalCancellationsDuringLargeBootMaintenanceNeverTripBootCrashLoop() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addTonedWanxiangSchema("wanxiang_toned", in: .wanxiang)
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let events = MainActorHeartbeat.phrases(9_999) + [LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]
+            #expect(try store.recordBatch(events) == 10_000)
+
+            // Cache the built-in -> wanxiang build and persist wanxiang_toned as active.
+            do {
+                let seed = try workspace.engine(luaFile: nil)
+                _ = try await seed.switchSchemaSet(
+                    to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: "wanxiang_toned",
+                    learningStore: nil, luaFile: nil)
+                seed.shutdown()
+            }
+
+            let config = RimeEngineConfiguration.activeSchemaSet(
+                root: workspace.user, builtinSharedDataDir: LexiconWorkspace.builtin, logDir: workspace.logs, luaFile: nil)
+            let sentinel = workspace.user.appending(path: BootGuard.sentinelFileName)
+            let userdb = workspace.setDir(.wanxiang).appending(path: "wanxiang_toned.userdb")
+
+            for round in 1...2 {
+                try? FileManager.default.removeItem(at: userdb)
+                let cancellation = DeployCancellation()
+                let boot = Task { @MainActor in
+                    try await RimeEngine.start(configuration: config, cancellation: cancellation)
+                }
+                // Wait until librime is actively importing chunks into `wanxiang_toned.userdb`.
+                let entered = await eventually(timeout: .seconds(30)) {
+                    FileManager.default.fileExists(atPath: sentinel.path)
+                        && FileManager.default.fileExists(atPath: userdb.path)
+                }
+                try #require(entered, "round \(round): boot never entered userdb maintenance")
+
+                // Round 1 verifies cooperative chunked cancellation completes inside `cleanupWait`
+                // and releases the lock; Round 2 forces the `cleanupWait` timeout branch to verify
+                // the sentinel is still disarmed synchronously without touching librime/lock early.
+                let cleanupWait: Duration = round == 1 ? .seconds(1) : .zero
+                let user = workspace.user
+                let (sentinelExistsAtExit, lockFreeAtExit, elapsed) = await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            let clock = ContinuousClock()
+                            let began = clock.now
+                            cancellation.cancelAndFinishCleanup(deployerGrace: .milliseconds(500), cleanupWait: cleanupWait)
+                            let elapsed = clock.now - began
+                            let sentinelExists = FileManager.default.fileExists(atPath: sentinel.path)
+                            let probe = BootGuard(userDataDir: user)
+                            let lockFree = probe.acquireLock() == .acquired
+                            if lockFree { probe.releaseLock() }
+                            continuation.resume(returning: (sentinelExists, lockFree, elapsed))
+                        }
+                    }
+                }
+                #expect(!sentinelExistsAtExit, "round \(round): clean cancellation left boot sentinel armed")
+                if round == 1 {
+                    #expect(elapsed < .seconds(1), "round 1: cooperative chunked cancel took \(elapsed)")
+                    #expect(lockFreeAtExit, "round 1: root lock was not released after cooperative stop")
+                } else {
+                    #expect(elapsed < .milliseconds(100), "round 2: zero cleanupWait blocked for \(elapsed)")
+                }
+
+                boot.cancel()
+                guard case .failure(let error) = await boot.result else {
+                    Issue.record("round \(round): a cancelled boot must not return an engine")
+                    return
+                }
+                #expect(error as? NoemaError == .engineUnavailable(reason: "boot cancelled"))
+                #expect(try store.watermark(for: .wanxiang, dictName: "wanxiang_toned") == nil,
+                        "round \(round): cancelled maintenance must not advance watermark")
+            }
+
+            // Third boot must succeed cleanly (never `.bootCrashLoop`) and finish projecting.
+            try? FileManager.default.removeItem(at: userdb)
+            let engine = try await RimeEngine.start(configuration: config)
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == nil && !engine.isSafeMode,
+                    "repeated clean cancellations tripped Safe Mode: \(String(describing: engine.safeModeReason))")
+            #expect(try store.watermark(for: .wanxiang, dictName: "wanxiang_toned")?.lastRevision == store.latestRevision())
+            #expect(candidates(engine, "nihao", pages: 1).contains("霓昊"))
+        }
+
         /// 500 mixed keys through the real engine (built-in set with the Lua translator) with
         /// the learning writer recording every commit: P95 stays under 2 ms.
         @Test func keyLatencyWithLearningStaysUnderTwoMilliseconds() throws {

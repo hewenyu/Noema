@@ -217,7 +217,9 @@ public final class RimeEngine: TypingEngine {
             throw .engineUnavailable(reason: "boot cancelled")
         }
         guard engine.beginBoot(clearingSentinel: false) else { return engine }
-        guard cancellation.registerAbandon({ engine.abandonBoot() }) else {
+        guard cancellation.registerAbandon(
+            { engine.abandonBoot() }, disarmSentinel: { engine.resources.bootGuard.disarm() }
+        ) else {
             engine.abandonBoot()
             throw .engineUnavailable(reason: "boot cancelled")
         }
@@ -232,8 +234,13 @@ public final class RimeEngine: TypingEngine {
                     let migration = migrateLegacyRootFiles(configuration)
                     var booted = QuiescentBoot.prepareFailed
                     if prepareBuild(configuration: configuration, cancellation: cancellation) {
-                        booted = cancellation.isCancelled
-                            ? .cancelled : .opened(bootQuiescently(library, configuration, migration: migration))
+                        if cancellation.isCancelled {
+                            booted = .cancelled
+                        } else {
+                            let opening = bootQuiescently(
+                                library, configuration, migration: migration, isCancelled: { cancellation.isCancelled })
+                            booted = cancellation.isCancelled ? .cancelled : .opened(opening)
+                        }
                     }
                     // Only after the last librime call and after prepareBuild removed its staging
                     // directory: `cancelAndFinishCleanup` finalizes librime once this leaves.
@@ -429,9 +436,13 @@ public final class RimeEngine: TypingEngine {
     /// userdb lost or corrupted while Noema was not running is recovered before the first
     /// key), then open the session on `schemaID`.
     nonisolated static func bootQuiescently(
-        _ library: RimeLibrary, _ configuration: RimeEngineConfiguration, migration: LegacyRootMigrator.PendingMigration?
+        _ library: RimeLibrary, _ configuration: RimeEngineConfiguration, migration: LegacyRootMigrator.PendingMigration?,
+        isCancelled: () -> Bool = { false }
     ) -> RimeLibrary.SessionOpening {
-        _ = library.initializeAndMaintain(configuration, migration: migration, store: .onDiskIfPresent)
+        _ = library.initializeAndMaintain(configuration, migration: migration, store: .onDiskIfPresent, isCancelled: isCancelled)
+        guard !isCancelled() else {
+            return RimeLibrary.SessionOpening(opened: false, isMandarinPinyin: false, secondaryInputRules: SecondaryInputRules())
+        }
         return library.openSession(configuration.schemaID)
     }
 

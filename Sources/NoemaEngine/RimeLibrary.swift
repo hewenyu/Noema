@@ -61,10 +61,14 @@ struct RimeLibrary: @unchecked Sendable {
     ///    store only into a Mandarin pinyin schema, spelled as its dictionary spells codes;
     /// 3. with a schema set and a store, `noema_learned.tsv` is exported.
     func initializeAndMaintain(
-        _ configuration: RimeEngineConfiguration, migration: LegacyRootMigrator.PendingMigration?, store source: StoreSource
+        _ configuration: RimeEngineConfiguration, migration: LegacyRootMigrator.PendingMigration?, store source: StoreSource,
+        isCancelled: () -> Bool = { false }
     ) -> Maintenance {
+        if isCancelled() { return Maintenance() }
         initialize(configuration)
+        if isCancelled() { return Maintenance() }
         importLegacyUserDBs(configuration, migration)
+        if isCancelled() { return Maintenance() }
         let schemaID = configuration.schemaID
         var result = Maintenance(isMandarinPinyin: isMandarinPinyinSchema(schemaID: schemaID), codeFormat: userDictCodeFormat(schemaID: schemaID))
         guard let set = configuration.schemaSetID else { return result }
@@ -75,19 +79,20 @@ struct RimeLibrary: @unchecked Sendable {
         var store = opened
         var maintainWithoutStore = false
         if case .given(let given) = source { (store, maintainWithoutStore) = (given, true) }
-        if store != nil || maintainWithoutStore, let dictName = userDictName(schemaID: schemaID), let levers = RimeUserDictLevers() {
+        if !isCancelled(), store != nil || maintainWithoutStore, let dictName = userDictName(schemaID: schemaID), let levers = RimeUserDictLevers() {
             result.userDictName = dictName
             let guardian = UserDBGuardian(
                 schemaSet: set, userDataDir: configuration.rimeUserDataDir,
                 snapshotsDir: NoemaPaths.userDBSnapshotsDir(set, root: configuration.userDataDir), levers: levers,
                 codeFormat: result.codeFormat)
             do {
-                result.outcome = try guardian.maintain(dictName, store: result.isMandarinPinyin ? store : nil)
+                result.outcome = try guardian.maintain(
+                    dictName, store: result.isMandarinPinyin ? store : nil, isCancelled: isCancelled)
             } catch {
                 result.failure = error
             }
         }
-        if let store {
+        if !isCancelled(), let store {
             result.learnedLines = try? LearnedSnapshotExporter.export(
                 from: store, to: configuration.rimeUserDataDir.appending(path: NoemaPaths.learnedTSVFileName))
         }

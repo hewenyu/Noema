@@ -12,6 +12,7 @@ final class FakeLevers: UserDictLevers {
     let userDataDir: URL
     var failingExports: Set<String> = []
     var failingImports: Set<String> = []
+    var onImport: ((String, Int) -> Void)?
     private(set) var imports: [(String, String)] = []
 
     init(userDataDir: URL) { self.userDataDir = userDataDir }
@@ -60,6 +61,7 @@ final class FakeLevers: UserDictLevers {
         }
         let output = rows.keys.sorted().map { "\($0)\t\(rows[$0]!)\n" }.joined()
         guard (try? Data(output.utf8).write(to: rowsURL(name))) != nil else { return -1 }
+        onImport?(name, count)
         return count
     }
 }
@@ -339,6 +341,61 @@ final class FakeLevers: UserDictLevers {
         #expect(throws: UserDBGuardian.Failure.exportFailed("rime_ice still fails to export after recovery")) {
             try guardian.recover("rime_ice", store: store)
         }
+    }
+
+    @Test func cancelledChunkedProjectionStopsEarlyAndLeavesWatermarkUnchanged() throws {
+        defer { cleanUp() }
+        let total = UserDBGuardian.importBatchSize * 2 + 500
+        let batch = (0..<total).map { index -> LearningCommitEvent in
+            let first = Unicode.Scalar(0x4E00 + (index / 100))!
+            let second = Unicode.Scalar(0x4E00 + (index % 100))!
+            return LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "\(Character(first))\(Character(second))")
+        }
+        #expect(try store.recordBatch(batch) == total)
+
+        var cancelled = false
+        var chunks = 0
+        levers.onImport = { _, _ in
+            chunks += 1
+            if chunks == 1 { cancelled = true }
+        }
+        #expect(throws: UserDBGuardian.Failure.cancelled) {
+            try guardian.maintain("rime_ice", store: store, isCancelled: { cancelled })
+        }
+        #expect(chunks == 1, "expected chunked projection to stop after the first batch, saw \(chunks)")
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice") == nil, "cancelled projection must not advance watermark")
+
+        // A follow-up uncancelled run finishes projecting every entry and writes the watermark.
+        levers.onImport = nil
+        #expect(try guardian.maintain("rime_ice", store: store) == .healthy(projected: total))
+        let mark = try #require(try store.watermark(for: .rimeIce, dictName: "rime_ice"))
+        #expect(mark.lastRevision == Int64(total) && mark.projectedCount == Int64(total))
+        #expect(levers.rows("rime_ice").count == total)
+    }
+
+    @Test func cancelledRecoveryClearsStaleWatermarkSoNextBootReplaysMissedEntries() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        _ = try guardian.maintain("rime_ice", store: store)
+        try guardian.writeSnapshot("rime_ice", learningRevision: 2)
+        // Project newer entries without updating the snapshot, then corrupt the userdb.
+        try learn([("zai jian", "再见")])
+        _ = try guardian.project("rime_ice", store: store)
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice")?.lastRevision == 3)
+        try FileManager.default.createDirectory(
+            at: setDir.appending(path: "rime_ice.userdb/lost"), withIntermediateDirectories: true)
+
+        var cancelled = false
+        // Cancel immediately after the snapshot import, before replaying revision 3.
+        levers.onImport = { _, _ in cancelled = true }
+        #expect(throws: UserDBGuardian.Failure.cancelled) {
+            try guardian.maintain("rime_ice", store: store, isCancelled: { cancelled })
+        }
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice") == nil)
+
+        levers.onImport = nil
+        #expect(try guardian.maintain("rime_ice", store: store) == .healthy(projected: 3))
+        #expect(levers.rows("rime_ice")["再见\tzai jian"] == 1)
     }
 
     private func tsv(_ text: String) throws -> URL {

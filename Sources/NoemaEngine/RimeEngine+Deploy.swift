@@ -343,10 +343,15 @@ public final class DeployCancellation: Sendable {
     private struct State {
         var cancelled = false
         var process: Process?
-        /// Entered while `prepareBuild` runs off the main actor; left after it returns.
+        /// Entered while `prepareBuild` and quiescent boot maintenance run off the main actor;
+        /// left after the last librime call returns.
         var prepareGroup: DispatchGroup?
         /// Disarms the boot sentinel and releases the lock and the claim; runs at most once.
         var onAbandon: (@MainActor @Sendable () -> Void)?
+        /// Disarms only the boot sentinel when `prepareGroup` outlives `cleanupWait` on exit,
+        /// leaving librime and the root lock owned by the background worker (zero concurrent
+        /// librime access, yet normal shutdown never increments the crash counter).
+        var onDisarmSentinel: (@MainActor @Sendable () -> Void)?
     }
 
     // `Process` is not Sendable; every access to it goes through this lock.
@@ -374,8 +379,10 @@ public final class DeployCancellation: Sendable {
     /// to `cleanupWait` for the background `prepareBuild` to return (it removes its staging
     /// directory and never touches the main actor, so this cannot deadlock); then run the
     /// boot's abandon hook here, synchronously: the sentinel is disarmed and the lock and the
-    /// claim are released before this returns. If `prepareBuild` is still running after
-    /// `cleanupWait`, the hook is skipped and the boot counts as unfinished.
+    /// claim are released before this returns. If background work is still running after
+    /// `cleanupWait`, librime and the lock stay with the background worker (so librime is never
+    /// finalized concurrently), while the boot sentinel is still disarmed so a clean shutdown
+    /// never counts toward `bootCrashLoop`.
     @MainActor
     public func cancelAndFinishCleanup(deployerGrace: Duration = .milliseconds(500), cleanupWait: Duration = .seconds(1)) {
         cancel()
@@ -388,26 +395,46 @@ public final class DeployCancellation: Sendable {
         if let group = state.withLockUnchecked({ $0.prepareGroup }) {
             let (seconds, attoseconds) = cleanupWait.components
             let wait = max(0, Double(seconds) + Double(attoseconds) / 1e18)
-            guard group.wait(timeout: .now() + wait) == .success else { return }
+            if group.wait(timeout: .now() + wait) != .success {
+                // Background maintenance is still touching librime: never finalize librime or
+                // release the root lock out from under it, but still disarm the boot sentinel
+                // so a clean user/OS shutdown never counts as a crash loop.
+                let disarm = state.withLockUnchecked { state -> (@MainActor @Sendable () -> Void)? in
+                    defer { state.onDisarmSentinel = nil }
+                    return state.onDisarmSentinel
+                }
+                disarm?()
+                return
+            }
         }
         let abandon = state.withLockUnchecked { state -> (@MainActor @Sendable () -> Void)? in
-            defer { state.onAbandon = nil }
+            defer {
+                state.onAbandon = nil
+                state.onDisarmSentinel = nil
+            }
             return state.onAbandon
         }
         abandon?()
     }
 
-    /// Installs the boot's abandon hook unless already cancelled (then false).
-    func registerAbandon(_ abandon: @escaping @MainActor @Sendable () -> Void) -> Bool {
+    /// Installs the boot's abandon and sentinel-disarm hooks unless already cancelled (then false).
+    func registerAbandon(
+        _ abandon: @escaping @MainActor @Sendable () -> Void,
+        disarmSentinel: (@MainActor @Sendable () -> Void)? = nil
+    ) -> Bool {
         state.withLockUnchecked { state -> Bool in
             guard !state.cancelled else { return false }
             state.onAbandon = abandon
+            state.onDisarmSentinel = disarmSentinel
             return true
         }
     }
 
     func clearAbandon() {
-        state.withLockUnchecked { $0.onAbandon = nil }
+        state.withLockUnchecked { state in
+            state.onAbandon = nil
+            state.onDisarmSentinel = nil
+        }
     }
 
     /// A group entered for the coming `prepareBuild`, or nil when already cancelled.
