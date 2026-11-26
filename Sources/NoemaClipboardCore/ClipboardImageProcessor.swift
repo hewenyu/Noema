@@ -38,16 +38,23 @@ public enum ClipboardImageProcessor {
         guard let source = CGImageSourceCreateWithData(data as CFData, options), CGImageSourceGetCount(source) >= 1 else {
             throw .imageDecodeFailed
         }
-        let (width, height) = try headerDimensions(source)
+        let (rawWidth, rawHeight, orientation) = try headerInfo(source)
         let isPNG = (CGImageSourceGetType(source) as String?) == "public.png"
         let png: Data
-        if isPNG {
+        let width: Int
+        let height: Int
+        if isPNG, orientation == 1 {
             png = data
+            width = rawWidth
+            height = rawHeight
         } else {
             let decodeOptions = [kCGImageSourceShouldCache: false, kCGImageSourceShouldCacheImmediately: false] as CFDictionary
-            guard let image = CGImageSourceCreateImageAtIndex(source, 0, decodeOptions) else { throw .imageDecodeFailed }
-            png = try encodePNG(image)
+            guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, decodeOptions) else { throw .imageDecodeFailed }
+            let normalized = orientation == 1 ? decoded : try applyOrientation(orientation, to: decoded)
+            png = try encodePNG(normalized)
             guard png.count <= quota.maxImageBytes else { throw .imageTooLarge(png.count) }
+            width = normalized.width
+            height = normalized.height
         }
         let thumbnailOptions = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -63,14 +70,57 @@ public enum ClipboardImageProcessor {
             sha256: Data(SHA256.hash(data: png)).hexString)
     }
 
-    /// The pixel size from the image header; rejects zero, oversized, and excessive-pixel dimensions.
-    static func headerDimensions(_ source: CGImageSource) throws(ClipboardError) -> (Int, Int) {
+    /// The pixel size and EXIF orientation (1...8, default 1) from the image header; rejects
+    /// zero, oversized, and excessive-pixel dimensions.
+    static func headerInfo(_ source: CGImageSource) throws(ClipboardError) -> (width: Int, height: Int, orientation: Int) {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
               let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
         else { throw .imageDecodeFailed }
         try validateDimensions(width: width, height: height)
-        return (width, height)
+        let topLevel = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue
+        let tiff = (properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any])?[kCGImagePropertyTIFFOrientation] as? NSNumber
+        let rawOrientation = topLevel ?? tiff?.intValue ?? 1
+        let orientation = (1...8).contains(rawOrientation) ? rawOrientation : 1
+        return (width, height, orientation)
+    }
+
+    /// Renders `image` into upright orientation (EXIF 1) for EXIF orientations 2...8,
+    /// handling both rotations and mirroring in CoreGraphics bottom-left coordinates.
+    static func applyOrientation(_ orientation: Int, to image: CGImage) throws(ClipboardError) -> CGImage {
+        let rawW = image.width
+        let rawH = image.height
+        let swapped = (5...8).contains(orientation)
+        let outW = swapped ? rawH : rawW
+        let outH = swapped ? rawW : rawH
+        try validateDimensions(width: outW, height: outH)
+        let w = CGFloat(rawW)
+        let h = CGFloat(rawH)
+        let transform: CGAffineTransform
+        switch orientation {
+        case 2: transform = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w, ty: 0)
+        case 3: transform = CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+        case 4: transform = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h)
+        case 5: transform = CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: h, ty: w)
+        case 6: transform = CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: w)
+        case 7: transform = CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0)
+        case 8: transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: h, ty: 0)
+        default: return image
+        }
+        let colorSpace = image.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        let context = CGContext(
+            data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0,
+            space: colorSpace, bitmapInfo: bitmapInfo)
+            ?? CGContext(
+                data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo)
+        guard let context else { throw .imageDecodeFailed }
+        context.interpolationQuality = .none
+        context.concatenate(transform)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let oriented = context.makeImage() else { throw .imageDecodeFailed }
+        return oriented
     }
 
     /// Width and height from a PNG's IHDR chunk (bytes 16–23), or nil for other data.

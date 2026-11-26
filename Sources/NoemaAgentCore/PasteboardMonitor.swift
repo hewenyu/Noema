@@ -130,6 +130,7 @@ public final class PasteboardMonitor {
         public var unsupported = 0
         public var accessDenied = 0
         public var emptyReads = 0
+        public var staleSnapshot = 0
     }
 
     public static let selfChangeCountLimit = 32
@@ -196,47 +197,87 @@ public final class PasteboardMonitor {
         guard pauseReasons.isEmpty else { return }
         let count = reader.changeCount
         guard count != lastSeenChangeCount else { return }
-        lastSeenChangeCount = count
 
         if reader.isSecureInputActive {
             taint(count)
+            lastSeenChangeCount = count
             counters.secureInput += 1
             return
         }
-        guard !taintedChangeCounts.contains(count) else { return }
+        guard !taintedChangeCounts.contains(count) else {
+            lastSeenChangeCount = count
+            return
+        }
         let access = reader.accessStatus
         if access != accessStatus {
             accessStatus = access
             onStatusChange()
         }
         if access == .alwaysDeny {
+            lastSeenChangeCount = count
             counters.accessDenied += 1
             return
         }
 
+        let pasteboardTypes = reader.pasteboardTypes()
+        let itemTypes = reader.itemTypes()
+        let source = reader.frontmostSource()
+
+        // Re-verify pasteboard generation and secure input before reading any payload so
+        // another process replacing the pasteboard (e.g. a password manager writing
+        // `ConcealedType`) can never have its payload evaluated under stale metadata.
+        if !confirmSnapshotUnchanged(expectedCount: count) { return }
+
         let reader = reader
         let snapshot = ClipboardCaptureSnapshot(
-            changeCount: count, pasteboardTypes: reader.pasteboardTypes(), itemTypes: reader.itemTypes(),
-            source: reader.frontmostSource(), isSecureInputActive: false,
+            changeCount: count, pasteboardTypes: pasteboardTypes, itemTypes: itemTypes,
+            source: source, isSecureInputActive: false,
             readString: { reader.readString() }, readData: { reader.readData(forType: $0) })
         switch filter.evaluate(snapshot, ignoredSelfChangeCounts: Set(ignoredSelfChangeCounts)) {
         case .skip(let reason):
+            lastSeenChangeCount = count
             record(reason)
         case .capture(.text):
             guard let text = snapshot.readString(), !text.isEmpty else {
+                lastSeenChangeCount = count
                 counters.emptyReads += 1
                 return
             }
+            guard confirmSnapshotUnchanged(expectedCount: count) else { return }
+            lastSeenChangeCount = count
             counters.captured += 1
             onCapture(ClipboardCapture(changeCount: count, payload: .text(text), source: snapshot.source))
         case .capture(.image(let type)):
             guard let data = snapshot.readData(type), !data.isEmpty else {
+                lastSeenChangeCount = count
                 counters.emptyReads += 1
                 return
             }
+            guard confirmSnapshotUnchanged(expectedCount: count) else { return }
+            lastSeenChangeCount = count
             counters.captured += 1
             onCapture(ClipboardCapture(changeCount: count, payload: .imageData(data, type: type), source: snapshot.source))
         }
+    }
+
+    /// Confirms that secure input did not activate and `changeCount` stayed at
+    /// `expectedCount`. On mismatch, leaves `lastSeenChangeCount` at `expectedCount` (unless
+    /// secure input activated, in which case the current count is tainted) so the next poll
+    /// evaluates the newer pasteboard generation against its own metadata.
+    private func confirmSnapshotUnchanged(expectedCount: Int) -> Bool {
+        if reader.isSecureInputActive {
+            let current = reader.changeCount
+            taint(current)
+            lastSeenChangeCount = current
+            counters.secureInput += 1
+            return false
+        }
+        guard reader.changeCount == expectedCount else {
+            lastSeenChangeCount = expectedCount
+            counters.staleSnapshot += 1
+            return false
+        }
+        return true
     }
 
     /// Writes `content` for a paste-back with three guards against recording it again:

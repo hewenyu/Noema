@@ -42,6 +42,23 @@ public final class ClipboardHistoryController {
     @ObservationIgnored private var isShutDown = false
     @ObservationIgnored private let log = NoemaLog.agent("clipboard")
     @ObservationIgnored private var panelStorage: ClipboardPanelController?
+    @ObservationIgnored private var changeObservers: [WeakChangeObserver] = []
+
+    private final class WeakChangeObserver {
+        weak var owner: AnyObject?
+        let handler: @MainActor () -> Void
+        init(owner: AnyObject, handler: @escaping @MainActor () -> Void) {
+            self.owner = owner
+            self.handler = handler
+        }
+    }
+
+    /// Registers a main-actor callback weakly owned by `owner`, fired on every history or
+    /// status change; pruned automatically once `owner` is deallocated.
+    func addChangeObserver(owner: AnyObject, _ handler: @escaping @MainActor () -> Void) {
+        changeObservers.removeAll { $0.owner == nil || $0.owner === owner }
+        changeObservers.append(WeakChangeObserver(owner: owner, handler: handler))
+    }
 
     /// The panel, created on first use.
     public var panel: ClipboardPanelController {
@@ -130,6 +147,8 @@ public final class ClipboardHistoryController {
         itemCount = store?.itemCount ?? 0
         monitor.setPausedSilently(.keychainLocked, store?.state != .ready)
         revision &+= 1
+        changeObservers.removeAll { $0.owner == nil }
+        for observer in changeObservers where observer.owner != nil { observer.handler() }
     }
 
     /// Retries the keychain after the screen unlocks or on request.
@@ -163,10 +182,10 @@ public final class ClipboardHistoryController {
         }
     }
 
-    private func purgeExpired() {
+    func purgeExpired(now: Date = Date()) {
         guard let store else { return }
         ingestQueue.async { [weak self] in
-            _ = try? store.purgeExpired()
+            _ = try? store.purgeExpired(now: now)
             Task { @MainActor [weak self] in self?.refreshStatus() }
         }
     }

@@ -81,6 +81,7 @@ public final class ClipboardPanelModel {
     public var accessStatus: PasteboardAccessStatus { history?.accessStatus ?? .default }
     public var isAccessibilityTrusted: Bool { history?.isAccessibilityTrusted ?? false }
     public var storeError: String? { history?.storeError }
+    public var historyRevision: Int { history?.revision ?? 0 }
 
     public var selected: ClipboardEntryMetadata? {
         guard let selectedID else { return items.first }
@@ -103,6 +104,15 @@ public final class ClipboardPanelModel {
 
     public func reload() {
         items = history?.items(filter: filter, query: query) ?? []
+        let liveIDs = Set(items.map(\.id))
+        // Drop any cached decrypted text, images, or revealed flags for entries that expired,
+        // were deleted, or are no longer visible in the active list.
+        contentCache = contentCache.filter { liveIDs.contains($0.key) }
+        imageCache = imageCache.filter { key, _ in
+            let id = key.hasPrefix("thumb:") ? String(key.dropFirst("thumb:".count)) : key
+            return liveIDs.contains(id)
+        }
+        revealedIDs.formIntersection(liveIDs)
         let ordered = orderedItems
         if let selectedID, ordered.contains(where: { $0.id == selectedID }) { return }
         selectedID = ordered.first?.id
@@ -124,6 +134,10 @@ public final class ClipboardPanelModel {
     }
 
     public func content(for item: ClipboardEntryMetadata) -> ClipboardEntryContent? {
+        if let expires = item.expiresAt, expires <= Date() {
+            contentCache.removeValue(forKey: item.id)
+            return nil
+        }
         if let cached = contentCache[item.id] { return cached }
         guard let content = history?.content(id: item.id) else { return nil }
         contentCache[item.id] = content
@@ -218,6 +232,9 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
             contentRect: CGRect(origin: .zero, size: Self.panelSize),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: true)
         super.init()
+        history?.addChangeObserver(owner: self) { [weak self] in
+            self?.handleHistoryChange()
+        }
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
@@ -303,6 +320,14 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
     public func windowDidResignKey(_ notification: Notification) {
         // A click outside: the clicked app already has focus.
         hide(restoreFocus: false)
+    }
+
+    private func handleHistoryChange() {
+        if isVisible {
+            model.reload()
+        } else {
+            model.clearCaches()
+        }
     }
 
     /// The panel, for tests.

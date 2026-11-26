@@ -43,6 +43,7 @@ struct ClipboardPanelView: View {
         }
         .onChange(of: model.query) { model.reload() }
         .onChange(of: model.filter) { model.reload() }
+        .onChange(of: model.historyRevision) { model.reload() }
         .onChange(of: model.openGeneration, initial: true) { searchFocused = true }
     }
 

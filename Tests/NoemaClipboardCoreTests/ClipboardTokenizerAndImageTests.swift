@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 @testable import NoemaClipboardCore
 import Testing
 
@@ -72,5 +74,85 @@ import Testing
         #expect(throws: ClipboardError.imageTooLarge(1_001)) { try ClipboardImageProcessor.process(data, quota: quota) }
         #expect(throws: ClipboardError.emptyContent) { try ClipboardImageProcessor.process(Data()) }
         #expect(throws: ClipboardError.imageDecodeFailed) { try ClipboardImageProcessor.process(Data("not an image".utf8)) }
+    }
+
+    /// Codex PR #23 round 1: JPEG/HEIC images carrying EXIF orientations 1...8 (rotations and
+    /// mirrors) are normalized upright when transcoded to PNG so full-image dimensions and
+    /// corner pixels match the ImageIO-transformed thumbnail.
+    @Test func jpegWithAllEightExifOrientationsMatchesThumbnailOrientation() throws {
+        // 40×20 asymmetric 4-quadrant image (TL=red, TR=green, BL=blue, BR=yellow).
+        let rawW = 40
+        let rawH = 20
+        var pixels = [UInt8](repeating: 0, count: rawW * rawH * 4)
+        for y in 0..<rawH {
+            for x in 0..<rawW {
+                let offset = (y * rawW + x) * 4
+                let top = y < rawH / 2
+                let left = x < rawW / 2
+                let rgb: (UInt8, UInt8, UInt8) = switch (top, left) {
+                case (true, true): (240, 20, 20)     // red
+                case (true, false): (20, 240, 20)    // green
+                case (false, true): (20, 20, 240)    // blue
+                case (false, false): (240, 240, 20)  // yellow
+                }
+                pixels[offset] = rgb.0
+                pixels[offset + 1] = rgb.1
+                pixels[offset + 2] = rgb.2
+                pixels[offset + 3] = 255
+            }
+        }
+        let provider = try #require(CGDataProvider(data: Data(pixels) as CFData))
+        let base = try #require(CGImage(
+            width: rawW, height: rawH, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: rawW * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+
+        func encodeJPEG(_ cgImage: CGImage, orientation: Int) throws -> Data {
+            let output = NSMutableData()
+            let dest = try #require(CGImageDestinationCreateWithData(output as CFMutableData, "public.jpeg" as CFString, 1, nil))
+            let props = [
+                kCGImagePropertyOrientation: orientation,
+                kCGImageDestinationLossyCompressionQuality: 1.0,
+            ] as CFDictionary
+            CGImageDestinationAddImage(dest, cgImage, props)
+            #expect(CGImageDestinationFinalize(dest))
+            return output as Data
+        }
+
+        func cornerRGBs(_ pngData: Data) throws -> (width: Int, height: Int, corners: [(Int, Int, Int)]) {
+            let source = try #require(CGImageSourceCreateWithData(pngData as CFData, nil))
+            let cg = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+            var buf = [UInt8](repeating: 0, count: cg.width * cg.height * 4)
+            let ctx = try #require(CGContext(
+                data: &buf, width: cg.width, height: cg.height, bitsPerComponent: 8, bytesPerRow: cg.width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+            // Sample 4 pixels well inside each quadrant (top-left, top-right, bottom-left, bottom-right).
+            let pts = [(3, 3), (cg.width - 4, 3), (3, cg.height - 4), (cg.width - 4, cg.height - 4)]
+            let corners = pts.map { (x, y) -> (Int, Int, Int) in
+                let i = (y * cg.width + x) * 4
+                return (Int(buf[i]), Int(buf[i + 1]), Int(buf[i + 2]))
+            }
+            return (cg.width, cg.height, corners)
+        }
+
+        for orientation in 1...8 {
+            let jpeg = try encodeJPEG(base, orientation: orientation)
+            let processed = try ClipboardImageProcessor.process(jpeg)
+            let expectedW = (5...8).contains(orientation) ? rawH : rawW
+            let expectedH = (5...8).contains(orientation) ? rawW : rawH
+            #expect(processed.width == expectedW && processed.height == expectedH, "orientation \(orientation)")
+            let full = try cornerRGBs(processed.pngData)
+            let thumb = try cornerRGBs(processed.thumbnailData)
+            #expect(full.width == expectedW && full.height == expectedH, "decoded PNG dims for orientation \(orientation)")
+            #expect(thumb.width == expectedW && thumb.height == expectedH, "thumb dims for orientation \(orientation)")
+            for (index, (f, t)) in zip(full.corners, thumb.corners).enumerated() {
+                #expect(
+                    abs(f.0 - t.0) < 30 && abs(f.1 - t.1) < 30 && abs(f.2 - t.2) < 30,
+                    "orientation \(orientation) corner \(index) mismatch: full=\(f) thumb=\(t)")
+            }
+        }
     }
 }

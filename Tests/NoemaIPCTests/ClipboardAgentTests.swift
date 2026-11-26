@@ -24,11 +24,20 @@ final class SpyPasteboard: PasteboardReading {
 
     var payloadReads: Int { stringReads + dataReads.count }
 
+    /// Optional hook fired inside `frontmostSource()` or `readString()` to simulate another
+    /// process replacing the pasteboard mid-poll (TOCTOU race tests).
+    var onFrontmostSource: (() -> Void)?
+    var onReadString: (() -> Void)?
+
     func pasteboardTypes() -> [String] { types }
     func itemTypes() -> [[String]] { items }
-    func frontmostSource() -> ClipboardSourceApp? { source }
+    func frontmostSource() -> ClipboardSourceApp? {
+        onFrontmostSource?()
+        return source
+    }
     func readString() -> String? {
         stringReads += 1
+        onReadString?()
         return string
     }
 
@@ -373,6 +382,93 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
 
         controller.hide(restoreFocus: false)
         #expect(!controller.isVisible && controller.model.isMasked(sensitive), "closing re-masks and drops decrypted content")
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 1 (HIGH): if another process replaces the pasteboard with
+    /// `ConcealedType` between metadata capture and payload read (or during payload read),
+    /// the stale snapshot is discarded and the concealed payload is never persisted.
+    @Test func concealedReplacementMidPollNeverPersists() throws {
+        let (store, root) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        // Race 1: pasteboard swaps to ConcealedType while `frontmostSource()` is queried.
+        pasteboard.copy("ordinary copy")
+        pasteboard.onFrontmostSource = { [unowned pasteboard] in
+            pasteboard.onFrontmostSource = nil
+            pasteboard.copy("concealed-after-metadata", types: ["public.utf8-plain-text", "org.nspasteboard.ConcealedType"])
+        }
+        history.monitor.poll()
+        history.waitForIngest()
+        #expect(pasteboard.payloadReads == 0, "pre-read changeCount mismatch must skip payload read")
+        #expect(history.monitor.counters.staleSnapshot == 1 && store.itemCount == 0)
+        // Next poll inspects generation 2 against its own ConcealedType metadata and skips it.
+        history.monitor.poll()
+        history.waitForIngest()
+        #expect(pasteboard.payloadReads == 0 && history.monitor.counters.privacyMarker == 1 && store.itemCount == 0)
+
+        // Race 2: pasteboard swaps to ConcealedType while `readString()` is executing.
+        pasteboard.copy("second ordinary copy")
+        pasteboard.onReadString = { [unowned pasteboard] in
+            pasteboard.onReadString = nil
+            pasteboard.copy("concealed-mid-read", types: ["public.utf8-plain-text", "org.nspasteboard.ConcealedType"])
+        }
+        history.monitor.poll()
+        history.waitForIngest()
+        #expect(history.monitor.counters.staleSnapshot == 2 && store.itemCount == 0, "mid-read change must discard payload")
+        // Next poll sees the concealed generation and skips it cleanly.
+        history.monitor.poll()
+        history.waitForIngest()
+        #expect(history.monitor.counters.privacyMarker == 2 && store.itemCount == 0)
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 1 (MEDIUM): an open panel subscribes to history updates so TTL
+    /// purges drop expired rows and their cached decrypted previews immediately, and newly
+    /// captured entries appear without closing and reopening the panel.
+    @Test func openPanelRefreshesAndDropsCachedContentOnTTLPurgeAndNewCapture() async throws {
+        let (store, root) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        let shortQuotaToken = "token " + "ghp" + "_" + String(repeating: "z", count: 24)
+        let now = Date()
+        let expiring = try store.insertText(shortQuotaToken, source: nil, now: now)
+        let kept = try store.insertText("keep open panel", source: nil, now: now)
+        try store.setPinned(id: kept.id, pinned: true, now: now)
+
+        let controller = ClipboardPanelController(history: history, frontmost: { nil })
+        controller.shouldOrderFront = false
+        controller.show()
+        #expect(controller.model.items.map(\.id).contains(expiring.id))
+        // Populate `contentCache` and `revealedIDs` for the expiring item while panel is open.
+        controller.model.selectedID = expiring.id
+        controller.model.toggleReveal(expiring)
+        #expect(controller.model.content(for: expiring) == .text(shortQuotaToken))
+
+        // Trigger TTL purge past the sensitive 15-minute expiry while the panel stays open.
+        history.purgeExpired(now: now.addingTimeInterval(20 * 60))
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(!controller.model.items.map(\.id).contains(expiring.id), "open panel still listed purged item")
+        #expect(controller.model.content(for: expiring) == nil, "open panel still returned cached purged content")
+        #expect(!controller.model.revealedIDs.contains(expiring.id))
+
+        // A new capture while the panel is open appears immediately.
+        pasteboard.copy("captured while open")
+        history.monitor.poll()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(controller.model.items.contains { $0.preview == "captured while open" })
+
+        controller.hide(restoreFocus: false)
         history.shutdown()
     }
 
