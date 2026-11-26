@@ -123,6 +123,27 @@ private final class IMKTextInputClientAdapter: TextInputClient {
 
     var clientBundleIdentifier: String? { client.bundleIdentifier() }
 
+    var uniqueClientIdentifier: String? { client.uniqueClientIdentifierString() }
+
+    var windowLevel: Int? { Int(client.windowLevel()) }
+
+    /// `attributes(forCharacterIndex:lineHeightRectangle:)` first, with the inline-relative
+    /// index IMKit expects; then `firstRect(forCharacterRange:actualRange:)`, which takes a
+    /// document index, so the offset is rebased on the marked range (or the selection) by
+    /// `DocumentCaretRange`. `.zero` from both, or no document location, is nil.
+    /// `CaretPositionResolver` validates whatever comes back.
+    func caretScreenRect(atUTF16Offset offset: Int) -> CGRect? {
+        let index = max(offset, 0)
+        var rect = NSRect.zero
+        _ = client.attributes(forCharacterIndex: index, lineHeightRectangle: &rect)
+        if rect != .zero { return rect }
+        guard let range = DocumentCaretRange.fallbackRange(
+            inlineOffset: index, markedRange: client.markedRange(), selectedRange: client.selectedRange())
+        else { return nil }
+        let fallback = client.firstRect(forCharacterRange: range, actualRange: nil)
+        return fallback == .zero ? nil : fallback
+    }
+
     func insertText(_ text: String) {
         client.insertText(text, replacementRange: replacementRange)
     }

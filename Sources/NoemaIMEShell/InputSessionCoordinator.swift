@@ -14,6 +14,11 @@ import NoemaCore
 /// engine declines return `false`, so the client receives the key. Committed text is
 /// always inserted before the key is passed through. Clearing a composition calls
 /// `clearComposition()`, never `resetSession()`, which would also reset `ascii_mode`.
+///
+/// Clients whose bundle identifier is in `inlinePreeditDisabledBundleIDs` never receive
+/// marked text: the candidate panel draws the preedit instead. Clicks on the panel arrive
+/// through `selectCandidate(at:expectedGenerationID:)` and
+/// `changePage(backward:expectedGenerationID:)`, which ignore stale generations.
 @MainActor
 public final class InputSessionCoordinator {
     /// A mode ID that switches the engine to ASCII. `Info.plist.in` declares only
@@ -23,6 +28,7 @@ public final class InputSessionCoordinator {
     private let engineProvider: @MainActor () -> (any TypingEngine)?
     private let candidatePresenter: any CandidatePresenting
     private let isSecureInputEnabled: @MainActor () -> Bool
+    private let inlinePreeditDisabledBundleIDs: Set<String>
 
     /// The session that owns the engine's composition, and its client.
     public private(set) var activeToken: UUID?
@@ -33,11 +39,13 @@ public final class InputSessionCoordinator {
     public init(
         engineProvider: @escaping @MainActor () -> (any TypingEngine)?,
         candidatePresenter: any CandidatePresenting = NoOpCandidatePresenter(),
-        isSecureInputEnabled: @escaping @MainActor () -> Bool = { IsSecureEventInputEnabled() }
+        isSecureInputEnabled: @escaping @MainActor () -> Bool = { IsSecureEventInputEnabled() },
+        inlinePreeditDisabledBundleIDs: Set<String> = []
     ) {
         self.engineProvider = engineProvider
         self.candidatePresenter = candidatePresenter
         self.isSecureInputEnabled = isSecureInputEnabled
+        self.inlinePreeditDisabledBundleIDs = inlinePreeditDisabledBundleIDs
     }
 
     // MARK: - Lifecycle
@@ -125,10 +133,11 @@ public final class InputSessionCoordinator {
     /// the key; committed text is inserted either way.
     public func handleKey(_ event: KeyEvent, token: UUID, client: any TextInputClient) -> Bool {
         // 1. Secure input: pass through before the engine sees the key. Only marked text
-        //    the shell put on a client is cleared; a secure client is never given any.
+        //    the shell put on a client is cleared; a secure client is never given any. A
+        //    composition without marked text (preedit drawn in the panel) is dropped too.
         if isSecureInputEnabled() {
             candidatePresenter.hide()
-            if activeToken != token || hasMarkedText {
+            if activeToken != token || hasMarkedText || (engineProvider()?.currentState.isComposing == true) {
                 dropComposition()
                 activeToken = token
                 activeClient = client
@@ -158,39 +167,101 @@ public final class InputSessionCoordinator {
 
         // 5–6. Ask the engine, then apply its result: committed text first.
         let result = engine.processKey(event)
+        applyResult(result, to: client)
+        return result.handled
+    }
+
+    // MARK: - Panel clicks
+
+    /// The user clicked candidate `index` of the panel showing `expectedGenerationID`.
+    /// Selects it like its number key would and returns true; returns false and changes
+    /// nothing under secure input, without an owner, engine, or Safe Mode, or when the
+    /// engine has moved past `expectedGenerationID` (a click on a stale panel).
+    @discardableResult
+    public func selectCandidate(at index: Int, expectedGenerationID: UInt64? = nil) -> Bool {
+        guard let (engine, client) = clickTarget(expectedGenerationID: expectedGenerationID) else { return false }
+        let result = engine.selectCandidate(at: index)
+        guard result.handled else { return false }
+        applyResult(result, to: client)
+        return true
+    }
+
+    /// The user paged the panel showing `expectedGenerationID`. Same guards as
+    /// `selectCandidate(at:expectedGenerationID:)`; also false without a composition.
+    @discardableResult
+    public func changePage(backward: Bool, expectedGenerationID: UInt64? = nil) -> Bool {
+        guard let (engine, client) = clickTarget(expectedGenerationID: expectedGenerationID),
+            engine.currentState.isComposing
+        else { return false }
+        let state = engine.changePage(backward: backward)
+        applyResult(KeyHandlingResult(handled: true, state: state), to: client)
+        return true
+    }
+
+    /// The engine and owner's client a panel click may act on, or nil.
+    private func clickTarget(expectedGenerationID: UInt64?) -> (any TypingEngine, any TextInputClient)? {
+        if isSecureInputEnabled() {
+            candidatePresenter.hide()
+            return nil
+        }
+        guard activeToken != nil, let client = activeClient, let engine = engineProvider() else { return nil }
+        let state = engine.currentState
+        guard !state.isSafeMode else { return nil }
+        if let expected = expectedGenerationID, state.generationID != expected { return nil }
+        return (engine, client)
+    }
+
+    // MARK: - Applying results
+
+    /// Applies an engine result to the owner's client: committed text first, then the
+    /// composition (marked text or panel preedit) or nothing.
+    private func applyResult(_ result: KeyHandlingResult, to client: any TextInputClient) {
         let state = result.state
         if let committed = result.committedText, !committed.isEmpty {
             client.insertText(committed)
+            // insertText replaced the marked text; no redundant empty setMarkedText.
+            hasMarkedText = false
             if state.isComposing {
-                showMarkedText(state, on: client)
+                present(state, on: client)
             } else {
-                // insertText replaced the marked text; no redundant empty setMarkedText.
-                hasMarkedText = false
                 candidatePresenter.hide()
             }
-            return result.handled
+            return
         }
         if state.isComposing {
-            showMarkedText(state, on: client)
+            present(state, on: client)
         } else {
             if hasMarkedText { client.clearMarkedText() }
             hasMarkedText = false
             candidatePresenter.hide()
         }
-        return result.handled
+    }
+
+    /// Shows `state` as marked text, or only in the panel for inline-preedit-disabled
+    /// clients, and refreshes the panel.
+    private func present(_ state: CompositionState, on client: any TextInputClient) {
+        let inPanel = rendersPreeditInPanel(for: client)
+        if inPanel {
+            if hasMarkedText { client.clearMarkedText() }
+            hasMarkedText = false
+        } else {
+            client.setMarkedText(
+                preedit: state.preedit,
+                caretUTF16Offset: state.caretUTF16Offset,
+                selectionUTF16Range: state.selectionUTF16Range
+            )
+            hasMarkedText = true
+        }
+        candidatePresenter.update(
+            state: state, client: client,
+            options: CandidatePresentationOptions(rendersPreeditInPanel: inPanel, sessionToken: activeToken))
+    }
+
+    private func rendersPreeditInPanel(for client: any TextInputClient) -> Bool {
+        client.clientBundleIdentifier.map { inlinePreeditDisabledBundleIDs.contains($0) } == true
     }
 
     // MARK: - Ownership
-
-    private func showMarkedText(_ state: CompositionState, on client: any TextInputClient) {
-        client.setMarkedText(
-            preedit: state.preedit,
-            caretUTF16Offset: state.caretUTF16Offset,
-            selectionUTF16Range: state.selectionUTF16Range
-        )
-        hasMarkedText = true
-        candidatePresenter.update(state: state, client: client)
-    }
 
     /// Makes `token` the owner, first clearing what a different previous owner left.
     private func take(token: UUID, client: any TextInputClient) {
