@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Verify assembled Noema bundles.
 #
-#   NoemaIME.app: layout, IMKit Info.plist keys, Mach-O linkage of MacOS/NoemaIME,
+#   NoemaIME.app: layout (rime-default, rime-lua/noema_learned.lua), IMKit Info.plist
+#     keys, Mach-O linkage of MacOS/NoemaIME (system SQLite included),
 #     MacOS/noema-rime-deployer, and Frameworks/librime.1.dylib, code signatures (signing
 #     Identifier dev.noema.inputmethod.NoemaIME) and empty signed entitlements, and real launches that report the packaged version, load
 #     librime, and start the deployer.
-#   Noema.app (the companion agent): layout, Info.plist (LSUIElement, identifiers, no usage
+#   Noema.app (the companion agent): layout (Resources/dictionaries.lock.json), Info.plist (LSUIElement, identifiers, no usage
 #     descriptions), Contents/Library/LaunchAgents/dev.noema.agent.plist (BundleProgram,
 #     MachServices), arm64-only MacOS/NoemaAgent with system-only linkage, no librime, and
 #     zero LC_RPATH, signatures (signing Identifier dev.noema.agent) and empty signed
@@ -164,6 +165,14 @@ verify_ime() {
     [[ -f "${CONTENTS}/Resources/rime-default/${file}" && ! -L "${CONTENTS}/Resources/rime-default/${file}" ]] \
       || bad "missing regular file: Contents/Resources/rime-default/${file}"
   done
+  # The learned-phrase translator, byte for byte the checked-in one.
+  local lua="${CONTENTS}/Resources/rime-lua/noema_learned.lua"
+  if [[ -f "${lua}" && ! -L "${lua}" ]]; then
+    cmp -s "${lua}" "${REPO_ROOT}/Resources/rime-lua/noema_learned.lua" \
+      || bad "Contents/Resources/rime-lua/noema_learned.lua differs from Resources/rime-lua/noema_learned.lua"
+  else
+    bad "missing regular file: Contents/Resources/rime-lua/noema_learned.lua"
+  fi
   if (( failures > start_failures )); then
     log "${APP}: layout is incomplete, skipping its remaining checks"
     return
@@ -253,6 +262,9 @@ PY
     otool -L "${macho}" | grep -Fq '@rpath/librime.1.dylib' \
       || bad "${macho#"${CONTENTS}/"} does not link @rpath/librime.1.dylib"
   done
+  # learning.sqlite goes through the system SQLite only.
+  otool -L "${EXE}" | grep -Eq '^[[:space:]]+/usr/lib/libsqlite3\.dylib ' \
+    || bad "MacOS/NoemaIME does not link /usr/lib/libsqlite3.dylib"
   dylib_id="$(otool -D "${DYLIB}" | sed -n '2p')"
   [[ "${dylib_id}" == "@rpath/librime.1.dylib" ]] || bad "Frameworks/librime.1.dylib install_name is '${dylib_id}', expected @rpath/librime.1.dylib"
   dylib_rpaths="$(rpaths_of "${DYLIB}")"
@@ -320,6 +332,14 @@ verify_agent() {
   done
   [[ -x "${EXE}" ]] || bad "Contents/MacOS/NoemaAgent is not executable"
   [[ ! -e "${CONTENTS}/Frameworks" ]] || bad "Noema.app must not contain Contents/Frameworks (no librime in the agent)"
+  # The dictionary lockfile Settings › 词库 installs from, byte for byte the checked-in one.
+  local lockfile="${CONTENTS}/Resources/dictionaries.lock.json"
+  if [[ -f "${lockfile}" && ! -L "${lockfile}" ]]; then
+    cmp -s "${lockfile}" "${REPO_ROOT}/vendor/dictionaries.lock.json" \
+      || bad "Contents/Resources/dictionaries.lock.json differs from vendor/dictionaries.lock.json"
+  else
+    bad "missing regular file: Contents/Resources/dictionaries.lock.json"
+  fi
   if (( failures > start_failures )); then
     log "${APP}: layout is incomplete, skipping its remaining checks"
     return

@@ -29,6 +29,8 @@ IME_RESOURCES="${REPO_ROOT}/Resources/IME"
 AGENT_RESOURCES="${REPO_ROOT}/Resources/Agent"
 RIME_DEFAULT="${REPO_ROOT}/Resources/rime-default"
 RIME_DEFAULT_FILES=(default.yaml noema_pinyin.schema.yaml noema_pinyin.dict.yaml)
+LEARNED_LUA="${REPO_ROOT}/Resources/rime-lua/noema_learned.lua"
+DICTIONARY_LOCKFILE="${REPO_ROOT}/vendor/dictionaries.lock.json"
 IME_ENTITLEMENTS="${IME_RESOURCES}/NoemaIME.entitlements"
 AGENT_ENTITLEMENTS="${AGENT_RESOURCES}/NoemaAgent.entitlements"
 IME_APP="NoemaIME.app"
@@ -151,12 +153,16 @@ if wants "${IME_APP}"; then
   for file in "${RIME_DEFAULT_FILES[@]}"; do
     [[ -f "${RIME_DEFAULT}/${file}" && ! -L "${RIME_DEFAULT}/${file}" ]] || die "Resources/rime-default is incomplete: missing ${file}"
   done
+  [[ -f "${LEARNED_LUA}" && ! -L "${LEARNED_LUA}" ]] || die "Resources/rime-lua/noema_learned.lua is missing"
 fi
 if wants "${AGENT_APP}"; then
   [[ -f "${AGENT_RESOURCES}/Info.plist.in" && -f "${AGENT_ENTITLEMENTS}" && -f "${AGENT_RESOURCES}/${AGENT_LAUNCH_AGENT}" ]] \
     || die "Resources/Agent is incomplete (Info.plist.in, NoemaAgent.entitlements, ${AGENT_LAUNCH_AGENT})"
   plutil -lint -s "${AGENT_ENTITLEMENTS}" || die "invalid entitlements plist: ${AGENT_ENTITLEMENTS}"
   plutil -lint -s "${AGENT_RESOURCES}/${AGENT_LAUNCH_AGENT}" || die "invalid LaunchAgent plist: ${AGENT_LAUNCH_AGENT}"
+  [[ -f "${DICTIONARY_LOCKFILE}" && ! -L "${DICTIONARY_LOCKFILE}" ]] || die "vendor/dictionaries.lock.json is missing"
+  /usr/bin/python3 -I -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "${DICTIONARY_LOCKFILE}" \
+    || die "vendor/dictionaries.lock.json is not valid JSON"
 fi
 
 # ---------------------------------------------------------------------------
@@ -371,7 +377,8 @@ sign() {
 }
 
 # ---------------------------------------------------------------------------
-# NoemaIME.app: the IMKit shell, its deployer, librime, and the built-in schema
+# NoemaIME.app: the IMKit shell, its deployer, librime, the built-in schema, and the
+# learned-phrase Lua translator
 # ---------------------------------------------------------------------------
 
 assemble_ime() {
@@ -388,6 +395,9 @@ assemble_ime() {
   # Built-in Rime schema sources (shared_data_dir); the engine deploys them into the
   # user data directory, so the signed bundle stays read-only.
   ditto "${RIME_DEFAULT}" "${contents}/Resources/rime-default"
+  # The learned-phrase translator RimeEngine copies into each schema set's lua/ directory.
+  mkdir -p "${contents}/Resources/rime-lua"
+  cp "${LEARNED_LUA}" "${contents}/Resources/rime-lua/noema_learned.lua"
   icns NoemaIME "${contents}/Resources/NoemaIME.icns"
   cp "${ICON_DIR}/menu-icon.pdf" "${contents}/Resources/menu-icon.pdf"
   write_info_plist "${IME_RESOURCES}/Info.plist.in" "${contents}/Info.plist"
@@ -402,7 +412,8 @@ assemble_ime() {
 }
 
 # ---------------------------------------------------------------------------
-# Noema.app: the companion agent and its LaunchAgent plist; no librime, no rpath
+# Noema.app: the companion agent, its LaunchAgent plist, and the dictionary lockfile;
+# no librime, no rpath
 # ---------------------------------------------------------------------------
 
 assemble_agent() {
@@ -415,6 +426,8 @@ assemble_agent() {
   chmod 0755 "${contents}/MacOS/NoemaAgent"
   icns Noema "${contents}/Resources/Noema.icns"
   cp "${ICON_DIR}/menu-icon.pdf" "${contents}/Resources/menu-icon.pdf"
+  # The pinned dictionary downloads Settings › 词库 installs from (SHA-256 per entry).
+  cp "${DICTIONARY_LOCKFILE}" "${contents}/Resources/dictionaries.lock.json"
   # SMAppService.agent(plistName:) registers Contents/Library/LaunchAgents/<plist>.
   cp "${AGENT_RESOURCES}/${AGENT_LAUNCH_AGENT}" "${contents}/Library/LaunchAgents/${AGENT_LAUNCH_AGENT}"
   write_info_plist "${AGENT_RESOURCES}/Info.plist.in" "${contents}/Info.plist"

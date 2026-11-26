@@ -40,9 +40,11 @@ jobs:
       - Sources/
       - Tests/
       - Resources/rime-default/
+      - Resources/rime-lua/
       - Resources/IME/Info.plist.in
       - Resources/Agent/
       - vendor/librime.lock
+      - vendor/dictionaries.lock.json
       - scripts/build/librime.sh
       - scripts/dev/test.sh
     fetch:
@@ -62,6 +64,7 @@ jobs:
       - Tests/
       - Resources/
       - vendor/librime.lock
+      - vendor/dictionaries.lock.json
       - scripts/build/librime.sh
       - scripts/build/bundle.sh
       - scripts/build/verify-bundle.sh
