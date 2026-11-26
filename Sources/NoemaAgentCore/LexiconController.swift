@@ -100,15 +100,16 @@ public final class LexiconController {
     }
 
     /// Downloads, verifies, and extracts the lockfile's entry for `schemaSetID` into
-    /// `schemas/<set>/`, off the main actor, then refreshes.
+    /// `schemas/<set>/`, off the main actor, then refreshes. A second call while the set
+    /// installs returns at once: the state turns `.installing` before the first suspension.
     public func install(schemaSetID: SchemaSetID) async {
-        guard schemaSetID != .builtin else { return }
+        guard schemaSetID != .builtin, installStates[schemaSetID] != .installing else { return }
+        installStates[schemaSetID] = .installing
         if lockfile == nil { await refresh() }
         guard let entry = lockfile?.entry(for: schemaSetID) else {
             installStates[schemaSetID] = .failed(lockfileError ?? "the lockfile has no \(schemaSetID.rawValue) entry")
             return
         }
-        installStates[schemaSetID] = .installing
         let installer = installer
         let outcome = await Task.detached(priority: .userInitiated) { () -> String? in
             do {

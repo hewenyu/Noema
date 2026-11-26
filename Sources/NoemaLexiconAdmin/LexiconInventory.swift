@@ -182,6 +182,7 @@ public struct LexiconInstaller: Sendable {
             } catch {
                 throw .io("creating \(directory.path): \(error)")
             }
+            guard FileSafety.isRealDirectory(directory) else { throw .io("\(directory.path) is not a real directory") }
             guard rename(download.file.path, destination.path) == 0 else {
                 throw .io("installing \(destination.path): errno \(errno)")
             }

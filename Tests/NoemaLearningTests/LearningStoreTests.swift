@@ -73,6 +73,19 @@ func permissions(_ url: URL) -> mode_t {
         #expect(try store.entriesSince(revision: 2).map(\.text) == ["世界"])
     }
 
+    /// `nihao,` commits `你好，`: the learned phrase is `你好`. Edge punctuation, symbols, and
+    /// spaces are trimmed; what is left must hold a Han character.
+    @Test func normalizationTrimsEdgePunctuationSymbolsAndSpaces() {
+        #expect(event("nihao", "你好，", preedit: "ni hao").normalized()?.text == "你好")
+        #expect(event("nihao", "「你好」。", preedit: "ni hao").normalized()?.text == "你好")
+        #expect(event("nihao", "  你好! ", preedit: "ni hao").normalized()?.text == "你好")
+        #expect(event("nihao", "\u{3000}你好¥", preedit: "ni hao").normalized()?.text == "你好")
+        #expect(event("nihao", "你，好", preedit: "ni hao").normalized()?.text == "你，好")
+        #expect(event("nihao", "，。！").normalized() == nil)
+        #expect(event("nihao", "，abc。").normalized() == nil)
+        #expect(event("nihao", "你\t好").normalized() == nil)
+    }
+
     @Test func normalizationPrefersThePreeditOnlyWhenItSpellsTheRawInput() {
         #expect(event("nihao", "你好", preedit: "ni hao").normalized()?.pinyinNorm == "ni hao")
         #expect(event("nihao", "你好", preedit: "你 hao").normalized()?.pinyinNorm == "nihao")
@@ -238,10 +251,32 @@ func permissions(_ url: URL) -> mode_t {
     }
 
     @Test func capsTheNumberOfLines() throws {
-        let entries = (0..<10).map { index in
-            LearnedEntry(id: Int64(index), pinyinNorm: "a", pinyinCompact: "a\(index)", text: "字", frequency: Int64(10 - index),
-                         isUserPhrase: false, updatedAt: Date(), revision: Int64(index))
+        let entries = (0..<10).map { (index: Int) -> LearnedEntry in
+            let compact = "a" + String(Character(Unicode.Scalar(UInt8(0x61 + index))))
+            return LearnedEntry(id: Int64(index), pinyinNorm: "a", pinyinCompact: compact, text: "字", frequency: Int64(10 - index),
+                                isUserPhrase: false, updatedAt: Date(), revision: Int64(index))
         }
-        #expect(LearnedSnapshotExporter.lines(for: entries, maximumEntries: 3).map(\.pinyinCompact) == ["a0", "a1", "a2"])
+        #expect(LearnedSnapshotExporter.lines(for: entries, maximumEntries: 3).map(\.pinyinCompact) == ["aa", "ab", "ac"])
+    }
+
+    /// An entry written into the store behind `normalized()`'s back cannot add a line: a tab,
+    /// newline, CR, or NUL in any field, a `#` comment, an empty field, or a compact key that
+    /// is not plain `a`-`z` is skipped.
+    @Test func skipsEntriesThatWouldInjectTSVLines() {
+        func entry(_ norm: String, _ compact: String, _ text: String) -> LearnedEntry {
+            LearnedEntry(id: 1, pinyinNorm: norm, pinyinCompact: compact, text: text, frequency: 1,
+                         isUserPhrase: false, updatedAt: Date(), revision: 1)
+        }
+        let hostile = [
+            entry("ni hao", "nihao", "你好\nevil\t坏\t999"), entry("ni hao", "nihao", "你\t好"),
+            entry("ni hao", "nihao", "你好\r"), entry("ni hao", "nihao", "你\u{0}好"),
+            entry("ni hao", "nihao", "#你好"), entry("ni hao", "nihao", ""),
+            entry("ni hao", "ni\nhao", "你好"), entry("ni hao", "ni\thao", "你好"),
+            entry("ni hao", "ni hao", "你好"), entry("ni hao", "NIHAO", "你好"), entry("ni hao", "", "你好"),
+            entry("ni\nhao", "nihao", "你好"), entry("", "nihao", "你好"),
+        ]
+        let lines = LearnedSnapshotExporter.lines(for: hostile + [entry("shi jie", "shijie", "世界")])
+        #expect(lines.map(\.text) == ["世界"], "\(lines)")
+        #expect(LearnedSnapshotExporter.render(lines) == Data("shijie\t世界\t1\n".utf8))
     }
 }

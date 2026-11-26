@@ -34,10 +34,12 @@ public struct LearningCommitEvent: Sendable, Hashable {
 
     /// The canonical `(pinyin_norm, pinyin_compact, text)` of this event, or nil when it is
     /// not learnable: no Han character, a control character (tab, newline) in the text, an
-    /// empty or oversized spelling. The preedit supplies the syllable breaks when it spells
-    /// the same letters as the raw input; otherwise the raw input is used as one run.
+    /// empty or oversized spelling. Leading and trailing punctuation, symbols, and spaces are
+    /// trimmed first (`nihao,` commits `你好，`; `你好` is learned). The preedit supplies the
+    /// syllable breaks when it spells the same letters as the raw input; otherwise the raw
+    /// input is used as one run.
     public func normalized() -> (pinyinNorm: String, pinyinCompact: String, text: String)? {
-        let text = self.text
+        let text = Self.trimmingEdgePunctuation(self.text)
         guard !text.isEmpty, text.unicodeScalars.count <= Self.maximumTextScalars,
               TextNormalization.containsHanCharacters(text),
               !text.unicodeScalars.contains(where: { $0.properties.generalCategory == .control })
@@ -48,6 +50,29 @@ public struct LearningCommitEvent: Sendable, Hashable {
         let key = !preeditKey.isEmpty && TextNormalization.compactPinyinKey(preedit) == rawCompact ? preeditKey : rawKey
         guard !key.isEmpty, key.unicodeScalars.count <= Self.maximumPinyinScalars else { return nil }
         return (key, TextNormalization.compactPinyinKey(key), text)
+    }
+
+    /// `text` without leading and trailing Unicode punctuation (`P*`), symbols (`S*`),
+    /// separators (`Z*`), and whitespace.
+    static func trimmingEdgePunctuation(_ text: String) -> String {
+        func isEdge(_ scalar: Unicode.Scalar) -> Bool {
+            switch scalar.properties.generalCategory {
+            case .connectorPunctuation, .dashPunctuation, .openPunctuation, .closePunctuation,
+                 .initialPunctuation, .finalPunctuation, .otherPunctuation,
+                 .mathSymbol, .currencySymbol, .modifierSymbol, .otherSymbol,
+                 .spaceSeparator, .lineSeparator, .paragraphSeparator:
+                true
+            default:
+                scalar.properties.isWhitespace
+            }
+        }
+        let scalars = Array(text.unicodeScalars)
+        guard let first = scalars.firstIndex(where: { !isEdge($0) }),
+              let last = scalars.lastIndex(where: { !isEdge($0) })
+        else { return "" }
+        var trimmed = String.UnicodeScalarView()
+        trimmed.append(contentsOf: scalars[first...last])
+        return String(trimmed)
     }
 }
 
@@ -77,6 +102,19 @@ public struct LearnedEntry: Sendable, Hashable {
         self.isUserPhrase = isUserPhrase
         self.updatedAt = updatedAt
         self.revision = revision
+    }
+}
+
+extension LearnedEntry {
+    /// Whether the entry can be written as one tab-separated line: `text`, `pinyinNorm`, and
+    /// `pinyinCompact` are non-empty and free of control characters (tab, newline, CR, NUL),
+    /// and `text` does not start with `#` (a comment line). `normalized()` never stores
+    /// anything else; this guards every TSV writer against a store edited behind its back.
+    public var isSafeForTSV: Bool {
+        func clean(_ field: String) -> Bool {
+            !field.isEmpty && !field.unicodeScalars.contains { $0.properties.generalCategory == .control }
+        }
+        return clean(text) && clean(pinyinNorm) && clean(pinyinCompact) && !text.hasPrefix("#")
     }
 }
 

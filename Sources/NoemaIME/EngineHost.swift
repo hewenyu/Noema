@@ -76,6 +76,9 @@ final class EngineHost {
     private var rootDir = NoemaPaths.rimeUserDataDir()
     private var builtinSharedDataDir: URL?
     private var luaFile: URL?
+    private var logDir = NoemaPaths.logDir()
+    /// Set once a boot of a non-built-in set fell back to the built-in one.
+    private var triedBuiltinFallback = false
 
     private init() {}
 
@@ -91,6 +94,12 @@ final class EngineHost {
     /// deploys off the main actor, so IMKit keys keep passing through and SIGTERM keeps
     /// being served meanwhile. Never throws or traps: a failure leaves the host
     /// `.unavailable` (keys pass through), and Safe Mode is logged by reason.
+    ///
+    /// A non-built-in set from `active-schema-set.json` that fails to boot (an error,
+    /// `engineInitFailed`, or `bootCrashLoop`) falls back once to the built-in set, recorded
+    /// as active, so a broken external pack never strands the user in Safe Mode with no
+    /// engine to switch from. A crash loop's sentinel is cleared for that one attempt; the
+    /// built-in record keeps a crash of the built-in set itself from looping.
     func boot() {
         guard case .uninitialized = state else { return }
         let userDataDir = NoemaPaths.rimeUserDataDir()
@@ -109,10 +118,15 @@ final class EngineHost {
         }
         rootDir = userDataDir
         builtinSharedDataDir = sharedDataDir
+        self.logDir = logDir
         luaFile = NoemaPaths.resolveLearnedLua(bundle: .main)
         if luaFile == nil { log.error("no bundled noema_learned.lua; learned phrases reach Rime only through userdbs") }
         let configuration = RimeEngineConfiguration.activeSchemaSet(
             root: userDataDir, builtinSharedDataDir: sharedDataDir, logDir: logDir, luaFile: luaFile)
+        startBoot(configuration)
+    }
+
+    private func startBoot(_ configuration: RimeEngineConfiguration) {
         log.info("booting schema set \(configuration.schemaSetID?.rawValue ?? "-", privacy: .public)")
         let cancellation = DeployCancellation()
         let task = Task { @MainActor [weak self] in
@@ -122,12 +136,12 @@ final class EngineHost {
             } catch {
                 outcome = .failure(error)
             }
-            self?.finishBoot(outcome)
+            self?.finishBoot(outcome, configuration: configuration)
         }
         state = .booting(task, cancellation)
     }
 
-    private func finishBoot(_ outcome: Result<RimeEngine, NoemaError>) {
+    private func finishBoot(_ outcome: Result<RimeEngine, NoemaError>, configuration: RimeEngineConfiguration) {
         switch state {
         case .booting:
             break
@@ -136,6 +150,7 @@ final class EngineHost {
             if case .success(let engine) = outcome { engine.shutdown() }
             return
         }
+        if fallBackToBuiltin(after: outcome, configuration: configuration) { return }
         switch outcome {
         case .success(let engine):
             state = .ready(engine)
@@ -151,6 +166,49 @@ final class EngineHost {
             ipc?.setEngineMode("unavailable")
             log.fault("RimeEngine unavailable: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    /// Starts the one fallback boot of the built-in set when `configuration` named another
+    /// set and its boot failed in a way the built-in set may not share. Root-wide failures
+    /// (the lock is held elsewhere, the directory is unwritable, the sentinel is corrupt)
+    /// would fail the same way and are left alone.
+    private func fallBackToBuiltin(after outcome: Result<RimeEngine, NoemaError>, configuration: RimeEngineConfiguration) -> Bool {
+        guard !triedBuiltinFallback, let set = configuration.schemaSetID, set != .builtin,
+              let builtinSharedDataDir
+        else { return false }
+        let clearSentinel: Bool
+        switch outcome {
+        case .failure: clearSentinel = false
+        case .success(let engine):
+            switch engine.safeModeReason {
+            case .engineInitFailed?, .bootCrashLoop?: clearSentinel = true
+            default: return false
+            }
+            engine.shutdown()
+        }
+        triedBuiltinFallback = true
+        log.error("schema set \(set.rawValue, privacy: .public) failed to boot; falling back to the built-in set")
+        var savedBuiltin = false
+        do {
+            try ActiveSchemaSetRecord(schemaSetID: .builtin, schemaID: SchemaSetID.builtin.defaultSchemaID)
+                .save(to: NoemaPaths.activeSchemaSetURL(root: rootDir))
+            savedBuiltin = true
+        } catch {
+            log.error("cannot record the built-in set as active: \(String(describing: error), privacy: .public)")
+        }
+        // Clear the sentinel only after `builtin` is persisted as active, so a failed save
+        // cannot loop across processes while a prior interrupted boot + broken external pack
+        // never strands the built-in fallback in `bootCrashLoop`.
+        if clearSentinel && savedBuiltin {
+            let guardian = BootGuard(userDataDir: rootDir, threshold: configuration.bootFailureThreshold)
+            if guardian.acquireLock() == .acquired { guardian.clear() }
+            guardian.releaseLock()
+        }
+        startBoot(RimeEngineConfiguration(
+            sharedDataDir: builtinSharedDataDir, userDataDir: rootDir, logDir: logDir,
+            schemaID: SchemaSetID.builtin.defaultSchemaID, deployerURL: configuration.deployerURL,
+            schemaSetID: .builtin, luaFile: luaFile))
+        return true
     }
 
     /// Finalizes librime and releases the user-data lock. While booting, cleans the boot up
@@ -269,10 +327,13 @@ final class EngineHost {
         ipc = manager
         reporter = CompositionIPCReporter(manager: manager, isSecureInputEnabled: isSecureInputEnabled)
         // Called on the manager's queue for every message the gate admitted (epoch and
-        // generation checked); a switch hops to the main actor, never blocking the queue.
+        // generation checked); a switch hops to the main queue, never blocking the manager's.
+        // `DispatchQueue.main` keeps the requests in arrival order (one Task each would not).
         manager.setMessageHandler { [weak self] message in
             guard case .switchSchemaSet(_, let request) = message else { return }
-            Task { @MainActor in self?.handleSchemaSwitchRequest(request) }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handleSchemaSwitchRequest(request) }
+            }
         }
         switch state {
         case .ready(let engine): manager.setEngineMode(engine.safeModeReason == nil ? "rime" : "safeMode")

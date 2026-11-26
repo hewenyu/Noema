@@ -33,6 +33,9 @@ Noema 同时支持内置拼音与万象（Wanxiang）、雾凇（rime-ice）、�
 - `CRimeTests` 的 `LexiconAndLearningTests` 在真实 librime、真实 deployer 子进程与真实 SQLite 上验证：三套夹具方案（其一 `translator/prism` 不同于 `translator/dictionary`）热切换、userdb 物理隔离、二次切换不重编译；跨方案学习分别经 userdb 投影与 Lua 翻译器两条路径生效；组字中的切换请求经真实 IPC 回报 `pendingIdle` 并在空闲后 `ready`；损坏 `CURRENT`、`MANIFEST`、`.ldb` 均被探测、隔离并恢复；部署失败时 `build/` 字节不变；第二写者被拒；安全输入零写入；开启学习后 500 键 P95 < 2 ms。负控（去掉导出探测、去掉安全输入判断、去掉空闲等待、注入 `import Network`/`import NoemaLexiconAdmin`、删掉包内 `noema_learned.lua` 或 `dictionaries.lock.json`）都会让对应检查失败。
 - 投影只在切换方案时发生：当前方案自己的 userdb 照常学习，其他方案在下次切换时经投影与重新导出的 `noema_learned.tsv`（启动与切换时导出）获得这些词。方案特有的词条属性（如万象的辅助码）不进入 SQLite，投影存在映射损失。
 - 无调全拼规范化会丢失声调信息，部分同音词消歧依赖方案自身。
+- 学习前去掉上屏文本首尾的标点、符号与空白（`nihao,` 上屏 `你好，`，只学 `你好`）；部分选字后的整句上屏沿用最近一次纯拼音预编辑的音节切分。`noema_learned.tsv` 与 levers 导入文件跳过含控制字符、以 `#` 开头或拼音非 `a`–`z` 的条目，即使 SQLite 被绕过写入也注入不了额外行。
+- 启动时 `active-schema-set.json` 指向的外部方案若部署或初始化失败（含崩溃循环），`EngineHost` 只回退一次内置方案并把它记为当前方案，用户不会困在 Safe Mode 里无法切回。
+- 风险：锁定在 lockfile 中的外部方案包自带的 Lua 脚本运行在 `NoemaIME` 内，可使用 `librime-lua` 的 `io`/`os`；目前只靠 SHA-256 固定来源缓解，日后如有需要可沙箱化或剥除 `io`/`os`。
 - 首次以方案集布局启动时，内置方案在 `sets/builtin/` 重新部署，根目录下旧的平铺 `build/` 与 userdb 不再使用，也不自动迁移。
 - 上游词库更新需要手动更新 `dictionaries.lock.json` 与哈希；万象的 `.gram`（约 390 MB）只登记，不随方案自动下载。
 - `rename(2)`、`link(2)` 与 `RENAME_SWAP` 仅在同一卷内原子，`schemas/`、`models/`、`sets/` 必须与根目录同卷。

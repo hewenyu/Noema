@@ -51,7 +51,7 @@ Rationale: [process model note](../.agents/notes/proposed/architecture/2026-11-2
 
 ## Schema sets and learning
 
-One root, `~/Library/Application Support/Noema/rime/`, holds the `.noema-rime.lock`, `learning.sqlite`, and `active-schema-set.json`. Each `SchemaSetID` (`builtin`, `wanxiang`, `rime-ice`, `mint`) runs with its own librime `user_data_dir` `sets/<set>/` (`build/`, userdbs, `lua/noema_learned.lua`, `noema_learned.tsv`); downloads extract to `schemas/<set>/`, models to `models/`. `EngineHost` boots the recorded set when installed, else `builtin`.
+One root, `~/Library/Application Support/Noema/rime/`, holds the `.noema-rime.lock`, `learning.sqlite`, and `active-schema-set.json`. Each `SchemaSetID` (`builtin`, `wanxiang`, `rime-ice`, `mint`) runs with its own librime `user_data_dir` `sets/<set>/` (`build/`, userdbs, `lua/noema_learned.lua`, `noema_learned.tsv`); downloads extract to `schemas/<set>/`, models to `models/`. `EngineHost` boots the recorded set when installed, else `builtin`, and falls back once to `builtin` when the recorded set fails to boot.
 
 - **Learning** — `RimeEngine.recordCommits` queues Han commits to `LearningStoreWriter`, never under secure input; it writes off the main actor and flushes before shutdown and switches.
 - **Switch** — `SchemaSetSwitcher` parks a request while composing (`pendingIdle`), deploys off the main actor (`compiling`), waits for idle again, then swaps librime (`ready` or `failed`). `UserDBGuardian` then probes the userdb with `export_user_dict`, restores a corrupt one from a SHA-256-verified snapshot or the store, and imports new entries; `noema_learned.tsv` is re-exported.

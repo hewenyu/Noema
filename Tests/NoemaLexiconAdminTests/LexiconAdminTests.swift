@@ -207,6 +207,80 @@ let repositoryRoot = URL(filePath: #filePath).deletingLastPathComponent().deleti
         }
     }
 
+    /// macOS `zip`/Archive Utility write host 19 ("OS X") with the same Unix `st_mode`; a
+    /// symlink, FIFO, or device from that host is refused like one from host 3.
+    @Test func refusesSpecialFilesFromAMacOSHost() throws {
+        for (name, mode) in [("link", UInt32(0o120777)), ("fifo", 0o010644), ("dev", 0o020644)] {
+            var zip = ZipBuilder()
+            zip.file("default.yaml", "x\n")
+            zip.items.append(.init(name: name, data: Data("/etc/passwd".utf8), mode: mode, madeBy: 0x1314))
+            let (archive, digest) = try write(zip)
+            do {
+                try SafeArchiveExtractor.extract(archive: archive, expectedSHA256: digest, into: destination)
+                Issue.record("\(name) from host 19 was extracted")
+            } catch {
+                guard case .unsafeEntry(name, _) = error else {
+                    Issue.record("\(name): expected unsafeEntry, got \(error)")
+                    continue
+                }
+            }
+            try expectNothingExtracted()
+        }
+        // Negative control: a regular file from host 19 extracts.
+        var zip = ZipBuilder()
+        zip.items.append(.init(name: "default.yaml", data: Data("x\n".utf8), mode: 0o100644, madeBy: 0x1314))
+        let (archive, digest) = try write(zip)
+        #expect(try SafeArchiveExtractor.extract(archive: archive, expectedSHA256: digest, into: destination).files == 1)
+    }
+
+    /// `schemas/` is a symlink to another directory: the install refuses before creating
+    /// anything there, so not a byte lands in the symlink's target.
+    @Test func refusesASymlinkedDestinationParent() throws {
+        let elsewhere = directory.url.appending(path: "elsewhere", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        let schemas = directory.url.appending(path: "schemas")
+        try FileManager.default.createSymbolicLink(at: schemas, withDestinationURL: elsewhere)
+        var zip = ZipBuilder()
+        zip.file("default.yaml", "x\n")
+        let (archive, digest) = try write(zip)
+        #expect(throws: SafeArchiveExtractor.Failure.notRegularFile(schemas.path)) {
+            try SafeArchiveExtractor.extract(archive: archive, expectedSHA256: digest, into: destination)
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: elsewhere.path).isEmpty)
+        // Negative control: the same archive installs once `schemas/` is a real directory.
+        try FileManager.default.removeItem(at: schemas)
+        #expect(try SafeArchiveExtractor.extract(archive: archive, expectedSHA256: digest, into: destination).files == 1)
+    }
+
+    /// The EOCD record must end exactly at its declared comment: a real comment is fine,
+    /// bytes appended after the record (or a lying comment length) are not a ZIP.
+    @Test func endOfCentralDirectoryMustMatchItsCommentLength() throws {
+        var commented = ZipBuilder()
+        commented.file("default.yaml", "x\n")
+        commented.comment = Data("built by a test".utf8)
+        let (good, goodDigest) = try write(commented)
+        #expect(try SafeArchiveExtractor.extract(archive: good, expectedSHA256: goodDigest, into: destination).files == 1)
+        try FileManager.default.removeItem(at: destination)
+
+        var lying = commented
+        lying.declaredCommentLength = 3
+        let (bad, badDigest) = try write(lying)
+        #expect(throws: SafeArchiveExtractor.Failure.notAZip("no end of central directory record")) {
+            try SafeArchiveExtractor.extract(archive: bad, expectedSHA256: badDigest, into: destination)
+        }
+        try expectNothingExtracted()
+    }
+
+    /// A ratio limit large enough to overflow `compressed * maxRatio` disables the ratio
+    /// check instead of trapping.
+    @Test func anOverflowingRatioLimitDoesNotTrap() throws {
+        var zip = ZipBuilder()
+        zip.file("default.yaml", String(repeating: "x", count: 64))
+        let (archive, digest) = try write(zip)
+        let limits = SafeArchiveExtractor.Limits(maxRatio: .max)
+        #expect(try SafeArchiveExtractor.extract(archive: archive, expectedSHA256: digest, into: destination, limits: limits).files == 1)
+    }
+
     @Test func refusesCaseOrNormalizationInsensitiveDuplicates() throws {
         for (first, second) in [("Default.yaml", "default.yaml"), ("caf\u{E9}.yaml", "cafe\u{301}.yaml")] {
             var zip = ZipBuilder()

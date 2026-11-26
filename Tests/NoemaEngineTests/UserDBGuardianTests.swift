@@ -92,6 +92,23 @@ final class FakeLevers: UserDictLevers {
         try store.recordBatch(pairs.map { LearningCommitEvent(rawInput: $0.0.replacingOccurrences(of: " ", with: ""), preedit: $0.0, text: $0.1) })
     }
 
+    /// The levers import file never carries a control character or a `#` comment from an
+    /// entry: such entries are skipped, so none can add rows of its own.
+    @Test func importTSVSkipsEntriesThatWouldInjectRows() {
+        defer { cleanUp() }
+        func entry(_ norm: String, _ text: String) -> LearnedEntry {
+            LearnedEntry(id: 1, pinyinNorm: norm, pinyinCompact: norm.replacingOccurrences(of: " ", with: ""), text: text,
+                         frequency: 2, isUserPhrase: false, updatedAt: Date(), revision: 1)
+        }
+        let hostile = [
+            entry("ni hao", "你好\t坏 huai\t999\n坏"), entry("ni hao", "你好\n坏\tni hao\t999"), entry("ni hao", "你好\r"),
+            entry("ni hao", "你\u{0}好"), entry("ni hao", "#你好"), entry("ni hao", ""),
+            entry("ni\thao", "你好"), entry("ni\nhao", "你好"), entry("", "你好"),
+        ]
+        let data = UserDBGuardian.importTSV(hostile + [entry("shi jie", "世界")])
+        #expect(String(decoding: data, as: UTF8.self) == "世界\tshi jie\t2\n")
+    }
+
     // MARK: Snapshots
 
     @Test func snapshotIsWrittenOnlyFromASuccessfulExportAndVerifiedBySHA256() throws {

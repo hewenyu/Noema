@@ -221,9 +221,14 @@ enum LexiconCommand {
             fputs("noema-cli lexicon switch: cannot lock \(options.root.path): \(reason.rawValue)\n", stderr)
             return 1
         }
+        // Boot the built-in set, never the target: a session on the target would open its
+        // userdb before `UserDBGuardian` inspects it. `switchSchemaSet` below checks (and if
+        // need be quarantines and restores) the target's userdb with no session open, as the
+        // input method's own switch does. A built-in target has no other set to boot from.
         let configuration = RimeEngineConfiguration(
-            sharedDataDir: shared, userDataDir: options.root, logDir: options.logDir, schemaID: schemaID,
-            deployerURL: options.deployer, schemaSetID: set, luaFile: options.luaFile)
+            sharedDataDir: builtin, userDataDir: options.root, logDir: options.logDir,
+            schemaID: SchemaSetID.builtin.defaultSchemaID, deployerURL: options.deployer, schemaSetID: .builtin,
+            luaFile: options.luaFile)
         let engine: RimeEngine
         do {
             engine = try await RimeEngine.start(configuration: configuration)
@@ -235,7 +240,7 @@ enum LexiconCommand {
         if let reason = engine.safeModeReason {
             fputs(reason == .userDataDirLocked
                 ? lockMessage
-                : "noema-cli lexicon switch: \(set.rawValue) did not deploy (\(reason.rawValue)); its previous build/ is unchanged. See \(options.logDir.path)/noema-rime-deployer.log\n",
+                : "noema-cli lexicon switch: the built-in set did not boot (\(reason.rawValue)); nothing changed. See \(options.logDir.path)/noema-rime-deployer.log\n",
                 stderr)
             return 1
         }
@@ -252,7 +257,7 @@ enum LexiconCommand {
             print("  active-schema-set.json: \(report.savedActiveRecord ? "saved" : "NOT saved")")
             return report.savedActiveRecord ? 0 : 1
         } catch {
-            fputs("noema-cli lexicon switch: \(error)\n", stderr)
+            fputs("noema-cli lexicon switch: \(set.rawValue) did not switch (\(error)); its previous build/ is unchanged. See \(options.logDir.path)/noema-rime-deployer.log\n", stderr)
             return 1
         }
     }

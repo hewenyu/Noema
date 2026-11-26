@@ -279,6 +279,11 @@ struct LexiconSettingsForm: View {
         }
         .formStyle(.grouped)
         .task { await lexicon.refresh() }
+        // The IME saves `active-schema-set.json` before it reports `ready`: rescan then, so
+        // 当前方案集 and 使用中 follow the switch at once.
+        .onChange(of: service.lastSchemaSwitchStatus) { _, status in
+            if status?.phase == .ready { Task { await lexicon.refresh() } }
+        }
     }
 
     @ViewBuilder

@@ -313,10 +313,11 @@ public struct UserDBGuardian {
         return (snapshot, metadata)
     }
 
-    /// `<text>\t<pinyin_norm>\t<frequency>` lines, the levers import format.
+    /// `<text>\t<pinyin_norm>\t<frequency>` lines, the levers import format. Entries that
+    /// could inject a line or a comment (`LearnedEntry.isSafeForTSV`) are skipped.
     public static func importTSV(_ entries: [LearnedEntry]) -> Data {
         var text = ""
-        for entry in entries { text += "\(entry.text)\t\(entry.pinyinNorm)\t\(max(entry.frequency, 1))\n" }
+        for entry in entries where entry.isSafeForTSV { text += "\(entry.text)\t\(entry.pinyinNorm)\t\(max(entry.frequency, 1))\n" }
         return Data(text.utf8)
     }
 

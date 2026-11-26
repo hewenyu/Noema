@@ -130,6 +130,66 @@ extension LibrimeSerializedTests {
             #expect(watermarks == ["mint", "rime-ice"], "\(watermarks)")
         }
 
+        /// `nihao,` commits `你好，` (the punctuator commits the candidate plus the full-width
+        /// comma): `learning.sqlite` learns `你好`, and the other set's TSV and userdb never
+        /// carry the comma.
+        @Test func trailingPunctuationIsTrimmedBeforeLearning() async throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+            let host = SwitcherHost(workspace: workspace, engine: engine, store: store, writer: writer)
+
+            var committed: [String] = []
+            for character in "nihao," {
+                if let text = engine.processKey(.text(character)).committedText { committed.append(text) }
+            }
+            #expect(committed == ["你好，"], "\(committed)")
+            writer.flush()
+            let learned = try store.allEntries()
+            #expect(learned.map(\.text) == ["你好"] && learned.first?.pinyinNorm == "ni hao", "\(learned)")
+
+            #expect(try await host.switchAndWait(.rimeIce, "rime_ice_fixture").phase == .ready)
+            let tsv = try String(contentsOf: workspace.setDir(.rimeIce).appending(path: NoemaPaths.learnedTSVFileName), encoding: .utf8)
+            #expect(tsv == "nihao\t你好\t1\n")
+            #expect(!candidates(engine, "nihao").contains("你好，"))
+        }
+
+        /// `nihaoshijie`, select `你好` (preedit `你好shi jie`), then `世界`: the commit
+        /// `你好世界` is learned under the syllables of the all-pinyin preedit, `ni hao shi
+        /// jie`, not the unspaced raw input.
+        @Test func partialSelectionCommitKeepsTheSyllableBreaks() throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+
+            for character in "nihaoshijie" { _ = engine.processKey(.text(character)) }
+            try #require(engine.currentState.preedit == "ni hao shi jie", "\(engine.currentState.preedit)")
+            func select(_ text: String) throws -> KeyHandlingResult {
+                for _ in 0..<8 {
+                    if let index = engine.currentState.candidates.firstIndex(where: { $0.text == text }) {
+                        return engine.selectCandidate(at: index)
+                    }
+                    engine.changePage(backward: false)
+                }
+                Issue.record("no candidate \(text) in \(engine.currentState.candidates.map(\.text))")
+                throw CancellationError()
+            }
+            #expect(try select("你好").committedText == nil)
+            #expect(engine.currentState.preedit.hasPrefix("你好"), "\(engine.currentState.preedit)")
+            #expect(try select("世界").committedText == "你好世界")
+            writer.flush()
+            let learned = try store.allEntries()
+            #expect(learned.map(\.text) == ["你好世界"] && learned.first?.pinyinNorm == "ni hao shi jie", "\(learned)")
+        }
+
         /// An agent `switchSchemaSet` arriving mid-composition over the real IPC manager is
         /// parked (`pendingIdle`), the preedit stays, nothing compiles; the commit that ends
         /// the composition starts it (`compiling`); a composition begun meanwhile holds the
@@ -164,8 +224,10 @@ extension LibrimeSerializedTests {
             }
             manager.setMessageHandler { message in
                 guard case .switchSchemaSet(_, let request) = message else { return }
-                Task { @MainActor in
-                    switcher.request(.init(requestID: request.requestID, schemaSetID: request.schemaSetID, schemaID: request.schemaID))
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        switcher.request(.init(requestID: request.requestID, schemaSetID: request.schemaSetID, schemaID: request.schemaID))
+                    }
                 }
             }
             manager.start()

@@ -101,7 +101,9 @@ public enum SafeArchiveExtractor {
         guard size >= 22 else { throw .notAZip("too short") }
         let tailLength = Int(min(size, 22 + 0xFFFF))
         let tail = try file.read(at: size - Int64(tailLength), count: tailLength)
-        guard let eocd = (0...(tailLength - 22)).reversed().first(where: { tail.u32($0) == 0x0605_4B50 }) else {
+        guard let eocd = (0...(tailLength - 22)).reversed().first(where: {
+            tail.u32($0) == 0x0605_4B50 && $0 + 22 + Int(tail.u16($0 + 20)) == tailLength
+        }) else {
             throw .notAZip("no end of central directory record")
         }
         if eocd >= 20, tail.u32(eocd - 20) == 0x0706_4B50 { throw .unsupported("archive", reason: "ZIP64") }
@@ -153,11 +155,11 @@ public enum SafeArchiveExtractor {
             guard flags & 0x0041 == 0 else { throw .unsupported(name, reason: "encrypted") }
             guard method == 0 || method == 8 else { throw .unsupported(name, reason: "compression method \(method)") }
 
-            // File type: Unix hosts carry st_mode in the high half of the external attributes.
+            // File type: Unix (3) and macOS (19) hosts carry st_mode in the high half of the external attributes.
             let host = madeBy >> 8
             let mode = mode_t(external >> 16)
             var isDirectory = name.hasSuffix("/")
-            if host == 3, mode != 0 {
+            if host == 3 || host == 19, mode != 0 {
                 switch mode & S_IFMT {
                 case S_IFREG: guard !isDirectory else { throw .unsafeEntry(name, reason: "file named like a directory") }
                 case S_IFDIR: isDirectory = true
@@ -171,7 +173,8 @@ public enum SafeArchiveExtractor {
             if isDirectory, compressed != 0 || uncompressed != 0 { throw .unsafeEntry(name, reason: "directory with data") }
             if !isDirectory {
                 if uncompressed > 0, compressed == 0 { throw .ratioExceeded(name) }
-                if uncompressed > compressed * limits.maxRatio { throw .ratioExceeded(name) }
+                let (maxAllowed, overflow) = compressed.multipliedReportingOverflow(by: limits.maxRatio)
+                if !overflow, uncompressed > maxAllowed { throw .ratioExceeded(name) }
                 if method == 0, compressed != uncompressed { throw .corrupt(name, reason: "stored sizes differ") }
             }
             total += uncompressed
@@ -224,6 +227,9 @@ public enum SafeArchiveExtractor {
         } catch {
             throw .io("creating \(parent.path): \(error)")
         }
+        // A symlinked parent (`schemas/` -> elsewhere) or destination would redirect the install.
+        guard FileSafety.isRealDirectory(parent) else { throw .notRegularFile(parent.path) }
+        if let type = FileSafety.fileType(destination), type != S_IFDIR { throw .notRegularFile(destination.path) }
         let temporary = parent.appending(path: ".\(destination.lastPathComponent).extract.\(getpid()).\(UUID().uuidString)")
         guard mkdir(temporary.path, 0o700) == 0 else { throw .io("creating \(temporary.path): errno \(errno)") }
         var installed = false

@@ -52,6 +52,7 @@ public final class DictionaryDownloader: Sendable {
         } catch {
             throw .io("creating \(directory.path): \(error)")
         }
+        guard FileSafety.isRealDirectory(directory) else { throw .io("\(directory.path) is not a real directory") }
         let file = directory.appending(path: ".download.\(getpid()).\(UUID().uuidString)")
         let descriptor = open(file.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else { throw .io("creating \(file.path): errno \(errno)") }

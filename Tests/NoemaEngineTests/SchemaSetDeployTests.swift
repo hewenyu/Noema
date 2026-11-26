@@ -122,6 +122,10 @@ import Testing
         #expect(SchemaPatch.appendingTranslator(component, to: already) == already)
         #expect(SchemaPatch.appendingTranslator(component, to: "patch: {a: 1}\n") == nil, "flow style is refused")
         #expect(SchemaPatch.appendingTranslator(component, to: "patch:\n\ta: 1\n") == nil, "tab indentation is refused")
+        // CRLF files (written on Windows) are merged, not refused, and keep their line endings.
+        #expect(SchemaPatch.appendingTranslator(component, to: "# mine\r\npatch:\r\n  a: 1\r\n") ==
+                "# mine\r\npatch:\r\n  \(line)\r\n  a: 1\r\n")
+        #expect(SchemaPatch.isTopLevelPatchKey("patch:\r") && SchemaPatch.isTopLevelPatchKey("patch: # c\r"))
     }
 
     // MARK: Staging locks and the build switch

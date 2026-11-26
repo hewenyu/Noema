@@ -263,6 +263,10 @@ extension RimeEngine {
                 if !creating, errno == ENOENT {
                     let directory = open(staging.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                     guard directory >= 0 else { return nil }
+                    guard flock(directory, LOCK_EX | LOCK_NB) == 0 else {
+                        close(directory)
+                        return nil
+                    }
                     return StagingLock(descriptor: directory)
                 }
                 return nil

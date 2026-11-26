@@ -29,9 +29,15 @@ struct ZipBuilder {
         var deflate = false
         /// Overrides the uncompressed size written to the headers.
         var declaredSize: UInt32?
+        /// Overrides "version made by" (host in the high byte); default Unix (0x0314) or DOS.
+        var madeBy: UInt16?
     }
 
     var items: [Item] = []
+    /// The end-of-central-directory comment.
+    var comment = Data()
+    /// The comment length the EOCD declares; defaults to `comment.count`.
+    var declaredCommentLength: UInt16?
 
     mutating func file(_ name: String, _ text: String, deflate: Bool = false) {
         items.append(Item(name: name, data: Data(text.utf8), deflate: deflate))
@@ -60,7 +66,7 @@ struct ZipBuilder {
             archive.le16(UInt16(name.count)); archive.le16(0)
             archive.append(name); archive.append(payload)
 
-            central.le32(0x0201_4B50); central.le16(item.mode == 0 ? 20 : 0x0314); central.le16(20); central.le16(0x0800)
+            central.le32(0x0201_4B50); central.le16(item.madeBy ?? (item.mode == 0 ? 20 : 0x0314)); central.le16(20); central.le16(0x0800)
             central.le16(method); central.le16(0); central.le16(0); central.le32(crc); central.le32(UInt32(payload.count))
             central.le32(size); central.le16(UInt16(name.count)); central.le16(0); central.le16(0); central.le16(0)
             central.le16(0); central.le32(item.mode << 16); central.le32(offset)
@@ -70,7 +76,8 @@ struct ZipBuilder {
         archive.append(central)
         archive.le32(0x0605_4B50); archive.le16(0); archive.le16(0)
         archive.le16(UInt16(items.count)); archive.le16(UInt16(items.count))
-        archive.le32(UInt32(central.count)); archive.le32(centralOffset); archive.le16(0)
+        archive.le32(UInt32(central.count)); archive.le32(centralOffset)
+        archive.le16(declaredCommentLength ?? UInt16(comment.count)); archive.append(comment)
         return archive
     }
 
@@ -115,7 +122,13 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     private let routes: [String: Response]
     private let lock = NSLock()
     private var stopped = false
-    private(set) var requests: [String] = []
+    private var recorded: [String] = []
+    /// Every request path served so far, read under the lock.
+    var requests: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
 
     init(routes: [String: Response]) throws {
         self.routes = routes
@@ -179,7 +192,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         let line = String(decoding: request, as: UTF8.self).split(separator: "\r\n").first ?? ""
         let path = line.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
         lock.lock()
-        requests.append(path)
+        recorded.append(path)
         lock.unlock()
         let response = routes[path] ?? Response(status: 404, body: Data("not found".utf8))
         var head = "HTTP/1.1 \(response.status) X\r\nContent-Length: \(response.body.count)\r\nConnection: close\r\n"

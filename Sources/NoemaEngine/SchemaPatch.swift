@@ -13,11 +13,21 @@ public enum SchemaPatch {
     /// a new file when `existing` is nil or holds no top-level `patch:` key (one is
     /// appended); the line inserted right under a top-level block `patch:` line, indented
     /// like that mapping's first key (two spaces when it is empty); nil when `patch:` is in
-    /// flow style (`patch: {...}`) or the text holds a tab-indented line under it.
+    /// flow style (`patch: {...}`) or the text holds a tab-indented line under it. CRLF
+    /// files are edited line by line and keep their CRLF endings.
     public static func appendingTranslator(_ component: String, to existing: String?) -> String? {
         let line = "\"\(appendTranslatorKey)\": \"\(component)\""
-        guard var text = existing, !text.isEmpty else { return "patch:\n  \(line)\n" }
-        if text.contains("\"\(component)\"") { return text }
+        guard let original = existing, !original.isEmpty else { return "patch:\n  \(line)\n" }
+        if original.contains("\"\(component)\"") { return original }
+        // `"\r\n"` is one Character, so it never matches a `"\n"` split; edit LF lines.
+        let usesCRLF = original.contains("\r\n")
+        guard let patched = appendingLine(line, to: usesCRLF ? original.replacingOccurrences(of: "\r\n", with: "\n") : original)
+        else { return nil }
+        return usesCRLF ? patched.replacingOccurrences(of: "\n", with: "\r\n") : patched
+    }
+
+    private static func appendingLine(_ line: String, to existing: String) -> String? {
+        var text = existing
         if !text.hasSuffix("\n") { text += "\n" }
         var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         if lines.last == "" { lines.removeLast() }
@@ -38,10 +48,10 @@ public enum SchemaPatch {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    /// `patch:` at column 0 with nothing after it but spaces or a comment.
+    /// `patch:` at column 0 with nothing after it but spaces, a stray `\r`, or a comment.
     static func isTopLevelPatchKey(_ line: String) -> Bool {
         guard line.hasPrefix("patch:") else { return false }
-        let rest = line.dropFirst("patch:".count).drop { $0 == " " || $0 == "\t" }
+        let rest = line.dropFirst("patch:".count).drop { $0 == " " || $0 == "\t" || $0 == "\r" }
         return rest.isEmpty || rest.hasPrefix("#")
     }
 }

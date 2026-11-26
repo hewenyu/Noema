@@ -86,7 +86,9 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
 public final class RimeEngine: TypingEngine {
     /// Changes only through `switchSchemaSet`.
     public internal(set) var configuration: RimeEngineConfiguration
-    public private(set) var currentState: CompositionState
+    public private(set) var currentState: CompositionState {
+        didSet { noteSegmentedPreedit() }
+    }
     public var isSafeMode: Bool { currentState.isSafeMode }
     public var safeModeReason: SafeModeReason? { currentState.safeModeReason }
     public private(set) var isShutDown = false
@@ -445,11 +447,34 @@ public final class RimeEngine: TypingEngine {
         KeyHandlingResult(handled: false, state: currentState, degradation: .safeMode)
     }
 
+    /// The latest all-pinyin preedit of the current composition (`ni hao shi jie`), kept
+    /// while a commit is observed: after a partial selection the preedit reads
+    /// `你好shi jie` and no longer spells the whole raw input, so the commit that finishes
+    /// the composition takes its syllable breaks from here. Cleared when composing ends.
+    private var lastSegmentedPreedit: String?
+
+    private func noteSegmentedPreedit() {
+        guard onCommitObservation != nil, currentState.isComposing else {
+            lastSegmentedPreedit = nil
+            return
+        }
+        let preedit = currentState.preedit
+        if !TextNormalization.containsHanCharacters(preedit), !TextNormalization.tonelessPinyinKey(preedit).isEmpty {
+            lastSegmentedPreedit = preedit
+        }
+    }
+
     /// The raw input and preedit before a call that may commit; nil when nobody observes.
+    /// A preedit holding Han characters from a partial selection is replaced by the last
+    /// all-pinyin preedit (`LearningCommitEvent.normalized` still checks it spells the raw input).
     private func captureBeforeCommit() -> (rawInput: String, preedit: String)? {
         guard onCommitObservation != nil else { return nil }
         let raw = noema_rime_get_input(resources.session).map { String(cString: $0) } ?? ""
-        return (raw, currentState.preedit)
+        let preedit = currentState.preedit
+        if TextNormalization.containsHanCharacters(preedit), let segmented = lastSegmentedPreedit {
+            return (raw, segmented)
+        }
+        return (raw, preedit)
     }
 
     private func reportCommit(_ committed: String?, before: (rawInput: String, preedit: String)?) {

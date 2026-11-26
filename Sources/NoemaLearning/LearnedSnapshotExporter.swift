@@ -17,11 +17,15 @@ public enum LearnedSnapshotExporter {
         public var frequency: Int64
     }
 
-    /// The lines `export` writes, in order.
+    /// The lines `export` writes, in order. Entries that could break the line format (see
+    /// `LearnedEntry.isSafeForTSV`) or whose compact key is not plain `a`-`z` are skipped.
     public static func lines(for entries: [LearnedEntry], maximumEntries: Int = defaultMaximumEntries) -> [Line] {
         var lines: [Line] = []
         var index: [String: Int] = [:]
         for entry in entries {
+            guard entry.isSafeForTSV,
+                  entry.pinyinCompact.unicodeScalars.allSatisfy({ (0x61...0x7A).contains($0.value) })
+            else { continue }
             let key = "\(entry.pinyinCompact)\t\(entry.text)"
             if let existing = index[key] {
                 lines[existing].frequency += entry.frequency
