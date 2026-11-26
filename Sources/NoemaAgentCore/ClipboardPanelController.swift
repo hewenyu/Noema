@@ -56,7 +56,11 @@ public final class ClipboardPanelModel {
     public var query = ""
     public var filter: ClipboardFilter = .all
     public private(set) var items: [ClipboardEntryMetadata] = []
-    public var selectedID: String?
+    public var selectedID: String? {
+        didSet {
+            if selectedID != oldValue { revealedIDs.removeAll() }
+        }
+    }
     public var revealedIDs: Set<String> = []
     public var showsActions = false
     /// The app the panel will paste into: frontmost before it opened.

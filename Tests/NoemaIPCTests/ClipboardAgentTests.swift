@@ -364,6 +364,11 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         #expect(controller.model.content(for: sensitive) == .text("token sk-abcdefghijklmnopqrstu"))
         controller.model.toggleReveal(sensitive)
         #expect(!controller.model.isMasked(sensitive))
+        controller.model.moveSelection(-1)
+        #expect(controller.model.isMasked(sensitive), "moving selection re-masks revealed sensitive entry")
+        controller.model.moveSelection(1)
+        controller.model.toggleReveal(sensitive)
+        #expect(!controller.model.isMasked(sensitive))
 
         controller.hide(restoreFocus: false)
         #expect(!controller.isVisible && controller.model.isMasked(sensitive), "closing re-masks and drops decrypted content")

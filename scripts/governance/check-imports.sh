@@ -52,7 +52,7 @@ const fs = require('fs');
 const path = require('path');
 
 const BANNED_MODULES = 'AVFoundation|AVFAudio|Speech|SoundAnalysis|CoreAudio|AudioToolbox|Network|CFNetwork|WebKit|ApplicationServices|HIServices|ScreenCaptureKit|Contacts|CoreLocation|EventKit|Photos|ServiceManagement|NoemaAgentCore|NoemaLexiconAdmin|NoemaClipboardCore';
-const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|AXIsProcessTrusted[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|CGEvent(?:Post|CreateKeyboardEvent|Source)|CGEvent\\s*\\(\\s*keyboardEventSource|CGPreflight(?:Post|Listen)EventAccess|NSPasteboard[A-Za-z]*|SecItem[A-Za-z]*|RegisterEventHotKey|NSExpression';
+const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|AXIsProcessTrusted[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|CGEvent(?:Post|CreateKeyboardEvent|Source)|CGEvent\\s*\\(\\s*keyboardEventSource|CG(?:Preflight|Request)(?:Post|Listen)EventAccess|NSPasteboard[A-Za-z]*|SecItem[A-Za-z]*|RegisterEventHotKey|NSExpression';
 const ATTR = '@[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?\\s*';
 const ACCESS = '(?:public|package|internal|fileprivate|private)\\s+';
 const KIND = '(?:(?:typealias|struct|class|actor|enum|protocol|let|var|func)\\s+)?';

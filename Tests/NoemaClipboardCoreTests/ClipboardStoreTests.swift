@@ -220,13 +220,58 @@ import Testing
         let second = try store.insertText("same text", source: ClipboardSourceApp(bundleID: "com.apple.Safari", name: "Safari"), now: t0 + 60)
         #expect(second.id == first.id && store.itemCount == 1)
         #expect(second.lastUsedAt == t0 + 60 && second.source.name == "Safari" && second.isPinned && second.expiresAt == nil)
-        #expect(store.items(query: "safari").map(\.id) == [first.id])
-        #expect(store.items(query: "textedit").isEmpty)
+        #expect(store.items(query: "safari", now: t0 + 60).map(\.id) == [first.id])
+        #expect(store.items(query: "textedit", now: t0 + 60).isEmpty)
+        // Re-copying from a CJK app re-tokenizes `source_app` in `:memory:` FTS5.
+        let third = try store.insertText("same text", source: ClipboardSourceApp(bundleID: "com.apple.Notes", name: "备忘录"), now: t0 + 120)
+        #expect(third.id == first.id && third.source.name == "备忘录")
+        #expect(store.items(query: "备忘", now: t0 + 120).map(\.id) == [first.id])
+        #expect(store.items(query: "safari", now: t0 + 120).isEmpty)
         #expect(throws: ClipboardError.emptyContent) { try store.insertText("  \n ", source: nil) }
         #expect(throws: ClipboardError.imageDimensionsRejected(width: 20_000, height: 20_000)) {
             try store.insert(.image(pngData: Data([1]), thumbnailData: Data([1]), width: 20_000, height: 20_000), source: nil)
         }
+        #expect(throws: ClipboardError.imageTooLarge(store.quota.maxImageBytes + 1)) {
+            try store.insert(
+                .image(pngData: Data([1]), thumbnailData: Data(count: store.quota.maxImageBytes + 1), width: 1, height: 1),
+                source: nil)
+        }
         store.close()
+    }
+
+    @Test func opensUnderNestedMissingParentDirectories() throws {
+        let dir = try TemporaryDirectory()
+        defer { dir.cleanup() }
+        let nested = dir.url.appending(path: "missing/Noema/clipboard", directoryHint: .isDirectory)
+        #expect(!FileManager.default.fileExists(atPath: nested.deletingLastPathComponent().path))
+        let store = try ClipboardStore(directory: nested, keyStore: InMemoryClipboardKeyStore())
+        let item = try store.insertText("fresh install", source: Self.source)
+        #expect(store.items().map(\.id) == [item.id])
+        #expect(RawDisk.mode(nested) == 0o700 && RawDisk.mode(store.blobs.directory) == 0o700)
+        store.close()
+    }
+
+    @Test func recopyingCorruptedRowHealsIt() throws {
+        let dir = try TemporaryDirectory()
+        defer { dir.cleanup() }
+        let keys = InMemoryClipboardKeyStore()
+        let store = try Self.open(dir, keys: keys)
+        let original = try store.insertText("healable secret phrase", source: Self.source)
+        let dbURL = store.databaseURL
+        store.close()
+
+        // Corrupt `encrypted_payload` while keeping `dedup_hmac` intact.
+        _ = Self.rawSQL(dbURL, "UPDATE clipboard_items SET encrypted_payload = X'00112233' WHERE id = '\(original.id)'")
+        let reopened = try Self.open(dir, keys: keys)
+        #expect(reopened.diagnostics.undecryptableRows == 1 && reopened.items().isEmpty)
+
+        // Re-copying identical text replaces the corrupted row and restores search + decryption.
+        let healed = try reopened.insertText("healable secret phrase", source: Self.source)
+        #expect(healed.id != original.id && reopened.itemCount == 1)
+        #expect(reopened.diagnostics.undecryptableRows == 0)
+        #expect(reopened.items(query: "healable").map(\.id) == [healed.id])
+        #expect(try reopened.content(id: healed.id) == .text("healable secret phrase"))
+        reopened.close()
     }
 
     @Test func imagesDedupAndShareBlobsUntilTheLastReference() throws {
@@ -264,9 +309,9 @@ import Testing
         try store.setPinned(id: a.id, pinned: true, now: t0)
         let b = try store.insertImage(images[1], source: Self.source, now: t0 + 1)
         let c = try store.insertImage(images[2], source: Self.source, now: t0 + 2)
-        #expect(Set(store.items().map(\.id)) == [a.id, c.id], "b is the oldest unpinned image")
+        #expect(Set(store.items(now: t0 + 3).map(\.id)) == [a.id, c.id], "b is the oldest unpinned image")
         let d = try store.insertImage(images[3], source: Self.source, now: t0 + 3)
-        #expect(Set(store.items().map(\.id)) == [a.id, d.id], "the pinned image survives LRU")
+        #expect(Set(store.items(now: t0 + 4).map(\.id)) == [a.id, d.id], "the pinned image survives LRU")
         #expect(store.totalImageBytes <= quota.maxTotalImageBytes)
         let names = Set(RawDisk.files(under: store.blobs.directory).map(\.lastPathComponent))
         #expect(names == [a.blobDigest!, d.blobDigest!].reduce(into: Set<String>()) { $0.insert("\($1).enc"); $0.insert("\($1).thumb.enc") })
@@ -284,7 +329,7 @@ import Testing
         let evicted = try store.insertText("evicted entry zulu", source: nil, now: t0 + 1)
         for index in 2...4 { try store.insertText("entry \(index)", source: nil, now: t0 + Double(index)) }
         #expect(store.itemCount == 3)
-        let ids = store.items().map(\.id)
+        let ids = store.items(now: t0 + 10).map(\.id)
         #expect(ids.contains(oldest.id) && !ids.contains(evicted.id))
         #expect(try store.searchIDs("zulu").isEmpty)
         #expect(throws: ClipboardError.textTooLarge(store.quota.maxTextBytes + 1)) {
@@ -306,11 +351,13 @@ import Testing
         #expect(secret.expiresAt == t0 + 15 * 60 && standard.expiresAt == t0 + 30 * 86_400)
 
         #expect(try store.purgeExpired(now: t0 + 14 * 60) == 0)
+        // Expired secrets disappear from `items(now:)` immediately, even before `purgeExpired`.
+        #expect(Set(store.items(now: t0 + 16 * 60).map(\.id)) == [standard.id, pinned.id])
         #expect(try store.purgeExpired(now: t0 + 16 * 60) == 1)
-        #expect(Set(store.items().map(\.id)) == [standard.id, pinned.id])
+        #expect(Set(store.items(now: t0 + 16 * 60).map(\.id)) == [standard.id, pinned.id])
         #expect(try store.searchIDs("ghp").isEmpty)
         #expect(try store.purgeExpired(now: t0 + 31 * 86_400) == 1)
-        #expect(store.items().map(\.id) == [pinned.id], "pinned entries never expire")
+        #expect(store.items(now: t0 + 31 * 86_400).map(\.id) == [pinned.id], "pinned entries never expire")
         // Using an entry restarts its TTL; unpinning restores one.
         try store.setPinned(id: pinned.id, pinned: false, now: t0 + 31 * 86_400)
         #expect(try store.metadata(id: pinned.id).expiresAt == t0 + 61 * 86_400)

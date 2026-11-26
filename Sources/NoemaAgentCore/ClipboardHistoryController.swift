@@ -64,7 +64,7 @@ public final class ClipboardHistoryController {
     }
 
     /// Opens the store off the main thread (the keychain may prompt), then starts the
-    /// monitor, the lock and sleep observers, and the hourly TTL purge.
+    /// monitor, the lock and sleep observers, and the periodic (5 min) TTL purge.
     public func start(directory: URL = NoemaPaths.clipboardDir(), keyStore: any ClipboardKeyStore = KeychainClipboardKeyStore()) {
         monitor.setPaused(.keychainLocked, true)
         ingestQueue.async { [weak self] in

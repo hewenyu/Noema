@@ -28,7 +28,8 @@ public struct ClipboardStoreDiagnostics: Sendable, Hashable {
 /// - Unpinned rows expire `ttl(for:)` after their last use and are evicted oldest first
 ///   past `maxItems` or `maxTotalImageBytes`; pinned rows never expire or get evicted.
 /// - When the keychain refuses the master key the store is `.keychainLocked`: listing is
-///   empty and every write throws `.storeLocked` until `retryUnlock()` succeeds.
+///   empty and content writes throw `.storeLocked` until `retryUnlock()` succeeds; TTL and
+///   quota maintenance may still drop expired or over-quota rows.
 ///
 /// Thread-safe: every call is serialized by one lock.
 public final class ClipboardStore: @unchecked Sendable {
@@ -58,6 +59,14 @@ public final class ClipboardStore: @unchecked Sendable {
     public init(
         directory: URL, keyStore: any ClipboardKeyStore, quota: ClipboardStorageQuota = .default, now: Date = Date()
     ) throws(ClipboardError) {
+        let parent = directory.deletingLastPathComponent()
+        if !parent.path.isEmpty, !FileManager.default.fileExists(atPath: parent.path) {
+            do {
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            } catch {
+                throw .blobIO(parent.path, errno: errno == 0 ? EIO : errno)
+            }
+        }
         try ClipboardBlobStore.ensurePrivateDirectory(directory)
         // SQLITE_OPEN_NOFOLLOW refuses a symlink anywhere in the path: resolve the ancestors
         // (`/var` -> `/private/var`); the directory itself was just checked not to be one.
@@ -190,7 +199,13 @@ public final class ClipboardStore: @unchecked Sendable {
         let (db, index, cipher) = try ready()
         let dedup = cipher.dedupHMAC(kind: .text, payload: bytes)
         if let existing = try existingID(db, kind: .text, dedup: dedup) {
-            return try bumpLocked(db, index, id: existing, source: source, now: now)
+            if !unreadable.contains(existing) {
+                return try bumpLocked(db, index, id: existing, source: source, now: now)
+            }
+            // A corrupted row with matching dedup HMAC is replaced cleanly when re-copied.
+            try deleteRowsLocked(db, index, ids: [existing])
+            unreadable.remove(existing)
+            diagnosticsValue.undecryptableRows = unreadable.count
         }
         let id = UUID().uuidString.lowercased()
         let sensitivity = ClipboardPrivacyFilter.classifySensitivity(text)
@@ -211,6 +226,7 @@ public final class ClipboardStore: @unchecked Sendable {
     {
         guard !image.pngData.isEmpty else { throw .emptyContent }
         guard image.pngData.count <= quota.maxImageBytes else { throw .imageTooLarge(image.pngData.count) }
+        guard image.thumbnailData.count <= quota.maxImageBytes else { throw .imageTooLarge(image.thumbnailData.count) }
         lock.lock()
         defer { lock.unlock() }
         let (db, index, cipher) = try ready()
@@ -323,9 +339,12 @@ public final class ClipboardStore: @unchecked Sendable {
 
     // MARK: Reading
 
-    /// Entries matching `filter` and `query`, most recently used first. An empty query
-    /// lists everything; a query without a searchable term matches nothing.
-    public func items(filter: ClipboardFilter = .all, query: String = "", limit: Int = 500) -> [ClipboardEntryMetadata] {
+    /// Entries matching `filter` and `query`, most recently used first, excluding unreadable
+    /// or already-expired unpinned rows. An empty query lists everything; a query without a
+    /// searchable term matches nothing.
+    public func items(
+        filter: ClipboardFilter = .all, query: String = "", limit: Int = 500, now: Date = Date()
+    ) -> [ClipboardEntryMetadata] {
         lock.lock()
         defer { lock.unlock() }
         guard let handles = try? ready() else { return [] }
@@ -344,7 +363,11 @@ public final class ClipboardStore: @unchecked Sendable {
         case .pinned: "WHERE i.pinned = 1"
         }
         guard let rows = try? metadataRows(db, clause: clause, order: "ORDER BY i.last_used_at DESC, i.created_at DESC") else { return [] }
-        return Array(rows.lazy.filter { !self.unreadable.contains($0.id) && (matches?.contains($0.id) ?? true) }.prefix(limit))
+        return Array(rows.lazy.filter {
+            !self.unreadable.contains($0.id)
+                && ($0.expiresAt.map { $0 > now } ?? true)
+                && (matches?.contains($0.id) ?? true)
+        }.prefix(limit))
     }
 
     /// The ids FTS5 returns for a compiled query (tests and diagnostics); throws on a
@@ -529,7 +552,7 @@ public final class ClipboardStore: @unchecked Sendable {
         let update = try Self.prepare(index, "UPDATE clip_fts SET source_app = ?2 WHERE item_id = ?1")
         defer { sqlite3_finalize(update) }
         Self.bind(update, 1, id)
-        Self.bind(update, 2, source?.name)
+        Self.bind(update, 2, source?.name.map(ClipboardTokenizer.indexForm))
         try Self.stepDone(index, update)
         return try metadataLocked(db, id: id)
     }
