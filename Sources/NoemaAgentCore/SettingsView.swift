@@ -1,4 +1,5 @@
 import Foundation
+import NoemaClipboardCore
 import NoemaCore
 import NoemaIPC
 import NoemaLexiconAdmin
@@ -117,6 +118,7 @@ struct QuickActionsSettingsView: View {
     /// What each `v` shortcut does; agent actions show whether they are available yet.
     static func status(of item: VMenuItem) -> String {
         guard let action = item.quickAction else { return "离线可用" }
+        if action == .clipboard { return "可用（⇧⌘V）" }
         if action.isImplemented { return "可用" }
         return "计划中（\(action.plannedMilestone ?? "")）"
     }
@@ -135,6 +137,9 @@ struct QuickActionsSettingsView: View {
                 Text("v 模式")
             } footer: {
                 Text("空闲时按 v 打开九宫格菜单：方向键或 Tab 移动，回车或空格选择，Esc 或退格退出。v1+2 直接计算（空格上屏 3），v= 开始一个算式，vv 输入字母 v，v 后接其他字母（如 vim）按回车原样上屏。正在拼音输入时 v 照常参与拼写（lv → 绿）。")
+            }
+            if let clipboard = model.clipboard {
+                ClipboardSettingsSection(clipboard: clipboard)
             }
             Section {
                 Toggle("候选中显示 Emoji", isOn: Binding(
@@ -156,6 +161,71 @@ struct QuickActionsSettingsView: View {
     }
 }
 
+/// "剪贴板历史" in 快速操作: status, permissions, the blocklist, and clearing.
+struct ClipboardSettingsSection: View {
+    let clipboard: ClipboardHistoryController
+    @State private var newBundleID = ""
+    @State private var confirmsClear = false
+
+    private var storageTitle: String {
+        if let error = clipboard.storeError { return "不可用：\(error)" }
+        switch clipboard.storeState {
+        case .ready: return "AES-GCM 加密 · \(clipboard.itemCount) 条"
+        case .keychainLocked: return "钥匙串已锁定，暂停记录"
+        case nil: return "正在打开…"
+        }
+    }
+
+    var body: some View {
+        Section {
+            LabeledContent("快捷键", value: "⇧⌘V，或 v 模式 v2")
+            LabeledContent("存储", value: storageTitle)
+            LabeledContent("剪贴板访问", value: clipboard.accessStatus.title)
+            LabeledContent("辅助功能") {
+                HStack {
+                    Text(clipboard.isAccessibilityTrusted ? "已授权（回车自动粘贴）" : "未授权（只复制，按 ⌘V 粘贴）")
+                        .foregroundStyle(.secondary)
+                    if !clipboard.isAccessibilityTrusted {
+                        Button("请求授权…") { clipboard.requestAccessibility() }
+                    }
+                    Button("打开辅助功能设置…") { clipboard.openAccessibilitySettings() }
+                }
+            }
+            LabeledContent("不记录的 App") {
+                Text("\(ClipboardPrivacyFilter.builtInBlockedBundleIDs.count) 个内置密码管理器 + \(clipboard.customBlockedBundleIDs.count) 个自定义")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(clipboard.customBlockedBundleIDs, id: \.self) { bundleID in
+                LabeledContent(bundleID) {
+                    Button("移除") {
+                        clipboard.setCustomBlockedBundleIDs(clipboard.customBlockedBundleIDs.filter { $0 != bundleID })
+                    }
+                }
+            }
+            HStack {
+                TextField("Bundle ID，例如 com.example.vault", text: $newBundleID)
+                    .onSubmit(addBundleID)
+                Button("添加", action: addBundleID).disabled(newBundleID.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            Button("清空未固定历史…", role: .destructive) { confirmsClear = true }
+                .confirmationDialog("清空所有未固定的剪贴板历史？", isPresented: $confirmsClear) {
+                    Button("清空", role: .destructive) { clipboard.clearUnpinned() }
+                }
+        } header: {
+            Text("剪贴板历史")
+        } footer: {
+            Text("只在 Noema Agent 中运行。密码框（安全输入）期间、标记为隐藏或临时的内容、密码管理器与上面列出的 App 都不会被记录；所有记录用存放在登录钥匙串中的密钥以 AES-GCM 加密，未固定的记录 30 天后删除，疑似密钥的文本 15 分钟后删除。")
+        }
+    }
+
+    private func addBundleID() {
+        let trimmed = newBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        clipboard.setCustomBlockedBundleIDs(clipboard.customBlockedBundleIDs + [trimmed])
+        newBundleID = ""
+    }
+}
+
 struct OtherSettingsView: View {
     @Bindable var model: AgentStatusModel
 
@@ -164,6 +234,7 @@ struct OtherSettingsView: View {
             Section("路径") {
                 LabeledContent("Rime 用户目录", value: NoemaPaths.rimeUserDataDir().path)
                 LabeledContent("日志目录", value: NoemaPaths.logDir().path)
+                LabeledContent("剪贴板历史", value: NoemaPaths.clipboardDir().path)
                 LabeledContent("输入法", value: NoemaPaths.installedIMEBundleURL().path)
             }
             Section("诊断") {
@@ -172,7 +243,7 @@ struct OtherSettingsView: View {
                 LabeledContent("被拒绝的对端", value: "\(model.service.rejectedPeers)")
             }
             Section("隐私") {
-                Text("输入法进程零 TCC：不联网、不读剪贴板、不录音、不使用辅助功能。安全输入（密码框）期间输入法不向 Agent 发送任何消息；IPC 只携带组字的计数与状态，从不携带按键、预编辑或上屏文本。")
+                Text("输入法进程零 TCC：不联网、不读剪贴板、不录音、不使用辅助功能；剪贴板历史与自动粘贴只在 Noema Agent 中运行。安全输入（密码框）期间输入法不向 Agent 发送任何消息；IPC 只携带组字的计数与状态，从不携带按键、预编辑或上屏文本。")
                     .font(.callout)
             }
             Section("关于") {

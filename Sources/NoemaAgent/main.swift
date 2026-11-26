@@ -7,11 +7,14 @@
 // the status item and the Settings window. A direct launch (not by launchd) cannot check
 // in: it hands over to an already running instance (LaunchServices reopens it, so its
 // Settings window shows), or stays up in standby so Settings can register the LaunchAgent,
-// and quits once the launchd-managed instance posts the ready notification.
+// and quits once the launchd-managed instance posts the ready notification. Only the
+// launchd-managed instance runs the clipboard history (one writer of clipboard.sqlite):
+// the pasteboard monitor, the ⇧⌘V hotkey, and the panel.
 import AppKit
 import Dispatch
 import Foundation
 import NoemaAgentCore
+import NoemaClipboardCore
 import NoemaCore
 import NoemaIPC
 import notify
@@ -45,6 +48,8 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var statusMenuItem: NSMenuItem?
     private var settingsWindow: NSWindow?
+    private(set) var clipboard: ClipboardHistoryController?
+    private var hotKeys: GlobalHotKeyManager?
     /// Standby only: the ready-notification registration that ends this instance.
     private var standbyReadyToken: Int32 = NOTIFY_TOKEN_INVALID
 
@@ -83,6 +88,7 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
         case .listening:
             notify_post(NoemaPaths.agentReadyNotificationName)
             log.info("checked in to \(NoemaPaths.agentMachServiceName, privacy: .public)")
+            startClipboardHistory()
             installStatusItem()
         case .standbyNotLaunchdManaged:
             if let other = otherRunningInstance() {
@@ -110,7 +116,36 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         cancelStandbyReadyObserver()
+        shutDown()
+    }
+
+    /// Stops the IPC listener and the clipboard history: monitor stopped, hotkey
+    /// unregistered, store closed with a WAL checkpoint.
+    func shutDown() {
+        hotKeys?.unregisterAll()
+        hotKeys = nil
+        clipboard?.shutdown()
         coordinator?.stop()
+    }
+
+    // MARK: - Clipboard history
+
+    private func startClipboardHistory() {
+        guard clipboard == nil else { return }
+        let controller = ClipboardHistoryController(reader: SystemPasteboardReader(), pasteDriver: SystemAccessibilityPasteDriver())
+        controller.onToast = { [weak self] message in self?.toast.show(message: message) }
+        controller.start(directory: NoemaPaths.clipboardDir(), keyStore: KeychainClipboardKeyStore())
+        clipboard = controller
+        model.clipboard = controller
+        let hotKeys = GlobalHotKeyManager()
+        if hotKeys.register(.clipboardPanel, action: { [weak controller] in controller?.togglePanel() }) == nil {
+            log.error("⇧⌘V is taken by another app; the clipboard panel stays available from the menu and v2")
+        }
+        self.hotKeys = hotKeys
+    }
+
+    @objc private func toggleClipboardFromMenu(_ sender: Any?) {
+        if let clipboard { clipboard.togglePanel() } else { toast.show(message: "剪贴板历史未启动") }
     }
 
     /// Asks LaunchServices to reopen the running instance, which delivers
@@ -174,6 +209,10 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
         item.button?.toolTip = "Noema"
 
         let menu = NSMenu()
+        let history = NSMenuItem(title: "剪贴板历史…", action: #selector(toggleClipboardFromMenu(_:)), keyEquivalent: "v")
+        history.keyEquivalentModifierMask = [.command, .shift]
+        history.target = self
+        menu.addItem(history)
         let settings = NSMenuItem(title: "打开设置…", action: #selector(openSettingsFromMenu(_:)), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -210,12 +249,17 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
         return settings
     }
 
-    /// A v-mode quick action from the IME: `v9` opens Settings; an action that ships in a
-    /// later milestone shows a non-activating toast, so focus stays in the user's editor.
+    /// A v-mode quick action from the IME: `v2` opens the clipboard panel, `v9` Settings; an
+    /// action that ships in a later milestone shows a non-activating toast, so focus stays
+    /// in the user's editor.
     func runQuickAction(_ action: QuickActionID) {
         log.info("quick action \(action.rawValue, privacy: .public)")
         if action == .settings {
             showSettings(section: .general)
+            return
+        }
+        if action == .clipboard {
+            if let clipboard { clipboard.showPanel() } else { toast.show(message: "剪贴板历史未启动") }
             return
         }
         guard !action.isImplemented else { return }
@@ -289,7 +333,7 @@ func runAgent() -> Never {
         signal(signalNumber, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
         source.setEventHandler {
-            MainActor.assumeIsolated { delegate.coordinator?.stop() }
+            MainActor.assumeIsolated { delegate.shutDown() }
             exit(0)
         }
         source.resume()
@@ -298,7 +342,7 @@ func runAgent() -> Never {
 
     app.run()
     withExtendedLifetime((delegate, signalSources)) {}
-    delegate.coordinator?.stop()
+    delegate.shutDown()
     exit(0)
 }
 
