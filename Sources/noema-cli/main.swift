@@ -14,6 +14,7 @@ let usage = """
       install      install NoemaIME.app into ~/Library/Input Methods (install --help)
       reload       stop running NoemaIME processes so macOS relaunches them (reload --help)
       repl         type into a real Rime engine from stdin (repl --help)
+      lexicon      list, verify, or switch schema sets offline (lexicon --help)
     """
 
 func printError(_ message: String) {
@@ -52,6 +53,8 @@ case "reload":
     exit(ReloadCommand.run(Array(arguments.dropFirst())))
 case "repl":
     ReplCommand.run(Array(arguments.dropFirst()))
+case "lexicon":
+    exit(LexiconCommand.run(Array(arguments.dropFirst())))
 case "-h", "--help", "help":
     print(usage)
     exit(0)

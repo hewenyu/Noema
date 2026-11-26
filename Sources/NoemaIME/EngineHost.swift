@@ -4,6 +4,7 @@ import NoemaCore
 import NoemaEngine
 import NoemaIMEShell
 import NoemaIPC
+import NoemaLearning
 import NoemaUI
 
 /// Owns the one `RimeEngine` of the input method process, the coordinator every
@@ -14,6 +15,13 @@ import NoemaUI
 /// composition changes leave through `CompositionIPCReporter` (fire-and-forget, nothing
 /// under secure input), and a dead or unreachable agent only moves `IPCConnectionManager`
 /// through `degraded`, `reconnecting`, and `circuitOpen`.
+///
+/// Learning: once the engine is ready (not Safe Mode, so this process holds the root lock),
+/// `learning.sqlite` is opened read-write off the main actor and every Han commit is queued
+/// to a `LearningStoreWriter` (never under secure input). Schema sets: the engine boots the
+/// set in `active-schema-set.json` (built-in when absent or not installed), and the agent's
+/// `switchSchemaSet` runs through `SchemaSetSwitcher`, which never interrupts a composition;
+/// each phase goes back to the agent as `schemaSwitchStatus`.
 @MainActor
 final class EngineHost {
     enum State {
@@ -49,13 +57,25 @@ final class EngineHost {
             coordinator?.changePage(backward: backward, expectedGenerationID: generation)
         }
         candidatePanel = panel
-        coordinator.onCompositionChange = { [unowned self] state in self.reporter?.report(state) }
+        coordinator.onCompositionChange = { [unowned self] state in
+            self.reporter?.report(state)
+            self.switcher?.compositionDidChange(state)
+        }
         return coordinator
     }()
 
     /// The agent connection, started by `startAgentConnection()` after launch.
     private(set) var ipc: IPCConnectionManager?
     private var reporter: CompositionIPCReporter?
+
+    /// The canonical learning store and its writer; nil until the engine is ready.
+    private(set) var learningStore: LearningStore?
+    private(set) var learningWriter: LearningStoreWriter?
+    /// Runs agent-requested schema-set switches; nil until the engine is ready.
+    private(set) var switcher: SchemaSetSwitcher?
+    private var rootDir = NoemaPaths.rimeUserDataDir()
+    private var builtinSharedDataDir: URL?
+    private var luaFile: URL?
 
     private init() {}
 
@@ -87,7 +107,13 @@ final class EngineHost {
             log.fault("no bundled rime-default directory; every key passes through")
             return
         }
-        let configuration = RimeEngineConfiguration(sharedDataDir: sharedDataDir, userDataDir: userDataDir, logDir: logDir)
+        rootDir = userDataDir
+        builtinSharedDataDir = sharedDataDir
+        luaFile = NoemaPaths.resolveLearnedLua(bundle: .main)
+        if luaFile == nil { log.error("no bundled noema_learned.lua; learned phrases reach Rime only through userdbs") }
+        let configuration = RimeEngineConfiguration.activeSchemaSet(
+            root: userDataDir, builtinSharedDataDir: sharedDataDir, logDir: logDir, luaFile: luaFile)
+        log.info("booting schema set \(configuration.schemaSetID?.rawValue ?? "-", privacy: .public)")
         let cancellation = DeployCancellation()
         let task = Task { @MainActor [weak self] in
             let outcome: Result<RimeEngine, NoemaError>
@@ -118,6 +144,7 @@ final class EngineHost {
                 log.error("RimeEngine is in Safe Mode: \(reason.rawValue, privacy: .public)")
             } else {
                 log.info("RimeEngine ready")
+                attachLearning(to: engine)
             }
         case .failure(let error):
             state = .unavailable(String(describing: error))
@@ -148,10 +175,72 @@ final class EngineHost {
             state = .unavailable("shut down")
             log.info("RimeEngine boot cancelled and cleaned up")
         case .ready(let engine):
+            // A running switch first (its deployer and staging), then every queued commit,
+            // and only then librime and the lock.
+            switcher?.shutdown(deployerGrace: deployerGrace)
+            learningWriter?.flush()
+            engine.recordCommits(to: nil)
             engine.shutdown()
+            learningStore?.close()
             state = .unavailable("shut down")
             log.info("RimeEngine shut down")
         }
+        switcher = nil
+        learningWriter = nil
+        learningStore = nil
+    }
+
+    // MARK: - Learning and schema sets
+
+    /// Builds the switcher at once, then opens `learning.sqlite` read-write off the main actor
+    /// and, if the engine is still the ready one, records commits and exports the
+    /// learned-phrase snapshot for `noema_learned.lua`.
+    private func attachLearning(to engine: RimeEngine) {
+        guard let builtinSharedDataDir else { return }
+        let switcher = SchemaSetSwitcher(
+            root: rootDir, builtinSharedDataDir: builtinSharedDataDir, luaFile: luaFile,
+            engineProvider: { [weak self] in
+                guard let self, case .ready(let engine) = self.state else { return nil }
+                return engine
+            })
+        switcher.onEvent = { [weak self] event in
+            self?.ipc?.reportSchemaSwitch(SchemaSetSwitchStatus(
+                requestID: event.requestID, schemaSetID: event.schemaSetID, phase: event.phase, detail: event.detail))
+        }
+        self.switcher = switcher
+        let storeURL = NoemaPaths.learningStoreURL(root: rootDir)
+        let tsv = engine.configuration.rimeUserDataDir.appending(path: NoemaPaths.learnedTSVFileName)
+        Task { @MainActor [weak self] in
+            let store = await Task.detached(priority: .utility) { () -> LearningStore? in
+                guard let store = try? LearningStore(url: storeURL) else { return nil }
+                _ = try? LearnedSnapshotExporter.export(from: store, to: tsv)
+                return store
+            }.value
+            guard let self, case .ready(let current) = self.state, current === engine, let store else {
+                store?.close()
+                return
+            }
+            let writer = LearningStoreWriter(store: store)
+            self.learningStore = store
+            self.learningWriter = writer
+            switcher.learningStore = store
+            switcher.learningWriter = writer
+            engine.recordCommits(to: writer, isSecureInputEnabled: { IsSecureEventInputEnabled() })
+            self.log.info("learning store attached")
+        }
+    }
+
+    /// An agent's `switchSchemaSet`, on the main actor.
+    func handleSchemaSwitchRequest(_ request: SchemaSetSwitchRequest) {
+        let switchRequest = SchemaSetSwitcher.Request(
+            requestID: request.requestID, schemaSetID: request.schemaSetID, schemaID: request.schemaID)
+        guard let switcher else {
+            ipc?.reportSchemaSwitch(SchemaSetSwitchStatus(
+                requestID: request.requestID, schemaSetID: request.schemaSetID, phase: .failed,
+                detail: "the engine is not ready"))
+            return
+        }
+        switcher.request(switchRequest)
     }
 
     // MARK: - Agent connection
@@ -179,6 +268,12 @@ final class EngineHost {
     func attachAgentConnection(_ manager: IPCConnectionManager, isSecureInputEnabled: @escaping @MainActor () -> Bool) {
         ipc = manager
         reporter = CompositionIPCReporter(manager: manager, isSecureInputEnabled: isSecureInputEnabled)
+        // Called on the manager's queue for every message the gate admitted (epoch and
+        // generation checked); a switch hops to the main actor, never blocking the queue.
+        manager.setMessageHandler { [weak self] message in
+            guard case .switchSchemaSet(_, let request) = message else { return }
+            Task { @MainActor in self?.handleSchemaSwitchRequest(request) }
+        }
         switch state {
         case .ready(let engine): manager.setEngineMode(engine.safeModeReason == nil ? "rime" : "safeMode")
         case .unavailable: manager.setEngineMode("unavailable")
@@ -188,6 +283,7 @@ final class EngineHost {
 
     /// Disconnects from the agent and cancels every XPC session before returning.
     func stopAgentConnection() {
+        ipc?.setMessageHandler(nil)
         ipc?.stop()
         ipc = nil
         reporter = nil

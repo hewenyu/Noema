@@ -1,4 +1,5 @@
 import Foundation
+import NoemaCore
 
 // The v1 message families between `NoemaIME` and `NoemaAgent`. Every message travels as
 // the payload of an `IPCEnvelope` whose `kind` is the message's `kind`. Kinds and field
@@ -12,6 +13,8 @@ public enum SettingsSectionID: String, Codable, Sendable, Hashable, CaseIterable
     case general
     case quickActions
     case other
+    /// The lexicon section: schema sets, installed dictionaries, and the learning store.
+    case lexicon
 }
 
 /// The agent-owned settings the IME reads. Sent in `helloAck` and on every change.
@@ -106,6 +109,34 @@ public struct AISuggestionMessage: Codable, Sendable, Hashable {
     }
 }
 
+/// The agent asks the IME to run `schemaSetID` (and `schemaID`, default the set's own).
+public struct SchemaSetSwitchRequest: Codable, Sendable, Hashable {
+    public var requestID: UUID
+    public var schemaSetID: SchemaSetID
+    public var schemaID: String?
+
+    public init(requestID: UUID = UUID(), schemaSetID: SchemaSetID, schemaID: String? = nil) {
+        self.requestID = requestID
+        self.schemaSetID = schemaSetID
+        self.schemaID = schemaID
+    }
+}
+
+/// The IME's progress on `requestID`; `detail` says why a switch failed. Carries no user text.
+public struct SchemaSetSwitchStatus: Codable, Sendable, Hashable {
+    public var requestID: UUID
+    public var schemaSetID: SchemaSetID
+    public var phase: SchemaSwitchPhase
+    public var detail: String?
+
+    public init(requestID: UUID, schemaSetID: SchemaSetID, phase: SchemaSwitchPhase, detail: String? = nil) {
+        self.requestID = requestID
+        self.schemaSetID = schemaSetID
+        self.phase = phase
+        self.detail = detail
+    }
+}
+
 /// A message family carried in `IPCEnvelope.payload`.
 public protocol IPCMessage: Codable, Sendable, Equatable {
     /// The stable envelope kind of this case.
@@ -121,12 +152,15 @@ public enum IMEToAgent: IPCMessage {
     /// The engine mode changed after `hello` (appended to v1): `booting` became `rime`,
     /// `safeMode`, or `unavailable`. Same vocabulary as `IMEHello.engineMode`.
     case engineModeChanged(sessionEpoch: UUID, engineMode: String)
+    /// Progress of an `AgentToIME.switchSchemaSet` (appended to v1).
+    case schemaSwitchStatus(sessionEpoch: UUID, status: SchemaSetSwitchStatus)
 
     public static let helloKind = "ime.hello"
     public static let heartbeatKind = "ime.heartbeat"
     public static let compositionStateChangedKind = "ime.compositionStateChanged"
     public static let openSettingsRequestedKind = "ime.openSettingsRequested"
     public static let engineModeChangedKind = "ime.engineModeChanged"
+    public static let schemaSwitchStatusKind = "ime.schemaSwitchStatus"
 
     public var kind: String {
         switch self {
@@ -135,6 +169,7 @@ public enum IMEToAgent: IPCMessage {
         case .compositionStateChanged: Self.compositionStateChangedKind
         case .openSettingsRequested: Self.openSettingsRequestedKind
         case .engineModeChanged: Self.engineModeChangedKind
+        case .schemaSwitchStatus: Self.schemaSwitchStatusKind
         }
     }
 
@@ -146,10 +181,11 @@ public enum IMEToAgent: IPCMessage {
         case .compositionStateChanged(let snapshot): snapshot.sessionEpoch
         case .openSettingsRequested: nil
         case .engineModeChanged(let epoch, _): epoch
+        case .schemaSwitchStatus(let epoch, _): epoch
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case kind, hello, sessionEpoch, snapshot, section, engineMode }
+    private enum CodingKeys: String, CodingKey { case kind, hello, sessionEpoch, snapshot, section, engineMode, status }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -164,6 +200,10 @@ public enum IMEToAgent: IPCMessage {
             self = .engineModeChanged(
                 sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
                 engineMode: try container.decode(String.self, forKey: .engineMode))
+        case Self.schemaSwitchStatusKind:
+            self = .schemaSwitchStatus(
+                sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
+                status: try container.decode(SchemaSetSwitchStatus.self, forKey: .status))
         default:
             throw IPCError.malformedFrame
         }
@@ -180,6 +220,9 @@ public enum IMEToAgent: IPCMessage {
         case .engineModeChanged(let epoch, let mode):
             try container.encode(epoch, forKey: .sessionEpoch)
             try container.encode(mode, forKey: .engineMode)
+        case .schemaSwitchStatus(let epoch, let status):
+            try container.encode(epoch, forKey: .sessionEpoch)
+            try container.encode(status, forKey: .status)
         }
     }
 }
@@ -192,11 +235,15 @@ public enum AgentToIME: IPCMessage {
     /// decodes as 0).
     case settingsSnapshot(sessionEpoch: UUID, settings: AgentSettingsSnapshot, revision: UInt64 = 0)
     case aiSuggestion(AISuggestionMessage)
+    /// Run another schema set (appended to v1). The envelope's `generationID` is the agent's
+    /// monotonic switch generation, so the gate drops a stale or repeated request.
+    case switchSchemaSet(sessionEpoch: UUID, request: SchemaSetSwitchRequest)
 
     public static let helloAckKind = "agent.helloAck"
     public static let heartbeatAckKind = "agent.heartbeatAck"
     public static let settingsSnapshotKind = "agent.settingsSnapshot"
     public static let aiSuggestionKind = "agent.aiSuggestion"
+    public static let switchSchemaSetKind = "agent.switchSchemaSet"
 
     public var kind: String {
         switch self {
@@ -204,6 +251,7 @@ public enum AgentToIME: IPCMessage {
         case .heartbeatAck: Self.heartbeatAckKind
         case .settingsSnapshot: Self.settingsSnapshotKind
         case .aiSuggestion: Self.aiSuggestionKind
+        case .switchSchemaSet: Self.switchSchemaSetKind
         }
     }
 
@@ -213,10 +261,11 @@ public enum AgentToIME: IPCMessage {
         case .heartbeatAck(let epoch): epoch
         case .settingsSnapshot(let epoch, _, _): epoch
         case .aiSuggestion(let suggestion): suggestion.sessionEpoch
+        case .switchSchemaSet(let epoch, _): epoch
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case kind, ack, sessionEpoch, settings, settingsRevision, suggestion }
+    private enum CodingKeys: String, CodingKey { case kind, ack, sessionEpoch, settings, settingsRevision, suggestion, request }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -229,6 +278,10 @@ public enum AgentToIME: IPCMessage {
                 settings: try container.decode(AgentSettingsSnapshot.self, forKey: .settings),
                 revision: try container.decodeIfPresent(UInt64.self, forKey: .settingsRevision) ?? 0)
         case Self.aiSuggestionKind: self = .aiSuggestion(try container.decode(AISuggestionMessage.self, forKey: .suggestion))
+        case Self.switchSchemaSetKind:
+            self = .switchSchemaSet(
+                sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
+                request: try container.decode(SchemaSetSwitchRequest.self, forKey: .request))
         default:
             throw IPCError.malformedFrame
         }
@@ -245,6 +298,9 @@ public enum AgentToIME: IPCMessage {
             try container.encode(settings, forKey: .settings)
             try container.encode(revision, forKey: .settingsRevision)
         case .aiSuggestion(let suggestion): try container.encode(suggestion, forKey: .suggestion)
+        case .switchSchemaSet(let epoch, let request):
+            try container.encode(epoch, forKey: .sessionEpoch)
+            try container.encode(request, forKey: .request)
         }
     }
 }

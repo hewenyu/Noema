@@ -344,6 +344,12 @@ public final class IPCConnectionManager: @unchecked Sendable {
         sendFireAndForget(.engineModeChanged(sessionEpoch: Self.unstampedEpoch, engineMode: mode))
     }
 
+    /// Reports a schema-set switch's progress to the agent: fire-and-forget like every IME
+    /// message, so nothing leaves while unhealthy or under secure input. Never blocks.
+    public func reportSchemaSwitch(_ status: SchemaSetSwitchStatus) {
+        sendFireAndForget(.schemaSwitchStatus(sessionEpoch: Self.unstampedEpoch, status: status))
+    }
+
     /// Runs `body` on `queue` and waits: for tests and shutdown, never on the hot path.
     public func sync<T>(_ body: () -> T) -> T {
         if DispatchQueue.getSpecific(key: queueKey) != nil { return body() }
@@ -618,7 +624,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
         case .settingsSnapshot(_, let settings, let revision):
             let accepted = core.withLock { Self.applySettings(settings, revision: revision, core: &$0) }
             guard accepted else { return }
-        case .aiSuggestion:
+        case .aiSuggestion, .switchSchemaSet:
             break
         }
         guard core.withLock({ $0.running }) else { return }
@@ -900,6 +906,8 @@ extension IMEToAgent {
             return self
         case .engineModeChanged(_, let mode):
             return .engineModeChanged(sessionEpoch: epoch, engineMode: mode)
+        case .schemaSwitchStatus(_, let status):
+            return .schemaSwitchStatus(sessionEpoch: epoch, status: status)
         }
     }
 
@@ -907,7 +915,8 @@ extension IMEToAgent {
     var isLatestWins: Bool {
         switch self {
         case .compositionStateChanged, .engineModeChanged: true
-        case .hello, .heartbeat, .openSettingsRequested: false
+        // Every phase of a switch reaches the agent, in order.
+        case .hello, .heartbeat, .openSettingsRequested, .schemaSwitchStatus: false
         }
     }
 }

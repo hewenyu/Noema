@@ -1,14 +1,19 @@
 import Foundation
 import NoemaCore
 import NoemaIPC
+import NoemaLexiconAdmin
 import SwiftUI
 
 extension SettingsSectionID {
+    /// The sidebar order; raw cases stay append-only on the wire.
+    public static let sidebarOrder: [SettingsSectionID] = [.general, .quickActions, .lexicon, .other]
+
     public var title: String {
         switch self {
         case .general: "基础设置"
         case .quickActions: "快速操作"
         case .other: "其他"
+        case .lexicon: "词库"
         }
     }
 
@@ -17,6 +22,7 @@ extension SettingsSectionID {
         case .general: "gearshape"
         case .quickActions: "bolt"
         case .other: "ellipsis.circle"
+        case .lexicon: "books.vertical"
         }
     }
 }
@@ -54,7 +60,7 @@ public struct SettingsRootView: View {
 
     public var body: some View {
         NavigationSplitView {
-            List(SettingsSectionID.allCases, id: \.self, selection: $model.selectedSection) { section in
+            List(SettingsSectionID.sidebarOrder, id: \.self, selection: $model.selectedSection) { section in
                 Label(section.title, systemImage: section.symbolName).tag(section)
             }
             .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
@@ -63,6 +69,7 @@ public struct SettingsRootView: View {
             case .general: GeneralSettingsView(model: model)
             case .quickActions: QuickActionsSettingsView()
             case .other: OtherSettingsView(model: model)
+            case .lexicon: LexiconSettingsView(model: model)
             }
         }
         .frame(minWidth: 680, minHeight: 440)
@@ -163,5 +170,127 @@ struct OtherSettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(SettingsSectionID.other.title)
+    }
+}
+
+extension SchemaSwitchPhase {
+    public var title: String {
+        switch self {
+        case .compiling: "正在编译"
+        case .pendingIdle: "等待当前输入结束"
+        case .ready: "已切换"
+        case .failed: "切换失败"
+        }
+    }
+}
+
+/// Byte counts as the Finder shows them (`ByteCountFormatter`, file style).
+func formattedBytes(_ bytes: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+}
+
+/// "词库": the active schema set and the switch to another, the installed dictionaries, and
+/// a read-only summary of the canonical learning store.
+struct LexiconSettingsView: View {
+    @Bindable var model: AgentStatusModel
+
+    var body: some View {
+        Group {
+            if let lexicon = model.lexicon {
+                LexiconSettingsForm(lexicon: lexicon, service: model.service)
+            } else {
+                ContentUnavailableView("词库不可用", systemImage: "books.vertical", description: Text("Noema Agent 尚未启动 IPC 服务。"))
+            }
+        }
+        .navigationTitle(SettingsSectionID.lexicon.title)
+    }
+}
+
+struct LexiconSettingsForm: View {
+    let lexicon: LexiconController
+    let service: AgentServiceSnapshot
+
+    var body: some View {
+        Form {
+            Section("方案集") {
+                LabeledContent("当前方案集", value: lexicon.activeSchemaSetID.displayName)
+                ForEach(SchemaSetID.allCases) { set in
+                    LabeledContent {
+                        HStack {
+                            if set == lexicon.activeSchemaSetID {
+                                Text("使用中").foregroundStyle(.secondary)
+                            } else if lexicon.installedSets.contains(set) {
+                                Button("切换") { lexicon.switchTo(schemaSetID: set) }
+                            }
+                            if set != .builtin, !lexicon.installedSets.contains(set) {
+                                installControl(for: set)
+                            }
+                        }
+                    } label: {
+                        Text(set.displayName)
+                    }
+                }
+                if let status = lexicon.switchStatus(in: service) {
+                    LabeledContent("切换状态", value: "\(status.schemaSetID.displayName)：\(status.phase.title)")
+                    if let detail = status.detail, status.phase == .failed {
+                        Text(detail).foregroundStyle(.red).font(.callout)
+                    }
+                }
+                if let error = lexicon.lastSwitchError {
+                    Text(error).foregroundStyle(.red).font(.callout)
+                }
+            }
+            Section("已安装的词典") {
+                let dictionaries = lexicon.inventory?.dictionaries ?? []
+                if dictionaries.isEmpty {
+                    Text("没有找到 *.dict.yaml").foregroundStyle(.secondary)
+                } else {
+                    Table(dictionaries) {
+                        TableColumn("方案集") { Text($0.schemaSetID.displayName) }
+                        TableColumn("文件") { Text($0.relativePath).textSelection(.enabled) }
+                        TableColumn("大小") { Text(formattedBytes($0.byteSize)).monospacedDigit() }
+                    }
+                    .frame(minHeight: 160)
+                }
+            }
+            Section("共享学习库（learning.sqlite，只读）") {
+                if let stats = lexicon.inventory?.learning {
+                    LabeledContent("已学习词条", value: "\(stats.entryCount)")
+                    LabeledContent("用户词组", value: "\(stats.userPhraseCount)")
+                    LabeledContent("累计上屏", value: "\(stats.totalFrequency)")
+                    LabeledContent("最新修订", value: "\(stats.latestRevision)")
+                    ForEach(stats.watermarks, id: \.schemaSet) { mark in
+                        LabeledContent(
+                            "投影水位 · \(SchemaSetID(rawValue: mark.schemaSet)?.displayName ?? mark.schemaSet)",
+                            value: "修订 \(mark.lastRevision) · \(mark.projectedCount) 条")
+                    }
+                } else if let error = lexicon.inventory?.learningError {
+                    Text("无法读取：\(String(describing: error))").foregroundStyle(.red).font(.callout)
+                } else {
+                    Text("尚未学习任何词条").foregroundStyle(.secondary)
+                }
+            }
+            Section {
+                Button(lexicon.isRefreshing ? "正在刷新…" : "刷新") { Task { await lexicon.refresh() } }
+                    .disabled(lexicon.isRefreshing)
+            } footer: {
+                Text("切换由输入法在后台编译，正在输入时会等到本次输入结束；Agent 只读取学习库，从不写入。")
+            }
+        }
+        .formStyle(.grouped)
+        .task { await lexicon.refresh() }
+    }
+
+    @ViewBuilder
+    private func installControl(for set: SchemaSetID) -> some View {
+        switch lexicon.installStates[set] ?? .idle {
+        case .installing:
+            ProgressView().controlSize(.small)
+        case .failed(let reason):
+            Button("重试安装") { Task { await lexicon.install(schemaSetID: set) } }
+                .help(reason)
+        case .idle, .installed:
+            Button("下载安装") { Task { await lexicon.install(schemaSetID: set) } }
+        }
     }
 }

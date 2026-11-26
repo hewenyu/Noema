@@ -30,13 +30,19 @@ public struct AgentServiceSnapshot: Sendable, Hashable {
     /// Composition updates older than one already seen from the same peer.
     public var staleCompositionDrops = 0
     public var settings: AgentSettingsSnapshot = .defaults
+    /// The latest progress the IME reported on a schema-set switch, on its current epoch.
+    public var lastSchemaSwitchStatus: SchemaSetSwitchStatus?
+    /// The switch `requestSchemaSetSwitch` sent last, and how many peers it reached.
+    public var lastSchemaSwitchRequest: SchemaSetSwitchRequest?
+    public var lastSchemaSwitchRecipients = 0
 
     public init() {}
 }
 
 /// The agent side of the IME connection. Owns an `IPCServerTransport`, answers `hello`
 /// with `helloAck` and `heartbeat` with `heartbeatAck` (echoing the IME's epoch and
-/// generation), records composition metadata, and forwards `openSettingsRequested`.
+/// generation), records composition metadata and schema-switch progress, forwards
+/// `openSettingsRequested`, and pushes settings, suggestions, and schema-set switches.
 public final class AgentServiceCoordinator: @unchecked Sendable {
     private struct Peer {
         var epoch: UUID?
@@ -48,6 +54,7 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
         var peers: [IPCPeerID: Peer] = [:]
         var sequence: UInt64 = 0
         var settingsRevision: UInt64 = 0
+        var schemaSwitchGeneration: UInt64 = 0
     }
 
     public let agentVersion: String
@@ -137,6 +144,32 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
         for (peer, frame) in pushes { try? transport.push(frame, to: peer) }
     }
 
+    /// Asks every peer that said hello to run `schemaSetID` (and `schemaID`), under a fresh
+    /// request ID and the next monotonic switch generation, so the IME's gate drops a stale
+    /// or repeated request. Returns the request ID the IME's `schemaSwitchStatus` names.
+    @discardableResult
+    public func requestSchemaSetSwitch(schemaSetID: SchemaSetID, schemaID: String? = nil) -> UUID {
+        let request = SchemaSetSwitchRequest(schemaSetID: schemaSetID, schemaID: schemaID)
+        let pushes = update { state -> [(IPCPeerID, Data)] in
+            state.schemaSwitchGeneration += 1
+            let generation = state.schemaSwitchGeneration
+            let frames = state.peers.sorted(by: { $0.key < $1.key }).compactMap { peer, info -> (IPCPeerID, Data)? in
+                guard let epoch = info.epoch else { return nil }
+                state.sequence += 1
+                let envelope = IPCEnvelope(
+                    sequence: state.sequence, message: AgentToIME.switchSchemaSet(sessionEpoch: epoch, request: request),
+                    generationID: generation)
+                return (try? IPCWireCodec.encode(envelope)).map { (peer, $0) }
+            }
+            state.snapshot.lastSchemaSwitchRequest = request
+            state.snapshot.lastSchemaSwitchRecipients = frames.count
+            return frames
+        }
+        for (peer, frame) in pushes { try? transport.push(frame, to: peer) }
+        log.info("schema-set switch to \(schemaSetID.rawValue, privacy: .public) sent to \(pushes.count, privacy: .public) peer(s)")
+        return request.requestID
+    }
+
     // MARK: - Transport callbacks
 
     func handle(_ frame: Data, from peer: IPCPeerID, identity: PeerIdentity?) -> Data? {
@@ -186,6 +219,10 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
                 state.snapshot.lastEngineMode = mode
                 if state.snapshot.lastHello?.sessionEpoch == epoch { state.snapshot.lastHello?.engineMode = mode }
                 return nil
+            case .schemaSwitchStatus(let epoch, let status):
+                guard epoch == info.epoch else { return nil }
+                state.snapshot.lastSchemaSwitchStatus = status
+                return nil
             }
         }
         if let section = openSection { onOpenSettings(section) }
@@ -231,6 +268,8 @@ public final class AgentStatusModel {
     public var launchAgentStatus: LaunchAgentStatus = .notRegistered
     public var selectedSection: SettingsSectionID? = .general
     public var lastLaunchAgentError: String?
+    /// The "词库" section's model; the agent sets it once its IPC service exists.
+    public var lexicon: LexiconController?
     public let agentVersion: String
     @ObservationIgnored private let launchAgent: any LaunchAgentControlling
 
