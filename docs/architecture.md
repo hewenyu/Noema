@@ -42,7 +42,7 @@ Tests use Swift Testing only, one target per library (see `Package.swift`). `CRi
 
 `TypingEngine` is the synchronous, `@MainActor` boundary between the IMKit shell and an engine: `processKey(_:)` returns a `KeyHandlingResult` whose `committedText` and `handled` are independent. `RimeEngine` implements it:
 
-- **Boot** — claim librime, lock the root, arm `BootGuard`, copy legacy root data into `sets/builtin/`, prepare `build/` off the main actor, initialize, open a session on `schemaID`, then disarm.
+- **Boot** — claim librime, lock the root, arm `BootGuard`, migrate legacy data; off the main actor, prepare `build/`, initialize, run `UserDBGuardian`, open a session; disarm.
 - **Deployment** — `build/` is trusted only when `DeployManifest.validated` matches a fresh SHA-256 inventory. `noema-rime-deployer` runs with a timeout in a locked staging directory; the result is re-validated and swapped in with `renamex_np(RENAME_SWAP)`, and any failure leaves `build/` unchanged ([`RimeEngine+Deploy.swift`](../Sources/NoemaEngine/RimeEngine+Deploy.swift)).
 - **Safe Mode** — any boot failure sets a `SafeModeReason`, releases librime, and answers every key with `handled: false`; `recoverFromSafeMode()` boots again.
 - **State** — every call drains `RimeCommit` and rebuilds `CompositionState`; offsets are UTF-16, and `generationID` strictly increases.
@@ -54,7 +54,7 @@ Rationale: [process model note](../.agents/notes/proposed/architecture/2026-11-2
 One root, `~/Library/Application Support/Noema/rime/`, holds the `.noema-rime.lock`, `learning.sqlite`, and `active-schema-set.json`. Each `SchemaSetID` (`builtin`, `wanxiang`, `rime-ice`, `mint`) runs with its own librime `user_data_dir` `sets/<set>/` (`build/`, userdbs, `lua/noema_learned.lua`, `noema_learned.tsv`); downloads extract to `schemas/<set>/`, models to `models/`. `EngineHost` boots the recorded set when installed, else `builtin`, and falls back once to `builtin` when the recorded set fails to boot.
 
 - **Learning** — `RimeEngine.recordCommits` queues Han commits to `LearningStoreWriter`, never under secure input; it writes off the main actor and flushes before shutdown and switches. Keys are full pinyin, one standard syllable per Han character (jianpin expanded from the system reading); unverifiable spellings, shape or non-Mandarin schemas, and reverse lookups are never learned.
-- **Switch** — `SchemaSetSwitcher` parks a request while composing (`pendingIdle`), deploys off the main actor (`compiling`), waits for idle, then swaps librime (`ready` or `failed`). `UserDBGuardian` then probes the userdb, restores a corrupt one from a verified snapshot or the store, and imports entries past its watermark in the dictionary's spelling (toned for 万象), skipping non-Mandarin schemas; `noema_learned.tsv` is re-exported.
+- **Switch** — `SchemaSetSwitcher` parks a request while composing (`pendingIdle`), deploys off the main actor (`compiling`), waits for idle, then swaps librime off the main actor (`ready` or `failed`). `UserDBGuardian` probes the userdb, restores a corrupt one from a verified snapshot or the store, and imports entries past its watermark in the dictionary's spelling (toned for 万象), skipping non-Mandarin schemas; `noema_learned.tsv` is re-exported.
 - **Agent** — Settings › 词库 (`LexiconController`) reads the inventory and the store read-only, installs from the bundled lockfile, and sends `switchSchemaSet`.
 
 Rationale: [lexicon note](../.agents/notes/implemented/architecture/2026-11-23-lexicon-canonical-and-userdb-isolation.md).

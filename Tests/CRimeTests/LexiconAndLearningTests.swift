@@ -815,25 +815,119 @@ extension LibrimeSerializedTests {
             #expect(candidates(engine, "zzzz") == ["zzzz"])
         }
 
-        /// A user patch that overwrites the appended translator (`@last` replaces the last
-        /// item after `engine/translators/+` added it): the compiled schema lacks
-        /// `lua_translator@*noema_learned`, so the real deployer exits 1 and says so.
-        @Test func deployerFailsWhenTheCompiledSchemaLacksTheLearnedTranslator() throws {
+        /// Every YAML form a user `noema_pinyin.custom.yaml` may take (Codex #4711912896):
+        /// flow `patch: {...}` (one line, multi-line, empty, nested, with `#`/`,`/`}` inside
+        /// strings), block keys with inline sequences, the wrapper's own append key, CRLF,
+        /// tabs inside flow, anchors, a null `patch`, and a whole-list replacement. The real
+        /// `noema-rime-deployer` exits 0; the compiled schema keeps the user's page size and
+        /// `echo_translator` and lists `lua_translator@*noema_learned` once; the user's file
+        /// is staged byte for byte under `noema_pinyin.noema-user-custom.yaml`.
+        @Test func deployerAppendsTheLearnedTranslatorToEveryYAMLFormOfUserPatch() throws {
+            let workspace = try LexiconWorkspace()
+            let deployer = try #require(RimeEngine.locateDeployer())
+            let cases: [(patch: String, pageSize: Int, echo: Bool)] = [
+                ("patch: { \"menu/page_size\": 9 }\n", 9, false),
+                ("patch: { \"menu/page_size\": 9, \"engine/translators/+\": [\"echo_translator\"] }\n", 9, true),
+                ("patch: {\n  \"menu/page_size\": 9,\n}\n", 9, false),
+                ("patch: {}\n", 5, false),
+                ("patch: {menu/page_size: 9, engine/translators/+: [echo_translator]}", 9, true),
+                ("patch:\n  \"engine/translators/+\": [\"echo_translator\"]\n  menu/page_size: 9\n", 9, true),
+                ("patch:\n  engine/translators/+: [] # none yet, ]\n", 5, false),
+                ("patch: { \"punctuator/half_shape\": { \",\": \"，\", \"#\": \"}]\" }, \"menu/page_size\": 9 } # c, ]\n", 9, false),
+                ("patch:\n  \"engine/translators/@next\": echo_translator\n  \"menu/page_size\": 9\n", 9, true),
+                ("patch: {\t\"menu/page_size\":\t9,\t\"engine/translators/+\": [echo_translator] }\n", 9, true),
+                ("# mine\r\npatch:\r\n  menu/page_size: 9\r\n  \"engine/translators/+\":\r\n    - echo_translator\r\n", 9, true),
+                ("defs: &mine { \"menu/page_size\": 9 }\npatch: *mine\n", 9, false),
+                ("patch:\n", 5, false),
+                ("patch:\n  engine/translators: [punct_translator, script_translator, echo_translator]\n", 5, true),
+            ]
+            for (index, testCase) in cases.enumerated() {
+                let user = workspace.root.appending(path: "deployer-user-\(index)", directoryHint: .isDirectory)
+                let staging = workspace.root.appending(path: "deployer-staging-\(index)", directoryHint: .isDirectory)
+                for directory in [user, staging] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+                try Data(testCase.patch.utf8).write(to: user.appending(path: "noema_pinyin.custom.yaml"))
+                let result = try Tool.run(deployer.path, [
+                    "--shared-dir", LexiconWorkspace.builtin.path, "--user-dir", user.path, "--staging-dir", staging.path,
+                    "--log-dir", workspace.logs.path, "--schema", "noema_pinyin", "--lua-file", LexiconWorkspace.lua.path,
+                ])
+                #expect(result.status == 0, "case \(index) \(testCase.patch.debugDescription): \(result.stderr)")
+                guard result.status == 0 else { continue }
+                let compiled = try String(contentsOf: staging.appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+                let translators = compiled.components(separatedBy: "\n  translators:\n").last?
+                    .split(separator: "\n").prefix { $0.hasPrefix("    - ") }.map { $0.dropFirst(6).trimmingCharacters(in: ["\""]) } ?? []
+                // librime applies patch keys in sorted order: the wrapper's `@next` runs after
+                // every user key but the user's own `@next` (case 8, where it is `@after last`).
+                #expect((translators.last == "lua_translator@*noema_learned") == (index != 8), "case \(index): \(translators)")
+                #expect(translators.filter { $0 == "lua_translator@*noema_learned" }.count == 1, "case \(index): \(translators)")
+                #expect(translators.contains("echo_translator") == testCase.echo, "case \(index): \(translators)")
+                #expect(compiled.contains("\n  page_size: \(testCase.pageSize)\n"), "case \(index): page size")
+                let staged = staging.appending(path: "\(SchemaPatch.userPatchConfigID(schemaID: "noema_pinyin")).yaml")
+                #expect(try Data(contentsOf: staged) == Data(testCase.patch.utf8), "case \(index): the user's patch was edited")
+            }
+            // The nested flow mapping survived with its `#`, `,`, and `}]` strings.
+            let nested = try String(contentsOf: workspace.root.appending(path: "deployer-staging-7/build/noema_pinyin.schema.yaml"), encoding: .utf8)
+            #expect(nested.contains("\"}]\""), "\(nested)")
+        }
+
+        /// The upgrade Codex reproduced: a legacy root whose `noema_pinyin.custom.yaml` is flow
+        /// style boots in Safe Mode-free `sets/builtin` with the user's page size, the user's
+        /// `echo_translator`, and the learned-phrase translator all active.
+        @Test(arguments: [
+            "patch: { \"menu/page_size\": 9 }\n",
+            "patch: { \"menu/page_size\": 9, \"engine/translators/+\": [\"echo_translator\"] }\n",
+        ])
+        func legacyFlowStyleUserPatchUpgradesWithoutSafeMode(_ patch: String) async throws {
+            let workspace = try LexiconWorkspace()
+            let root = workspace.user
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try patch.write(to: root.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            let legacy = try RimeEngine(configuration: RimeEngineConfiguration(
+                sharedDataDir: LexiconWorkspace.builtin, userDataDir: root, logDir: workspace.logs, luaFile: nil))
+            legacy.type("nihao")
+            #expect(!legacy.isSafeMode && legacy.currentState.pageSize == 9)
+            legacy.shutdown()
+
+            let engine = try await RimeEngine.start(configuration: .activeSchemaSet(
+                root: root, builtinSharedDataDir: LexiconWorkspace.builtin, logDir: workspace.logs, luaFile: LexiconWorkspace.lua))
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == nil && engine.configuration.schemaSetID == .builtin)
+            engine.type("nihao")
+            #expect(engine.currentState.pageSize == 9)
+            engine.clearComposition()
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            #expect(engine.refreshLearnedPhrases(from: store) == 1)
+            engine.resetSession()
+            #expect(candidates(engine, "nihao").contains("霓昊"), "the learned-phrase translator is not active")
+            #expect((candidates(engine, "zzzz") == ["zzzz"]) == patch.contains("echo_translator"))
+        }
+
+        /// User patches that leave no way to append after them: one using both wrapper append
+        /// keys is refused before librime runs; one using `@next` and `@last` makes the wrapper
+        /// append with `@after last`, which sorts (and so applies) before the user's `@last`
+        /// overwrites it, so the compiled schema lacks `lua_translator@*noema_learned` and the
+        /// real deployer exits 1 and says so. Without `--lua-file` both deploy.
+        @Test(arguments: [
+            ("patch:\n  \"engine/translators/@next\": echo_translator\n  \"engine/translators/@after last\": punct_translator\n",
+             "already uses every key that could append"),
+            ("patch:\n  \"engine/translators/@next\": echo_translator\n  \"engine/translators/@last\": echo_translator\n",
+             "lacks lua_translator@*noema_learned"),
+        ])
+        func deployerFailsWhenTheLearnedTranslatorCannotBeAppended(_ patch: String, _ reason: String) throws {
             let workspace = try LexiconWorkspace()
             let user = workspace.root.appending(path: "deployer-user", directoryHint: .isDirectory)
             let staging = workspace.root.appending(path: "deployer-staging", directoryHint: .isDirectory)
             for directory in [user, staging] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
-            try "patch:\n  \"engine/translators/@last\": \"echo_translator\"\n"
-                .write(to: user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            try patch.write(to: user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
             let deployer = try #require(RimeEngine.locateDeployer())
             let arguments = [
                 "--shared-dir", LexiconWorkspace.builtin.path, "--user-dir", user.path, "--staging-dir", staging.path,
                 "--log-dir", workspace.logs.path, "--schema", "noema_pinyin",
             ]
             let result = try Tool.run(deployer.path, arguments + ["--lua-file", LexiconWorkspace.lua.path])
-            #expect(result.status == 1 && result.stderr.contains("lacks lua_translator@*noema_learned"), "\(result)")
+            #expect(result.status == 1 && result.stderr.contains(reason), "\(result)")
             #expect(!FileManager.default.fileExists(atPath: staging.appending(path: "build/\(DeployManifest.fileName)").path))
-            // Without --lua-file the same patch deploys.
             try FileManager.default.removeItem(at: staging)
             try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
             #expect(try Tool.run(deployer.path, arguments).status == 0)
@@ -980,6 +1074,52 @@ extension LibrimeSerializedTests {
             #expect(quarantined.deletingLastPathComponent().lastPathComponent == UserDBGuardian.quarantineDirectoryName)
             #expect(FileSafety.isRealDirectory(quarantined) && FileSafety.isRealDirectory(userdb))
             #expect(candidates(engine, "nihao").contains("泥嚎"), "\(corruption): the learned phrase is gone")
+        }
+
+        /// The active set's userdb lost or corrupted while Noema was not running (Codex
+        /// #4711912906): 雾凇's `double_pinyin_flypy` (no Lua translator on double pinyin, so
+        /// only the userdb can serve a learned phrase) is restored from `learning.sqlite` by the
+        /// boot itself, through `RimeEngine.start` on `active-schema-set.json` with no switch,
+        /// so the very first `nihc` after the restart offers 霓昊.
+        @Test(arguments: ["deleted"] + LevelDBCorruption.allCases.map(\.rawValue))
+        func activeSetUserDBIsRecoveredOnBootBeforeTheFirstKey(_ damage: String) async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.useDoublePinyinFlypy(in: .rimeIce, appending: "")
+            try workspace.addSchema("double_pinyin_flypy", copying: "rime_ice_fixture", in: .rimeIce)
+            var engine = try workspace.engine()
+            let store = try workspace.openStore()
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            func toFlypy() async throws -> SchemaSetSwitchReport {
+                try await engine.switchSchemaSet(
+                    to: .rimeIce, sharedDataDir: workspace.schemaDir(.rimeIce), schemaID: "double_pinyin_flypy",
+                    learningStore: store, luaFile: LexiconWorkspace.lua)
+            }
+            let first = try await toFlypy()
+            #expect(first.isMandarinPinyinSchema && first.userDictName == "rime_ice_fixture" && first.savedActiveRecord)
+            #expect(candidates(engine, "nihc").contains("霓昊"))
+            // Reopen once so LevelDB compacts its log into a table, and stay on the set.
+            try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store)
+            #expect(try await toFlypy().userDBOutcome == .healthy(projected: 0))
+            store.close()
+            engine.shutdown()
+
+            let userdb = workspace.setDir(.rimeIce).appending(path: "rime_ice_fixture.userdb")
+            if let corruption = LevelDBCorruption(rawValue: damage) {
+                try #require(!corruption.apply(to: userdb).isEmpty, "no \(damage) file in the userdb")
+            } else {
+                try FileManager.default.removeItem(at: userdb)
+            }
+            engine = try await RimeEngine.start(configuration: .activeSchemaSet(
+                root: workspace.user, builtinSharedDataDir: LexiconWorkspace.builtin, logDir: workspace.logs,
+                luaFile: LexiconWorkspace.lua))
+            defer { engine.shutdown() }
+            #expect(engine.safeModeReason == nil && engine.configuration.schemaSetID == .rimeIce)
+            #expect(engine.currentState.schemaID == "double_pinyin_flypy")
+            #expect(candidates(engine, "nihc").contains("霓昊"), "\(damage): the first keys after the restart miss 霓昊")
+            #expect(FileSafety.isRealDirectory(userdb))
+            let quarantine = workspace.setDir(.rimeIce).appending(path: UserDBGuardian.quarantineDirectoryName)
+            let quarantined = (try? FileManager.default.contentsOfDirectory(atPath: quarantine.path)) ?? []
+            #expect(quarantined.isEmpty == (damage == "deleted"), "\(damage): \(quarantined)")
         }
 
         /// A deployment that fails (the set's schema now names a dictionary that does not
@@ -1217,6 +1357,91 @@ extension LibrimeSerializedTests {
             #expect(try store.stats().entryCount == 1)
         }
 
+        /// The quiescent librime work of a switch and of a boot never runs on the main actor
+        /// (Codex, `RimeEngine+SchemaSet.swift:137`): with 10,000 phrases in
+        /// `learning.sqlite` projected, toned, into 万象's userdb (and the build cached), a
+        /// main-actor heartbeat never stalls 100 ms, and a key pressed meanwhile passes
+        /// through at once (`.engineUnavailable`). Once done, the userdb serves the phrases.
+        @Test func userDBMaintenanceOfTenThousandPhrasesNeverStallsTheMainActor() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addTonedWanxiangSchema("wanxiang_toned", in: .wanxiang)
+            var engine = try workspace.engine(luaFile: nil)
+            let store = try workspace.openStore()
+            defer { store.close() }
+            // 霓昊 only the userdb can offer for `nihao` (你好 outranks it as a sentence).
+            let events = MainActorHeartbeat.phrases(9_999) + [LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]
+            #expect(try store.recordBatch(events) == 10_000)
+            func toToned(_ store: LearningStore?) async throws -> SchemaSetSwitchReport {
+                try await engine.switchSchemaSet(
+                    to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: "wanxiang_toned",
+                    learningStore: store, luaFile: nil)
+            }
+            // Deploy first (no store: nothing projected), then leave the set.
+            _ = try await toToned(nil)
+            try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin)
+
+            let heartbeat = MainActorHeartbeat()
+            heartbeat.onTick = { [engine] in
+                guard engine.isInExclusiveMaintenance else { return }
+                let clock = ContinuousClock()
+                let start = clock.now
+                let result = engine.processKey(.text("n"))
+                heartbeat.keys.append((result, clock.now - start))
+            }
+            heartbeat.start()
+            let report = try await toToned(store)
+            heartbeat.stop()
+            let projected: Int? = switch report.userDBOutcome {
+            case .healthy(let projected)?: projected
+            case .reprojected(let imported)?: imported
+            case .recovered(let recovery)?: recovery.imported
+            default: nil
+            }
+            #expect(report.userDictCodeFormat == .unicodeToned && projected == 10_000, "\(String(describing: report.userDBOutcome))")
+            print("[switch heartbeat] max main-actor gap \(heartbeat.maxGap), keys during maintenance \(heartbeat.keys.count)")
+            #expect(heartbeat.maxGap < .milliseconds(100), "the switch stalled the main actor for \(heartbeat.maxGap)")
+            #expect(!heartbeat.keys.isEmpty, "no key reached the engine during the maintenance")
+            for (result, latency) in heartbeat.keys {
+                #expect(!result.handled && result.degradation == .engineUnavailable && latency < .milliseconds(5))
+            }
+            #expect(!engine.isInExclusiveMaintenance && candidates(engine, "nihao", pages: 1).contains("霓昊"))
+
+            // The boot: the userdb is gone; `start` rebuilds all 10,000 off the main actor.
+            engine.shutdown()
+            try FileManager.default.removeItem(at: workspace.setDir(.wanxiang).appending(path: "wanxiang_toned.userdb"))
+            let bootBeat = MainActorHeartbeat()
+            bootBeat.start()
+            engine = try await RimeEngine.start(configuration: .activeSchemaSet(
+                root: workspace.user, builtinSharedDataDir: LexiconWorkspace.builtin, logDir: workspace.logs, luaFile: nil))
+            bootBeat.stop()
+            defer { engine.shutdown() }
+            print("[boot heartbeat] max main-actor gap \(bootBeat.maxGap)")
+            #expect(engine.safeModeReason == nil && engine.currentState.schemaID == "wanxiang_toned")
+            #expect(bootBeat.maxGap < .milliseconds(100), "the boot stalled the main actor for \(bootBeat.maxGap)")
+            #expect(try store.watermark(for: .wanxiang, dictName: "wanxiang_toned")?.lastRevision == store.latestRevision())
+            #expect(candidates(engine, "nihao", pages: 1).contains("霓昊"))
+
+            // `shutdown()` mid-step waits for the block, disarms, and frees librime and the lock.
+            let sentinel = workspace.user.appending(path: BootGuard.sentinelFileName)
+            let toBuiltin = Task { @MainActor [engine] () -> NoemaError? in
+                do throws(NoemaError) {
+                    try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store)
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            let entered = await eventually(timeout: .seconds(30)) { engine.isInExclusiveMaintenance }
+            try #require(entered, "the switch never entered its exclusive step")
+            #expect(FileManager.default.fileExists(atPath: sentinel.path), "the switch did not arm the sentinel")
+            engine.shutdown()
+            #expect(!FileManager.default.fileExists(atPath: sentinel.path), "a shutdown mid-switch counted as a crash")
+            if case .engineUnavailable? = await toBuiltin.value {} else { Issue.record("the switch did not report the shutdown") }
+            let next = try workspace.engine(luaFile: nil)
+            #expect(next.safeModeReason == nil)
+            next.shutdown()
+        }
+
         /// 500 mixed keys through the real engine (built-in set with the Lua translator) with
         /// the learning writer recording every commit: P95 stays under 2 ms.
         @Test func keyLatencyWithLearningStaysUnderTwoMilliseconds() throws {
@@ -1246,6 +1471,64 @@ extension LibrimeSerializedTests {
             #expect(writer.statistics.recorded > 0 && writer.statistics.dropped == 0)
             #expect(p95 < .milliseconds(2), "P95 \(p95) exceeds the 2 ms budget")
         }
+    }
+}
+
+/// Measures the longest interval the main actor went without a wake of a 5 ms loop, from
+/// `start()` to `stop()` (so a main actor blocked throughout counts in full).
+@MainActor
+final class MainActorHeartbeat {
+    private(set) var maxGap: Duration = .zero
+    var keys: [(KeyHandlingResult, Duration)] = []
+    var onTick: (@MainActor () -> Void)?
+    private var task: Task<Void, Never>?
+    private let clock = ContinuousClock()
+    private var lastTick: ContinuousClock.Instant?
+
+    func start() {
+        lastTick = clock.now
+        task = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(5))
+                guard let self else { return }
+                self.tick()
+                self.onTick?()
+            }
+        }
+    }
+
+    func stop() {
+        tick()
+        task?.cancel()
+        lastTick = nil
+    }
+
+    private func tick() {
+        guard let lastTick else { return }
+        let now = clock.now
+        maxGap = max(maxGap, now - lastTick)
+        self.lastTick = now
+    }
+
+    /// `count` distinct two-character phrases of common characters, spelled in toneless
+    /// pinyin by Foundation's own transform, as learning events.
+    static func phrases(_ count: Int) -> [LearningCommitEvent] {
+        let characters = Array("的一是不了人我在有他这中大来上国个到说们为子和你地出道也时年得就那要下以生会自着去之过家学对可她里后小么心多天而能好都然没日于起还发成事只作当想看文无开手十用主行方又如前所本见经头面公同三已老从动两长")
+        let readings = characters.map { character in
+            String(character).applyingTransform(.mandarinToLatin, reverse: false)!
+                .applyingTransform(.stripDiacritics, reverse: false)!.lowercased()
+        }
+        var events: [LearningCommitEvent] = []
+        outer: for first in characters.indices {
+            for second in characters.indices {
+                guard events.count < count else { break outer }
+                let preedit = "\(readings[first]) \(readings[second])"
+                events.append(LearningCommitEvent(
+                    rawInput: preedit.replacingOccurrences(of: " ", with: ""), preedit: preedit,
+                    text: String(characters[first]) + String(characters[second])))
+            }
+        }
+        return events
     }
 }
 

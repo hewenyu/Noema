@@ -10,8 +10,8 @@ import os
 /// in one WAL transaction (`LearningStore.recordBatch`). When the queue is full the newest
 /// event is dropped and counted: learning is best effort, typing is not.
 ///
-/// `flush()` drains synchronously; call it before shutdown and before a schema-set switch.
-/// Never call it from the writer's own queue.
+/// `flush()` drains synchronously (call it before shutdown; never from the writer's own
+/// queue); `flushAsync()` drains without blocking, before a schema-set switch.
 public final class LearningStoreWriter: Sendable {
     public struct Statistics: Sendable, Hashable {
         public var enqueued: Int = 0
@@ -68,6 +68,17 @@ public final class LearningStoreWriter: Sendable {
     /// Writes everything queued so far before returning.
     public func flush() {
         queue.sync { drain() }
+    }
+
+    /// Writes everything queued so far, on the writer's queue, before resuming; never blocks
+    /// the caller's thread (`switchSchemaSet` calls it on the main actor).
+    public func flushAsync() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { [self] in
+                drain()
+                continuation.resume()
+            }
+        }
     }
 
     public var statistics: Statistics { state.withLock { $0.statistics } }

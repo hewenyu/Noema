@@ -36,7 +36,8 @@ extension RimeEngineConfiguration {
 /// - A started switch reports `.compiling` while `RimeEngine.switchSchemaSet` prepares and
 ///   deploys the target off the main actor; the current set keeps serving keys meanwhile.
 ///   If the user is composing again when the build is ready, it reports `.pendingIdle` and
-///   waits for the next idle boundary before the short quiescent step on the main actor.
+///   waits for the next idle boundary before the quiescent step, which runs off the main
+///   actor while every key passes through.
 /// - `.ready` once the engine runs the target; `.failed` (with the reason) when it cannot,
 ///   and the previous set keeps running with its `build/` untouched.
 @MainActor

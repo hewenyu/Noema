@@ -110,10 +110,12 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
 ///
 /// Boot: claim the process-wide librime (a second live engine throws), take the
 /// user-data `flock`, arm the boot-guard sentinel, deploy if needed through the
-/// `noema-rime-deployer` subprocess (see `RimeEngine+Deploy.swift`), initialize, open a
-/// session on `schemaID`, then disarm. A built-in boot first migrates a pre-schema-set root
-/// (`LegacyRootMigrator`). librime's deployer never runs in this process;
-/// `start(configuration:cancellation:)` waits for it off the main actor. Any refusal or failure on that path leaves the
+/// `noema-rime-deployer` subprocess (see `RimeEngine+Deploy.swift`), initialize, keep the
+/// schema's userdb in step with `learning.sqlite` (`RimeLibrary.initializeAndMaintain`, the
+/// step a schema-set switch takes too), open a session on `schemaID`, then disarm. A built-in
+/// boot first migrates a pre-schema-set root (`LegacyRootMigrator`). librime's deployer never
+/// runs in this process; `start(configuration:cancellation:)` runs everything from the deploy
+/// to the open session off the main actor. Any refusal or failure on that path leaves the
 /// engine in Safe Mode: it releases librime, the lock, and the claim, makes no further
 /// librime calls, and answers every key with `handled: false` and `.safeMode`.
 ///
@@ -123,7 +125,7 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
 public final class RimeEngine: TypingEngine {
     /// Changes only through `switchSchemaSet`.
     public internal(set) var configuration: RimeEngineConfiguration
-    public private(set) var currentState: CompositionState {
+    public internal(set) var currentState: CompositionState {
         didSet { noteSegmentedPreedit() }
     }
     public var isSafeMode: Bool { currentState.isSafeMode }
@@ -132,9 +134,17 @@ public final class RimeEngine: TypingEngine {
 
     let resources: RimeEngineResources
     let api: UnsafeMutablePointer<RimeApi>
+    var library: RimeLibrary { RimeLibrary(api: api, resources: resources) }
     private var generation: UInt64 = 0
     /// True while `switchSchemaSet` runs; a second switch is refused meanwhile.
     var isSwitchingSchemaSet = false
+    /// True while a background block holds librime exclusively (`runExclusively`): every
+    /// key and editing call answers `handled: false` with `.engineUnavailable` at once, and
+    /// the main actor makes no librime call.
+    public internal(set) var isInExclusiveMaintenance = false
+    /// Entered for every `runExclusively` block, so `shutdown()` waits for it to return
+    /// before it finalizes librime.
+    let maintenanceGroup = DispatchGroup()
     /// Whether the live schema spells Mandarin pinyin (`isMandarinPinyinSchema(schemaID:)`),
     /// for `cachedSchemaID`. Recomputed when a session opens and whenever `refreshState`
     /// sees another schema (librime's own schema switcher); false until then (fail-closed).
@@ -175,23 +185,27 @@ public final class RimeEngine: TypingEngine {
 
     /// Throws `.engineUnavailable` when librime lacks a required API member or another
     /// `RimeEngine` in this process has not been shut down. Every other failure enters
-    /// Safe Mode instead of throwing. A needed deployment blocks the caller for up to
-    /// `deployTimeout`; `start(configuration:cancellation:)` runs it off the main actor.
+    /// Safe Mode instead of throwing. A needed deployment (up to `deployTimeout`) and the
+    /// userdb maintenance block the caller; `start(configuration:cancellation:)` runs both
+    /// off the main actor.
     public convenience init(configuration: RimeEngineConfiguration) throws(NoemaError) {
         try self.init(claiming: configuration)
         boot(clearingSentinel: false)
     }
 
     /// Boots like `init(configuration:)`, but runs `prepareBuild` (the manifest check and
-    /// any `noema-rime-deployer` run, which make no librime call) on a global queue, so the
-    /// main actor keeps serving events. Locking, arming, `initialize`, and the session stay
-    /// on the main actor. A Safe Mode decision returns at once with no background work.
+    /// any `noema-rime-deployer` run) and then `initialize`, the userdb maintenance, and the
+    /// session (`bootQuiescently`; the engine is not published yet, so nothing else calls
+    /// librime) on a global queue, so the main actor keeps serving events. Locking, arming,
+    /// and disarming stay on the main actor. A Safe Mode decision returns at once with no
+    /// background work.
     ///
     /// Cancelling the task, or `cancellation`, stops the deployer (SIGTERM, then SIGKILL)
     /// and throws `.engineUnavailable(reason: "boot cancelled")` after disarming the
     /// sentinel (a cancelled boot is not a crash) and releasing the lock and the claim;
     /// `build/` is left as it was. `cancellation.cancelAndFinishCleanup` does all of that
-    /// before it returns, on the caller's main-actor stack, without waiting for this task.
+    /// before it returns, on the caller's main-actor stack, without waiting for this task
+    /// (it waits for the background block, within its `cleanupWait`, before finalizing).
     public static func start(
         configuration: RimeEngineConfiguration,
         cancellation: DeployCancellation = DeployCancellation()
@@ -207,18 +221,24 @@ public final class RimeEngine: TypingEngine {
             engine.abandonBoot()
             throw .engineUnavailable(reason: "boot cancelled")
         }
-        let (prepared, migration) = await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, LegacyRootMigrator.PendingMigration?), Never>) in
+        let library = engine.library
+        let booted = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<QuiescentBoot, Never>) in
                 guard let group = cancellation.enterPrepare() else {
-                    continuation.resume(returning: (false, nil))
+                    continuation.resume(returning: .cancelled)
                     return
                 }
                 DispatchQueue.global(qos: .userInitiated).async {
                     let migration = migrateLegacyRootFiles(configuration)
-                    let ok = prepareBuild(configuration: configuration, cancellation: cancellation)
-                    // Only after prepareBuild returned: its staging directory is gone.
+                    var booted = QuiescentBoot.prepareFailed
+                    if prepareBuild(configuration: configuration, cancellation: cancellation) {
+                        booted = cancellation.isCancelled
+                            ? .cancelled : .opened(bootQuiescently(library, configuration, migration: migration))
+                    }
+                    // Only after the last librime call and after prepareBuild removed its staging
+                    // directory: `cancelAndFinishCleanup` finalizes librime once this leaves.
                     cancellation.leavePrepare(group)
-                    continuation.resume(returning: (ok, migration))
+                    continuation.resume(returning: booted)
                 }
             }
         } onCancel: {
@@ -229,7 +249,7 @@ public final class RimeEngine: TypingEngine {
             engine.abandonBoot()
             throw .engineUnavailable(reason: "boot cancelled")
         }
-        engine.finishBoot(prepared: prepared, migration: migration)
+        engine.finishBoot(booted)
         return engine
     }
 
@@ -290,21 +310,21 @@ public final class RimeEngine: TypingEngine {
 
     @discardableResult
     public func highlightCandidate(at index: Int) -> CompositionState {
-        guard isOperational, currentState.candidates.indices.contains(index), ensureSession() else { return currentState }
+        guard isServing, currentState.candidates.indices.contains(index), ensureSession() else { return currentState }
         _ = api.pointee.highlight_candidate_on_current_page(resources.session, index)
         return refreshState()
     }
 
     @discardableResult
     public func changePage(backward: Bool) -> CompositionState {
-        guard isOperational, currentState.isComposing, ensureSession() else { return currentState }
+        guard isServing, currentState.isComposing, ensureSession() else { return currentState }
         _ = api.pointee.change_page(resources.session, backward ? 1 : 0)
         return refreshState()
     }
 
     @discardableResult
     public func setASCIIMode(_ enabled: Bool) -> CompositionState {
-        guard isOperational, ensureSession() else { return currentState }
+        guard isServing, ensureSession() else { return currentState }
         api.pointee.set_option(resources.session, "ascii_mode", enabled ? 1 : 0)
         return refreshState()
     }
@@ -323,13 +343,13 @@ public final class RimeEngine: TypingEngine {
 
     @discardableResult
     public func clearComposition() -> CompositionState {
-        guard isOperational, ensureSession() else { return currentState }
+        guard isServing, ensureSession() else { return currentState }
         api.pointee.clear_composition(resources.session)
         return refreshState()
     }
 
     public func resetSession() {
-        guard isOperational else { return }
+        guard isServing else { return }
         if resources.session != 0 {
             _ = api.pointee.destroy_session(resources.session)
             resources.session = 0
@@ -359,10 +379,16 @@ public final class RimeEngine: TypingEngine {
     }
 
     /// Destroys the session, finalizes librime, and releases the lock and the process
-    /// claim, so another engine may start. Idempotent.
+    /// claim, so another engine may start. Idempotent. During a switch's exclusive step it
+    /// first waits for that block to return (it never needs the main actor) and disarms the
+    /// sentinel, so a shutdown mid-switch is not counted as a crash.
     public func shutdown() {
         guard !isShutDown else { return }
         isShutDown = true
+        if isInExclusiveMaintenance {
+            maintenanceGroup.wait()
+            resources.bootGuard.disarm()
+        }
         resources.releaseAll()
         currentState = .empty(generationID: nextGeneration(), schemaID: configuration.schemaID)
     }
@@ -370,12 +396,16 @@ public final class RimeEngine: TypingEngine {
     // MARK: - Boot
 
     var isOperational: Bool { !isShutDown && !isSafeMode }
+    /// Operational and not inside an exclusive background block: librime may be called.
+    var isServing: Bool { isOperational && !isInExclusiveMaintenance }
 
     private func boot(clearingSentinel: Bool) {
         guard beginBoot(clearingSentinel: clearingSentinel) else { return }
         let migration = Self.migrateLegacyRootFiles(configuration)
-        finishBoot(
-            prepared: Self.prepareBuild(configuration: configuration, cancellation: DeployCancellation()), migration: migration)
+        guard Self.prepareBuild(configuration: configuration, cancellation: DeployCancellation()) else {
+            return finishBoot(.prepareFailed)
+        }
+        finishBoot(.opened(Self.bootQuiescently(library, configuration, migration: migration)))
     }
 
     /// Phase 1 of `LegacyRootMigrator` for a built-in boot, under the root lock and before
@@ -386,22 +416,38 @@ public final class RimeEngine: TypingEngine {
         return LegacyRootMigrator.migrateFilesIfNeeded(root: configuration.userDataDir, builtinDir: configuration.rimeUserDataDir)
     }
 
-    /// Phase 2 of `LegacyRootMigrator`, in the quiescent window after `initialize` and before
-    /// the first session: merges the migrated Mandarin pinyin userdbs into `learning.sqlite`.
-    /// A failure is retried on the next boot and never blocks this one.
-    private func importLegacyUserDBs(_ migration: LegacyRootMigrator.PendingMigration?) {
-        guard let migration, configuration.schemaSetID == .builtin else { return }
-        let schemaID = configuration.schemaID
-        let primary = isMandarinPinyinSchema(schemaID: schemaID) ? userDictName(schemaID: schemaID) : nil
-        let names = migration.userDBs.filter { $0 == SchemaSetID.builtin.defaultSchemaID || $0 == primary }
-        if names.isEmpty {
-            if migration.filesComplete { LegacyRootMigrator.writeMarker(builtinDir: configuration.rimeUserDataDir) }
-            return
+    /// How the librime part of a boot ended.
+    enum QuiescentBoot: Sendable {
+        case prepareFailed
+        case cancelled
+        case opened(RimeLibrary.SessionOpening)
+    }
+
+    /// The librime part of a boot after `prepareBuild`, with nothing else calling librime:
+    /// `initializeAndMaintain` (the legacy userdb import of a built-in boot, then the userdb
+    /// guardian and TSV export over an existing `learning.sqlite`, as a switch runs them, so a
+    /// userdb lost or corrupted while Noema was not running is recovered before the first
+    /// key), then open the session on `schemaID`.
+    nonisolated static func bootQuiescently(
+        _ library: RimeLibrary, _ configuration: RimeEngineConfiguration, migration: LegacyRootMigrator.PendingMigration?
+    ) -> RimeLibrary.SessionOpening {
+        _ = library.initializeAndMaintain(configuration, migration: migration, store: .onDiskIfPresent)
+        return library.openSession(configuration.schemaID)
+    }
+
+    /// Runs `body` on a global queue while it holds librime exclusively, inside
+    /// `maintenanceGroup`. The caller sets `isInExclusiveMaintenance` around it.
+    func runExclusively<T: Sendable>(_ body: @escaping @Sendable (RimeLibrary) -> T) async -> T {
+        let library = self.library
+        let group = maintenanceGroup
+        group.enter()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let value = body(library)
+                group.leave()
+                continuation.resume(returning: value)
+            }
         }
-        guard let levers = RimeUserDictLevers() else { return }
-        LegacyRootMigrator.importLegacyUserDBs(
-            names, filesComplete: migration.filesComplete, root: configuration.userDataDir,
-            builtinDir: configuration.rimeUserDataDir, levers: levers)
     }
 
     /// Creates the directories, takes the lock, and arms the sentinel. False means the
@@ -436,18 +482,11 @@ public final class RimeEngine: TypingEngine {
         return false
     }
 
-    /// After `prepareBuild`: initialize librime, open the session, and disarm, or enter
-    /// Safe Mode with the sentinel left armed.
-    private func finishBoot(prepared: Bool, migration: LegacyRootMigrator.PendingMigration? = nil) {
-        guard prepared else { return enterSafeMode(.engineInitFailed) }
-        configuration.exportOpenCCDataDir()
-        withTraits { traits in
-            RimeProcessLifecycle.setupIfNeeded(owner: resources.owner, api: api, traits: &traits)
-            api.pointee.initialize(&traits)
-        }
-        resources.isInitialized = true
-        importLegacyUserDBs(migration)
-        guard openSession() else { return enterSafeMode(.engineInitFailed) }
+    /// After `bootQuiescently`: adopt the session and disarm, or enter Safe Mode with the
+    /// sentinel left armed.
+    private func finishBoot(_ booted: QuiescentBoot) {
+        guard case .opened(let opening) = booted, opening.opened else { return enterSafeMode(.engineInitFailed) }
+        noteOpenedSession(opening)
         resources.bootGuard.disarm()
         refreshState()
     }
@@ -463,23 +502,24 @@ public final class RimeEngine: TypingEngine {
     }
 
     func openSession() -> Bool {
-        let session = api.pointee.create_session()
-        guard session != 0 else { return false }
-        resources.session = session
-        guard api.pointee.select_schema(session, configuration.schemaID) != 0 else { return false }
-        let schemaID = readStatus().schemaID
-        // A new session may run another set's build under the same schema ID: always re-classify.
-        noteSchema(schemaID, force: true)
-        return schemaID == configuration.schemaID
+        let opening = library.openSession(configuration.schemaID)
+        noteOpenedSession(opening)
+        return opening.opened
     }
 
-    /// Re-classifies the live schema when it is not `cachedSchemaID` (or with `force`).
-    private func noteSchema(_ schemaID: String?, force: Bool = false) {
-        guard force || schemaID != cachedSchemaID else { return }
+    /// Caches the classification of a newly opened session's schema: a new session may run
+    /// another set's build under the same schema ID, so it is always re-classified.
+    func noteOpenedSession(_ opening: RimeLibrary.SessionOpening) {
+        cachedSchemaID = opening.schemaID
+        currentSchemaIsMandarinPinyin = opening.isMandarinPinyin
+        currentSecondaryInputRules = opening.secondaryInputRules
+    }
+
+    /// Re-classifies the live schema when it is not `cachedSchemaID`.
+    private func noteSchema(_ schemaID: String?) {
+        guard schemaID != cachedSchemaID else { return }
         cachedSchemaID = schemaID
-        currentSchemaIsMandarinPinyin = schemaID.map { isMandarinPinyinSchema(schemaID: $0) } ?? false
-        currentSecondaryInputRules = currentSchemaIsMandarinPinyin
-            ? schemaID.map { secondaryInputRules(schemaID: $0) } ?? SecondaryInputRules() : SecondaryInputRules()
+        (currentSchemaIsMandarinPinyin, currentSecondaryInputRules) = library.classify(schemaID)
     }
 
     /// Recreates the session if librime dropped it (e.g. stale-session cleanup).
@@ -497,40 +537,15 @@ public final class RimeEngine: TypingEngine {
         currentState = .empty(generationID: nextGeneration(), schemaID: configuration.schemaID, safeModeReason: reason)
     }
 
-    /// Runs `body` with traits whose C strings live exactly as long as the call.
-    func withTraits<T>(_ body: (inout RimeTraits) -> T) -> T {
-        var traits = RimeTraits()
-        noema_rime_traits_init(&traits)
-        let sources: [String] = [
-            configuration.sharedDataDir.path, configuration.rimeUserDataDir.path, "Noema", "noema",
-            NoemaVersion.current.description, "rime.noema", configuration.logDir.path,
-        ]
-        // strdup only fails on allocation failure; treat that as fatal like any Swift allocation.
-        let strings: [UnsafeMutablePointer<CChar>] = sources.map { source in
-            guard let copy = strdup(source) else { fatalError("strdup failed") }
-            return copy
-        }
-        defer { strings.forEach { free($0) } }
-        traits.shared_data_dir = UnsafePointer(strings[0])
-        traits.user_data_dir = UnsafePointer(strings[1])
-        traits.distribution_name = UnsafePointer(strings[2])
-        traits.distribution_code_name = UnsafePointer(strings[3])
-        traits.distribution_version = UnsafePointer(strings[4])
-        traits.app_name = UnsafePointer(strings[5])
-        traits.log_dir = UnsafePointer(strings[6])
-        traits.min_log_level = 2
-        return body(&traits)
-    }
-
     // MARK: - Reading librime state
 
-    private func nextGeneration() -> UInt64 {
+    func nextGeneration() -> UInt64 {
         generation &+= 1
         return generation
     }
 
     private func degradedResult() -> KeyHandlingResult? {
-        if isShutDown {
+        if isShutDown || isInExclusiveMaintenance {
             return KeyHandlingResult(handled: false, state: currentState, degradation: .engineUnavailable)
         }
         if isSafeMode {
