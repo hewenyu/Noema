@@ -41,6 +41,26 @@ import Testing
         #expect(h.resolve(contentWidth: 100, expanded: true) == 128, "re-expanding starts from its own content")
     }
 
+    /// A composition moved from a wide screen to a narrow one (Codex review of PR #19): the
+    /// width grown under the 720 pt style bound re-clamps to the 624 pt screen ceiling at
+    /// once and never exceeds it, then grows again only within it.
+    @Test func screenCeilingReClampsAWidthGrownOnAWiderScreen() {
+        var h = machine()
+        #expect(h.resolve(contentWidth: 700, expanded: false) == 704)
+        #expect(h.resolve(contentWidth: 700, expanded: false, maxWidth: 720) == 704, "a ceiling at the style bound changes nothing")
+        #expect(h.resolve(contentWidth: 700, expanded: false, maxWidth: 624) == 624, "re-clamped to the narrow screen")
+        #expect(h.currentWidth == 624)
+        #expect(h.resolve(contentWidth: 300, expanded: false, maxWidth: 624) == 624, "still never shrinks within the ceiling")
+        #expect(h.resolve(contentWidth: 10_000, expanded: false, maxWidth: 624) == 624)
+        #expect(h.resolve(contentWidth: 300, expanded: false, maxWidth: 2_000) == 624, "a wider ceiling than the style bound is ignored")
+        #expect(h.resolve(contentWidth: 700, expanded: false, maxWidth: 2_000) == 704)
+        // A ceiling below minWidth wins; a non-finite one is ignored.
+        h.reset()
+        #expect(h.resolve(contentWidth: 10, expanded: false, maxWidth: 60) == 60)
+        #expect(h.resolve(contentWidth: 10, expanded: false, maxWidth: .nan) == 96)
+        #expect(h.resolve(contentWidth: 10, expanded: false, maxWidth: -5) == 0)
+    }
+
     @Test func toleratesDegenerateInputs() {
         var h = WidthHysteresis(step: 0, minWidth: -5, maxWidth: .nan)
         #expect(h.step == 1 && h.minWidth == 0 && h.maxWidth == 0)

@@ -841,6 +841,77 @@ extension LibrimeSerializedTests {
             #expect(visible.contains(panel.frame))
         }
 
+        /// Real Rime with the shipped `menu/page_size: 5` and five long `shi` entries (Codex
+        /// review of PR #19). Part A: on a 640×960 portrait screen the shipped controller
+        /// bounds the row to the screen's usable width (not the 720 pt style bound), so the
+        /// panel and its chevron stay inside the visible frame, and a real click on the
+        /// chevron expands it in place. Part B: the same composition grown to 704 pt on a
+        /// 1440×900 screen and then moved to the 640 pt screen re-clamps its hysteresis width.
+        @Test func longCandidatesStayInsideANarrowScreen() throws {
+            let style = CandidatePanelStyle()
+            let narrow = CGRect(x: 0, y: 0, width: 640, height: 960)
+            let wide = CGRect(x: 0, y: 0, width: 1440, height: 900)
+            let longEntries = (0..<5).map { "这是一个比较长的候选词组\($0)\tshi\t\(9_000 - $0)\n" }.joined()
+            let controller = CandidatePanelController(style: style)
+            controller.shouldOrderFront = false
+            let recorder = RecordingPresenter()
+            let harness = try Harness(dictionaryAppendix: longEntries, candidatePresenter: TeePresenter([recorder, controller]))
+            defer { harness.shutdown(); controller.hide() }
+            let client = RecordingClient()
+            client.caretRect = CGRect(x: 300, y: 600, width: 1, height: 18)
+            let token = UUID()
+            let view = controller.panelViewForTesting
+            let panel = controller.panelForTesting
+            func onScreen(_ rect: CGRect) -> CGRect { panel.convertToScreen(view.convert(rect, to: nil)) }
+            func expectInside(_ visible: CGRect, _ step: String) throws {
+                let layout = try #require(controller.currentLayout, "\(step)")
+                #expect(panel.frame.size == layout.panelSize && view.bounds.size == layout.panelSize, "\(step)")
+                #expect(panel.frame.width <= visible.width && visible.contains(panel.frame), "\(step): panel \(panel.frame)")
+                if let button = layout.expandButtonFrame {
+                    #expect(visible.contains(onScreen(button)), "\(step): chevron at \(onScreen(button)) off screen")
+                }
+                for item in layout.items {
+                    #expect(visible.contains(onScreen(item.pillFrame)), "\(step): \(item.index) at \(onScreen(item.pillFrame))")
+                }
+            }
+
+            // Part A: typed on the narrow screen.
+            controller.screensProvider = { [ScreenFrame(frame: narrow, visibleFrame: narrow)] }
+            for key in "shi" { #expect(harness.coordinator.handleKey(.text(key), token: token, client: client)) }
+            let state = try #require(recorder.lastState)
+            #expect(state.candidates.count == 5 && state.candidates.allSatisfy { $0.text.hasPrefix("这是一个比较长的候选词组") },
+                    "\(state.candidates.map(\.text))")
+            let unbounded = CandidateLayoutEngine(style: style).layout(
+                state: state, options: try #require(recorder.lastOptions), expanded: false)
+            #expect(unbounded.panelSize.width > narrow.width, "the reproduction overflows 640 pt without the bound")
+            try expectInside(narrow, "narrow collapsed")
+            let collapsed = try #require(controller.currentLayout)
+            let button = try #require(collapsed.expandButtonFrame, "five truncated capsules still fit one row")
+            let point = view.convert(button.center, to: nil)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = try #require(NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: 0,
+                    windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                    pressure: type == .leftMouseDown ? 1 : 0))
+                type == .leftMouseDown ? view.mouseDown(with: event) : view.mouseUp(with: event)
+            }
+            #expect(controller.isExpanded && controller.currentLayout?.isExpanded == true)
+            try expectInside(narrow, "narrow expanded")
+            #expect(client.inserts.isEmpty, "the chevron click commits nothing")
+
+            // Part B: grown on the wide screen, then moved to the narrow one mid-composition.
+            harness.coordinator.commitComposition(token: token, client: client)
+            controller.hide()
+            controller.screensProvider = { [ScreenFrame(frame: wide, visibleFrame: wide)] }
+            for key in "shi" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            try expectInside(wide, "wide")
+            #expect(panel.frame.width > narrow.width, "hysteresis grew past 640 pt on the wide screen: \(panel.frame.width)")
+            controller.screensProvider = { [ScreenFrame(frame: narrow, visibleFrame: narrow)] }
+            _ = harness.coordinator.handleKey(.key(VirtualKeyCode.downArrow, "", .function), token: token, client: client)
+            #expect(recorder.lastState?.highlightedIndex == 1, "the same composition re-rendered")
+            try expectInside(narrow, "moved to the narrow screen")
+        }
+
         @Test func pagingFromThePanelRefreshesCandidates() throws {
             let harness = try Harness()
             defer { harness.shutdown() }

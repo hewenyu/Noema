@@ -134,6 +134,47 @@ import Testing
         #expect(expanded.panelSize.width <= style.maxPanelWidth)
     }
 
+    /// Five long candidates on a 640 pt portrait screen (624 pt usable; Codex review of PR
+    /// #19): the row truncates into the screen's width instead of the 720 pt style bound,
+    /// the chevron stays inside the panel; at 260 pt the row is cut to "…" capsules, and at
+    /// 160 pt, where even those overflow, the page auto-expands with every row inside.
+    @Test func screenWidthBoundsTheRowAndTheExpandButton() throws {
+        let texts = (0..<5).map { "这是一个比较长的候选词组\($0)" }
+        let wide = engine.layout(state: state(texts), options: inline, expanded: false)
+        #expect(wide.panelSize.width > 624, "the reproduction needs a row wider than the narrow screen: \(wide.panelSize.width)")
+        for maxWidth in [624, 260, 160] as [CGFloat] {
+            for expanded in [false, true] {
+                var hysteresis = WidthHysteresis(style: style)
+                _ = engine.layout(state: state(texts), options: inline, expanded: expanded, hysteresis: &hysteresis)
+                let layout = engine.layout(
+                    state: state(texts), options: inline, expanded: expanded, hysteresis: &hysteresis, maxWidth: maxWidth)
+                let step = "maxWidth \(maxWidth) expanded \(expanded)"
+                #expect(layout.panelSize.width <= maxWidth && layout.contentWidth <= maxWidth, "\(step): \(layout.panelSize)")
+                if let button = layout.expandButtonFrame {
+                    #expect(button.minX >= 0 && button.maxX <= layout.panelSize.width, "\(step): \(button)")
+                }
+                for item in layout.items {
+                    #expect(item.pillFrame.minX >= 0 && item.pillFrame.maxX <= layout.panelSize.width, "\(step): \(item.pillFrame)")
+                    #expect(layout.hitTest(CGPoint(x: item.pillFrame.midX, y: item.pillFrame.midY)) == .candidate(item.index), "\(step)")
+                }
+                // The same layout through the stateless overload.
+                let direct = engine.layout(state: state(texts), options: inline, expanded: expanded, maxWidth: maxWidth)
+                #expect(direct.panelSize.width <= maxWidth, "\(step)")
+            }
+        }
+        let narrow = engine.layout(state: state(texts), options: inline, expanded: false, maxWidth: 624)
+        #expect(!narrow.isExpanded && narrow.expandButtonFrame != nil, "624 pt still fits one truncated row")
+        let tiny = engine.layout(state: state(texts), options: inline, expanded: false, maxWidth: 160)
+        #expect(tiny.isExpanded && tiny.expandButtonFrame == nil, "one row cannot fit 160 pt: auto-expanded")
+        // A ceiling at or above the style bound changes nothing.
+        #expect(engine.layout(state: state(texts), options: inline, expanded: false, maxWidth: 720) == wide)
+        #expect(engine.layout(state: state(texts), options: inline, expanded: false, maxWidth: .infinity) == wide)
+        // The floating preedit strip respects the ceiling too.
+        let strip = engine.layout(
+            state: state(["你好"], preedit: String(repeating: "nihao ", count: 30)), options: floating, expanded: false, maxWidth: 300)
+        #expect(strip.panelSize.width <= 300 && (strip.preeditStrip?.clipRect.maxX ?? .infinity) <= 300)
+    }
+
     /// A 20-candidate page (Rime `menu/page_size: 20`) cannot fit one row even with every
     /// text truncated to "…": labels, insets, and spacing alone overflow. The collapsed
     /// request is laid out expanded, without a dead collapse button, every capsule inside

@@ -145,29 +145,34 @@ public final class CandidatePanelController: CandidatePresenting {
 
     // MARK: - Rendering
 
-    /// Lays out the presentation bounded to its target screen's visible height (minus the
-    /// screen margins when there is room), so the panel always fits inside the visible frame
-    /// and a list taller than that scrolls; then places it at the caret.
+    /// Lays out the presentation bounded to its target screen's visible width and height
+    /// (minus the screen margins when there is room), so the panel always fits inside the
+    /// visible frame, a row too wide expands, and a list taller than that scrolls; then
+    /// places it at the caret.
     private func rerender(ensureHighlightVisible: Bool = true) {
         guard let presentation else { return }
         let screens = screensProvider()
+        let mouseLocation = NSEvent.mouseLocation
         guard let screen = resolver.targetScreen(
             caretRect: presentation.caretRect, clientKey: presentation.clientKey, screens: screens,
-            fallbackMouseLocation: NSEvent.mouseLocation)
+            fallbackMouseLocation: mouseLocation)
         else {
             hide()
             return
         }
+        let visibleWidth = screen.visibleFrame.width
         let visibleHeight = screen.visibleFrame.height
         let margins = 2 * style.screenMargin
+        let maxWidth = visibleWidth > margins + style.minPanelWidth ? visibleWidth - margins : visibleWidth
         let maxHeight = visibleHeight > margins + 80 ? visibleHeight - margins : visibleHeight
         let layout = layoutEngine.layout(
             state: presentation.state, options: presentation.options, expanded: isExpanded, hysteresis: &hysteresis,
-            maxHeight: maxHeight, verticalScrollOffset: verticalScrollOffset, ensureHighlightVisible: ensureHighlightVisible)
+            maxWidth: maxWidth, maxHeight: maxHeight, verticalScrollOffset: verticalScrollOffset,
+            ensureHighlightVisible: ensureHighlightVisible)
         verticalScrollOffset = layout.verticalScrollOffset
         guard let resolution = resolver.resolve(
             caretRect: presentation.caretRect, clientKey: presentation.clientKey, panelSize: layout.panelSize,
-            screens: screens, fallbackMouseLocation: NSEvent.mouseLocation)
+            screens: screens, fallbackMouseLocation: mouseLocation)
         else {
             hide()
             return

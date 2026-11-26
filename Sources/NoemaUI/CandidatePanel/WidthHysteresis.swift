@@ -23,16 +23,26 @@ public struct WidthHysteresis: Sendable, Hashable {
         self.init(step: style.widthQuantizationStep, minWidth: style.minPanelWidth, maxWidth: style.maxPanelWidth)
     }
 
-    /// The panel width for content `contentWidth` wide in `expanded` mode.
-    public mutating func resolve(contentWidth: CGFloat, expanded: Bool) -> CGFloat {
+    /// The panel width for content `contentWidth` wide in `expanded` mode. `ceiling` (the
+    /// target screen's usable width; nil: none) lowers `maxWidth` for this call and re-clamps
+    /// a width grown on a wider screen, so the panel never outgrows a narrower screen.
+    public mutating func resolve(contentWidth: CGFloat, expanded: Bool, maxWidth ceiling: CGFloat? = nil) -> CGFloat {
         if mode != expanded {
             currentWidth = 0
             mode = expanded
         }
-        let width = contentWidth.isFinite ? contentWidth : minWidth
-        let clamped = min(max(width, minWidth), maxWidth)
-        let quantized = min(maxWidth, (clamped / step).rounded(.up) * step)
-        currentWidth = max(currentWidth, quantized)
+        let limit: CGFloat
+        if let ceiling, ceiling.isFinite {
+            limit = min(maxWidth, max(ceiling, 0))
+        } else {
+            limit = maxWidth
+        }
+        let floorWidth = min(minWidth, limit)
+        currentWidth = min(currentWidth, limit)
+        let width = contentWidth.isFinite ? contentWidth : floorWidth
+        let clamped = min(max(width, floorWidth), limit)
+        let quantized = min(limit, (clamped / step).rounded(.up) * step)
+        currentWidth = min(limit, max(currentWidth, quantized))
         return currentWidth
     }
 

@@ -277,7 +277,12 @@ private final class CandidateContentView: NSView {
     private func drawScrollThumb(in viewport: CGRect, layout: CandidatePanelLayout, color: CGColor, ctx: CGContext) {
         let total = viewport.height + layout.maxVerticalScrollOffset
         guard total > 0, viewport.height > 4 else { return }
-        let track = viewport.insetBy(dx: 0, dy: 2)
+        var track = viewport.insetBy(dx: 0, dy: 2)
+        // Start below the expand chevron (pinned top-trailing) so the thumb never overlaps it.
+        if let button = layout.expandButtonFrame {
+            let top = max(track.minY, button.maxY + 2)
+            if track.maxY - top > 4 { track = CGRect(x: track.minX, y: top, width: track.width, height: track.maxY - top) }
+        }
         let length = max(track.height * viewport.height / total, min(16, track.height))
         let progress = layout.verticalScrollOffset / layout.maxVerticalScrollOffset
         let thumb = CGRect(x: viewport.maxX - 2 - 3, y: track.minY + (track.height - length) * progress, width: 3, height: length)

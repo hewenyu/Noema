@@ -84,7 +84,8 @@ public struct CandidatePanelLayout: Sendable, Hashable {
 /// panels list one candidate per row; any multi-row panel uses `expandedCornerRadius`.
 /// The expand button is pinned to the trailing edge of the hysteresis width, so the slack
 /// sits between the last candidate and the button. A page whose single row cannot fit in
-/// `maxPanelWidth` even after truncation is always laid out expanded, without the button.
+/// `maxPanelWidth` (or the narrower `maxWidth`, the screen's usable width) even after
+/// truncation is always laid out expanded, without the button.
 /// An expanded list taller than `maxHeight` (the screen's visible height) shows a scrolled
 /// viewport instead, which by default follows the highlighted candidate.
 public struct CandidateLayoutEngine: Sendable {
@@ -99,16 +100,19 @@ public struct CandidateLayoutEngine: Sendable {
         state: CompositionState,
         options: CandidatePresentationOptions,
         expanded: Bool,
+        maxWidth: CGFloat? = nil,
         maxHeight: CGFloat? = nil,
         verticalScrollOffset: CGFloat = 0,
         ensureHighlightVisible: Bool = true
     ) -> CandidatePanelLayout {
         var hysteresis = WidthHysteresis(style: style)
         return layout(
-            state: state, options: options, expanded: expanded, hysteresis: &hysteresis, maxHeight: maxHeight,
-            verticalScrollOffset: verticalScrollOffset, ensureHighlightVisible: ensureHighlightVisible)
+            state: state, options: options, expanded: expanded, hysteresis: &hysteresis, maxWidth: maxWidth,
+            maxHeight: maxHeight, verticalScrollOffset: verticalScrollOffset, ensureHighlightVisible: ensureHighlightVisible)
     }
 
+    /// `maxWidth` lowers `maxPanelWidth` to the screen's usable width (nil: no extra bound);
+    /// every row fits in it, and the hysteresis width is re-clamped to it.
     /// `maxHeight` bounds an expanded panel's height (nil: unbounded). When the list does
     /// not fit, it scrolls by `verticalScrollOffset` (clamped); `ensureHighlightVisible`
     /// then scrolls the least amount that shows the whole highlighted candidate.
@@ -117,6 +121,7 @@ public struct CandidateLayoutEngine: Sendable {
         options: CandidatePresentationOptions,
         expanded: Bool,
         hysteresis: inout WidthHysteresis,
+        maxWidth maxWidthCap: CGFloat? = nil,
         maxHeight: CGFloat? = nil,
         verticalScrollOffset: CGFloat = 0,
         ensureHighlightVisible: Bool = true
@@ -128,14 +133,20 @@ public struct CandidateLayoutEngine: Sendable {
         let pillHeight = contentHeight + 2 * s.pillVerticalInset
         let baselineInPill = s.pillVerticalInset + (contentHeight - candidateLineHeight) / 2 + fonts.candidate.ascent
         let hasCandidates = !state.candidates.isEmpty
-        let maxWidth = max(s.maxPanelWidth, s.minPanelWidth)
+        let styleMaxWidth = max(s.maxPanelWidth, s.minPanelWidth)
+        let maxWidth: CGFloat
+        if let cap = maxWidthCap, cap.isFinite {
+            maxWidth = min(styleMaxWidth, max(cap, 0))
+        } else {
+            maxWidth = styleMaxWidth
+        }
 
         // 1. Measure every candidate.
         let originalMeasured = state.candidates.enumerated().map { index, item in
             MeasuredItem(index: index, item: item, fonts: fonts, style: s)
         }
 
-        // 2. Fit the page into one row within maxPanelWidth (with room for the button):
+        // 2. Fit the page into one row within maxWidth (with room for the button):
         //    drop comments, then truncate text to a common cap, then re-measure. Labels,
         //    insets, spacing, and the "…" itself never shrink, so a large page (Rime
         //    `menu/page_size: 20`) can still overflow; such a page cannot collapse.
@@ -194,7 +205,7 @@ public struct CandidateLayoutEngine: Sendable {
             contentWidth = max(contentWidth, min(stripWidth, maxWidth))
         }
         contentWidth = ceil(contentWidth)
-        let width = hysteresis.resolve(contentWidth: contentWidth, expanded: effectiveExpanded)
+        let width = hysteresis.resolve(contentWidth: contentWidth, expanded: effectiveExpanded, maxWidth: maxWidth)
 
         // 5. Position, top-down.
         var y = s.verticalPadding
@@ -257,7 +268,7 @@ public struct CandidateLayoutEngine: Sendable {
         }
         var items: [CandidateItemLayout] = []
         var x = s.horizontalPadding
-        let expandedPillWidth = width - fixed
+        let expandedPillWidth = max(width - fixed, 0)
         for (position, item) in measured.enumerated() {
             let pill: CGRect
             if effectiveExpanded {
