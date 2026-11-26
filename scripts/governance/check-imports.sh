@@ -6,8 +6,11 @@
 #      library) and NoemaCore, NoemaEngine, NoemaText, NoemaLearning (the engine, text, and
 #      learning libraries it links) import no networking, audio/speech, AX, event-tap,
 #      pasteboard, or screen-capture frameworks and call none of those APIs (thin shell,
-#      zero TCC), nor ServiceManagement, NoemaAgentCore, or NoemaLexiconAdmin (the agent's
-#      side of the boundary: downloads and archive extraction), nor NSExpression (it raises
+#      zero TCC): no AXIsProcessTrusted*, synthesized CGEvent keystrokes or CGEventSource,
+#      CGPreflight*EventAccess, SecItem* keychain calls, or RegisterEventHotKey. Nor
+#      ServiceManagement, NoemaAgentCore, NoemaLexiconAdmin, or NoemaClipboardCore (the
+#      agent's side of the boundary: downloads, archive extraction, the encrypted clipboard
+#      history), nor NSExpression (it raises
 #      Objective-C exceptions on malformed input, which would crash the input method). Each directory must exist
 #      and hold source files. Carbon/HIToolbox and InputMethodKit stay allowed:
 #      IsSecureEventInputEnabled() lives in Carbon.
@@ -48,8 +51,8 @@ IFS= read -r -d '' LEXER <<'JS' || true
 const fs = require('fs');
 const path = require('path');
 
-const BANNED_MODULES = 'AVFoundation|AVFAudio|Speech|SoundAnalysis|CoreAudio|AudioToolbox|Network|CFNetwork|WebKit|ApplicationServices|HIServices|ScreenCaptureKit|Contacts|CoreLocation|EventKit|Photos|ServiceManagement|NoemaAgentCore|NoemaLexiconAdmin';
-const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|NSPasteboard[A-Za-z]*|NSExpression';
+const BANNED_MODULES = 'AVFoundation|AVFAudio|Speech|SoundAnalysis|CoreAudio|AudioToolbox|Network|CFNetwork|WebKit|ApplicationServices|HIServices|ScreenCaptureKit|Contacts|CoreLocation|EventKit|Photos|ServiceManagement|NoemaAgentCore|NoemaLexiconAdmin|NoemaClipboardCore';
+const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|AXIsProcessTrusted[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|CGEvent(?:Post|CreateKeyboardEvent|Source)|CGEvent\\s*\\(\\s*keyboardEventSource|CGPreflight(?:Post|Listen)EventAccess|NSPasteboard[A-Za-z]*|SecItem[A-Za-z]*|RegisterEventHotKey|NSExpression';
 const ATTR = '@[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?\\s*';
 const ACCESS = '(?:public|package|internal|fileprivate|private)\\s+';
 const KIND = '(?:(?:typealias|struct|class|actor|enum|protocol|let|var|func)\\s+)?';
@@ -311,7 +314,7 @@ for dir in "${IME_SOURCE_DIRS[@]}"; do
   elif [[ -z "$(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print -quit)" ]]; then
     bad "${dir} has no source files to scan"
   else
-    report_hits "${dir} must not use networking/audio/AX/pasteboard/LaunchAgent APIs, NSExpression, NoemaAgentCore, or NoemaLexiconAdmin (AGENTS.md rule 1)" \
+    report_hits "${dir} must not use networking/audio/AX/event-posting/pasteboard/keychain/hotkey/LaunchAgent APIs, NSExpression, NoemaAgentCore, NoemaLexiconAdmin, or NoemaClipboardCore (AGENTS.md rule 1)" \
       node -e "${LEXER}" -- ime < <(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print0)
   fi
 done

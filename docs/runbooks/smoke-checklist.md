@@ -43,11 +43,24 @@ Type `nihao`, then select with Space, a number key, and a mouse click, in each a
 
 In TextEdit unless noted:
 
-- [ ] `v`: marked `v` and a 2-column menu of nine cells beside the caret; 剪贴板, 语音输入, 翻译, 改写 dimmed; the candidate panel never shows at the same time.
+- [ ] `v`: marked `v` and a 2-column menu of nine cells beside the caret; 语音输入, 翻译, 改写 dimmed; the candidate panel never shows at the same time.
 - [ ] `v1+2` Space inserts `3`; `v=2+3` ↓ Return inserts `2+3=5`; `v8` `1` inserts today's date; `v3` `xx` `1` inserts 谢谢！; `v5` Tab switches symbol category.
 - [ ] Arrow keys move through the grid (↓ from 7 or 8 lands on 9); clicking a cell or row selects it.
 - [ ] `vv` inserts `v`; `vim` Return inserts `vim`; `lv` Space inserts 绿; `nv` Space inserts 女.
 - [ ] `v` then Esc, a click elsewhere in the document, or ⌘-Tab away: the `v` disappears and nothing is inserted.
-- [ ] `v2`: a HUD 剪贴板将在 M3 推出 appears near the top of the screen for about two seconds without taking focus from TextEdit; `v9` opens Settings.
+- [ ] `v4`: a HUD 语音输入将在 M3 推出 appears near the top of the screen for about two seconds without taking focus from TextEdit; `v2` opens the clipboard panel; `v9` opens Settings.
 - [ ] Password field: `v` passes through as a plain character, no panel.
 - [ ] `nihao`: 你好 first, 👋 second; Settings › 快速操作 › Emoji off removes 👋 on the next keystroke; on again restores it.
+
+## 6. Clipboard history
+
+With the launchd-managed `Noema.app` running, in TextEdit unless noted:
+
+- [ ] Copy text: ⇧⌘V (or the menu bar 剪贴板历史…, or `v2`) shows the glass panel centered on the pointer's screen; TextEdit stays the active app and the search field has focus.
+- [ ] Type `你好` and a Latin prefix; the list narrows; ↑/↓ move, Esc closes and TextEdit has focus again; a click outside closes the panel.
+- [ ] Return pastes into TextEdit once Accessibility is granted (Settings › 快速操作 › 剪贴板历史 › 打开辅助功能设置…); without it a HUD 已复制到剪贴板，请按 ⌘V 粘贴 appears and nothing is typed.
+- [ ] A pasted entry is not recorded again; ⌘K 固定 moves it to 已固定; 删除 removes it.
+- [ ] Copy in a password field, from 1Password or Passwords, or a `sk-…` key: the first two never appear; the key appears masked until 显示内容.
+- [ ] Copy a screenshot (⇧⌃⌘4): an image row with a thumbnail and its size in the inspector.
+- [ ] `strings ~/Library/Application\ Support/Noema/clipboard/clipboard.sqlite* | grep <copied word>` finds nothing.
+- [ ] Lock and unlock the screen: recording resumes; quit Noema from the menu and relaunch it: the history is intact.
