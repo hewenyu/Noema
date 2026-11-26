@@ -67,6 +67,22 @@ extension LibrimeSerializedTests {
             #expect(try store.allEntries().map(\.text) == ["你好"])
         }
 
+        /// Options configured before or during Safe Mode (e.g. `emoji_suggestion = false`)
+        /// are replayed onto the live session when `recoverFromSafeMode()` succeeds.
+        @Test func optionOverridesSurviveRecoverFromSafeMode() throws {
+            let workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
+            try workspace.writeSentinel(#"{"consecutiveFailures":2,"lastAttemptEpoch":1}"#)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            try #require(engine.safeModeReason == .bootCrashLoop)
+
+            engine.setOption(EngineHostEmojiOption.name, enabled: false)
+            #expect(engine.recoverFromSafeMode())
+            #expect(!engine.isSafeMode)
+            #expect(engine.option(EngineHostEmojiOption.name) == false, "recoverFromSafeMode dropped emoji_suggestion override")
+            #expect(!candidates(engine, "nihao").contains("👋"))
+        }
+
         // MARK: - Deployer: upstream `v` recognizers
 
         /// An upstream schema (万象 and 雾凇 ship one) with `recognizer/patterns/v` and
@@ -87,7 +103,11 @@ extension LibrimeSerializedTests {
                 """)
             try FileManager.default.createDirectory(at: workspace.user, withIntermediateDirectories: true)
             let userPatch = workspace.user.appending(path: "noema_pinyin.custom.yaml")
-            let userBytes = Data("patch: {\"menu/page_size\": 7, \"recognizer/patterns/mine\": \"^qq[a-z]*$\"}\n".utf8)
+            // Includes the user's own `recognizer/patterns/v` and `v_mode` keys so the wrapper
+            // must beat `__include` (YAML null `~` would be overwritten by `__include`).
+            let userBytes = Data(
+                "patch: {\"menu/page_size\": 7, \"recognizer/patterns/v\": \"^v.*$\", \"recognizer/patterns/v_mode\": \"^v_mode.*$\", \"recognizer/patterns/mine\": \"^qq[a-z]*$\"}\n"
+                    .utf8)
             try userBytes.write(to: userPatch)
 
             let engine = try workspace.engine()
@@ -264,6 +284,42 @@ extension LibrimeSerializedTests {
             Self.type("v", harness, token, client)
             harness.coordinator.setInputMode(InputSessionCoordinator.asciiInputModeID, token: token, client: client)
             #expect(!controller.isVisible && harness.coordinator.vModeState == .idle && client.calls.last == .clear)
+        }
+
+        /// Pressing `Esc` (from menu or sub-mode) or `Backspace` (from menu) must clear marked
+        /// text and hide the v-mode panel rather than leaving an orphaned panel behind.
+        @Test func escapeAndBackspaceExitVModeCleaningMarkedTextAndPanel() throws {
+            let controller = Self.panel()
+            let harness = try Self.harness(controller)
+            defer { harness.shutdown(); controller.hideAll() }
+            let client = RecordingClient()
+            client.caretRect = CGRect(x: 400, y: 600, width: 1, height: 18)
+            let token = UUID()
+
+            // `v` -> `Esc`
+            #expect(harness.coordinator.handleKey(.text("v"), token: token, client: client))
+            #expect(controller.isVisible && controller.isShowingVMode)
+            #expect(harness.coordinator.handleKey(.key(VirtualKeyCode.escape, "\u{1b}"), token: token, client: client))
+            #expect(client.calls.last == .clear)
+            #expect(!controller.isVisible && !controller.isShowingVMode && harness.coordinator.vModeState == .idle)
+
+            // `v` -> `Backspace`
+            #expect(harness.coordinator.handleKey(.text("v"), token: token, client: client))
+            #expect(controller.isVisible && controller.isShowingVMode)
+            #expect(harness.coordinator.handleKey(.key(VirtualKeyCode.delete, "\u{7f}"), token: token, client: client))
+            #expect(client.calls.last == .clear)
+            #expect(!controller.isVisible && !controller.isShowingVMode && harness.coordinator.vModeState == .idle)
+
+            // `v1+2` -> `Esc`
+            Self.type("v1+2", harness, token, client)
+            #expect(controller.isVisible && controller.isShowingVMode)
+            #expect(harness.coordinator.handleKey(.key(VirtualKeyCode.escape, "\u{1b}"), token: token, client: client))
+            #expect(client.calls.last == .clear)
+            #expect(!controller.isVisible && !controller.isShowingVMode && harness.coordinator.vModeState == .idle)
+
+            // Subsequent ordinary Chinese input works normally and shows the candidate panel.
+            Self.type("nihao ", harness, token, client)
+            #expect(client.inserts == ["你好"] && !controller.isVisible && !controller.isShowingVMode)
         }
 
         // MARK: - Secure input and the agent

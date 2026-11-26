@@ -226,7 +226,7 @@ public final class InputSessionCoordinator {
 
         // 5. v-mode, unless the engine composes (then the key is the engine's: `lv` is 绿).
         if !before.isComposing {
-            let (next, effect) = runVMode(.key(event), isEngineComposing: false)
+            let (next, effect) = runVMode(.key(event), isEngineComposing: false, isASCIIMode: before.isASCIIMode)
             if effect != .passToRime { return applyVMode(next, effect, client: client) }
             vModeState = .idle
         }
@@ -253,11 +253,13 @@ public final class InputSessionCoordinator {
         }
         guard vModeState.isActive, activeToken != nil, let client = activeClient, expectedGenerationID == vModeGenerationID
         else { return false }
-        guard let engine = engineProvider(), !engine.currentState.isSafeMode else {
+        guard let engine = engineProvider(), !engine.currentState.isSafeMode, !engine.currentState.isASCIIMode else {
             endVMode()
             return false
         }
-        let (next, effect) = runVMode(.click(index: index), isEngineComposing: engine.currentState.isComposing)
+        let (next, effect) = runVMode(
+            .click(index: index), isEngineComposing: engine.currentState.isComposing,
+            isASCIIMode: engine.currentState.isASCIIMode)
         _ = applyVMode(next, effect, client: client)
         return true
     }
@@ -279,9 +281,9 @@ public final class InputSessionCoordinator {
 
     /// One reducer step. The date list's instant is fixed when it opens, and the snippets
     /// are read once when `v3` opens.
-    private func runVMode(_ input: VModeInput, isEngineComposing: Bool) -> (VModeState, VModeEffect) {
+    private func runVMode(_ input: VModeInput, isEngineComposing: Bool, isASCIIMode: Bool = false) -> (VModeState, VModeEffect) {
         if case .vSub(.dateTime) = vModeState {} else { dateAnchor = now() }
-        let context = VModeContext(isEngineComposing: isEngineComposing)
+        let context = VModeContext(isASCIIMode: isASCIIMode, isEngineComposing: isEngineComposing)
         let (next, effect) = vModeReducer.reduce(vModeState, input, context: context)
         if case .vSub(.snippets) = next {
             if snippetCache == nil { snippetCache = snippetStore.load() }
@@ -302,8 +304,12 @@ public final class InputSessionCoordinator {
             endVMode()
             return false
         case .consumeOnly:
-            vModeState = next
-            if next.isActive { presentVMode(on: client) } else { endVMode() }
+            if next.isActive {
+                vModeState = next
+                presentVMode(on: client)
+            } else {
+                endVMode()
+            }
             return true
         case .commitText(let text):
             vModeState = .idle

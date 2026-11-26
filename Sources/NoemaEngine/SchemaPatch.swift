@@ -23,9 +23,10 @@ public enum SchemaPatch {
     public static let appendTranslatorKey = "engine/translators/+"
     /// Keys a wrapper may append with, in preference order (`appendKey(avoiding:)`).
     public static let wrapperAppendKeys = ["engine/translators/@next", "engine/translators/@after last"]
-    /// Recognizer patterns every staged patch sets to null, so no upstream pattern (万象's
-    /// and 雾凇's `v` modes) claims input that starts with `v`. `speller/alphabet` is left
-    /// alone: `lv` and `nv` still spell 绿 and 女.
+    /// Recognizer patterns every staged patch clears to `""` (empty string, not YAML null
+    /// `~`, so librime's `__include` in `wrapper` never overwrites it with a user's own
+    /// `recognizer/patterns/v`, while librime's `RecognizerPatterns` ignores empty patterns).
+    /// `speller/alphabet` is left alone: `lv` and `nv` still spell 绿 and 女.
     public static let disabledRecognizerKeys = ["recognizer/patterns/v", "recognizer/patterns/v_mode"]
     /// The `DeployManifest.schemaPatches` entry of a build compiled with
     /// `disabledRecognizerKeys`. A build without it predates v-mode and is redeployed.
@@ -42,7 +43,7 @@ public enum SchemaPatch {
     public static func freshPatch(appending component: String? = nil) -> String {
         var text = "patch:\n"
         if let component { text += "  \"\(appendTranslatorKey)\":\n    - \"\(component)\"\n" }
-        for key in disabledRecognizerKeys { text += "  \"\(key)\": ~\n" }
+        for key in disabledRecognizerKeys { text += "  \"\(key)\": \"\"\n" }
         return text
     }
 
@@ -62,7 +63,7 @@ public enum SchemaPatch {
             guard let key = appendKey(avoiding: userPatchKeys) else { return nil }
             text += "  \"\(key)\": \"\(component)\"\n"
         }
-        for key in disabledRecognizerKeys { text += "  \"\(key)\": ~\n" }
+        for key in disabledRecognizerKeys { text += "  \"\(key)\": \"\"\n" }
         return text + "\n"
     }
 

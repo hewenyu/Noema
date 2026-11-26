@@ -37,7 +37,7 @@ public struct SymbolPalette: Sendable, Hashable {
         let category = categories[min(max(index, 0), categories.count - 1)]
         let needle = query.lowercased()
         guard !needle.isEmpty else { return category.symbols.map(\.text) }
-        return category.symbols.filter { $0.keywords.contains { $0.contains(needle) } }.map(\.text)
+        return category.symbols.filter { $0.keywords.contains { $0.lowercased().contains(needle) } }.map(\.text)
     }
 
     /// The shipped palette: 常用标点, 数学符号, 箭头序号, 括号引号, 货币单位.

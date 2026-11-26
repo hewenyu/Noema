@@ -544,7 +544,9 @@ public final class RimeEngine: TypingEngine {
         cachedSchemaID = opening.schemaID
         currentSchemaIsMandarinPinyin = opening.isMandarinPinyin
         currentSecondaryInputRules = opening.secondaryInputRules
-        guard opening.opened, isServing, resources.session != 0 else { return }
+        // `opening.opened` confirms a live session is open even while `finishBoot` is leaving
+        // Safe Mode during `recoverFromSafeMode()` (before `refreshState()` clears `safeModeReason`).
+        guard opening.opened, !isShutDown, !isInExclusiveMaintenance, resources.session != 0 else { return }
         for (name, enabled) in optionOverrides.sorted(by: { $0.key < $1.key }) {
             api.pointee.set_option(resources.session, name, enabled ? 1 : 0)
         }
