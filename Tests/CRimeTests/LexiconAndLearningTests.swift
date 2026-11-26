@@ -190,6 +190,133 @@ extension LibrimeSerializedTests {
             #expect(learned.map(\.text) == ["你好世界"] && learned.first?.pinyinNorm == "ni hao shi jie", "\(learned)")
         }
 
+        /// Codex's sequence: `nihaoshijie`, select `你好` (preedit `你好shi jie`), then End,
+        /// Left, three forward Deletes, and `jian` (preedit `你好shi jian`, raw input
+        /// `nihaoshijian`), select `时间`. The all-pinyin preedit `ni hao shi jie` spelled the
+        /// old raw input, so it is not reused: `你好时间` is learned as `ni hao shi jian`, and
+        /// another set's rebuilt userdb serves it for `nihaoshijian`, never for `nihaoshijie`.
+        @Test func partialSelectionThenEditLearnsTheEditedSpelling() async throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+
+            try typeSelectAndEditTail(engine, replacingThreeKeysWith: "jian")
+            #expect(engine.currentState.preedit == "你好shi jian", "\(engine.currentState.preedit)")
+            #expect(try selectCandidate(engine, "时间").committedText == "你好时间")
+            writer.flush()
+            let learned = try store.allEntries()
+            #expect(learned.map(\.text) == ["你好时间"] && learned.first?.pinyinNorm == "ni hao shi jian", "\(learned)")
+            #expect(!learned.contains { $0.pinyinNorm == "ni hao shi jie" })
+
+            // 薄荷 (no Lua translator): only its rebuilt userdb serves the phrase.
+            let mint = try await engine.switchSchemaSet(
+                to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: "mint_fixture",
+                learningStore: store, learningWriter: writer, luaFile: nil)
+            if case .recovered(let recovery) = mint.userDBOutcome { #expect(recovery.imported == 1) } else {
+                Issue.record("mint: \(String(describing: mint.userDBOutcome))")
+            }
+            #expect(candidates(engine, "nihaoshijian").first == "你好时间")
+            let old = candidates(engine, "nihaoshijie")
+            #expect(old.first == "你好世界" && !old.contains("你好时间"), "\(old)")
+        }
+
+        /// The same edit to `chang` and the sentence `是长`: 长 reads `zhang`, the raw input
+        /// `nihaoshichang` does not spell `ni hao shi zhang`, and the stale `ni hao shi jie`
+        /// is not reused, so `你好是长` is not learned at all.
+        @Test func partialSelectionThenUnverifiableEditIsNotLearned() throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+
+            try typeSelectAndEditTail(engine, replacingThreeKeysWith: "chang")
+            #expect(engine.currentState.preedit == "你好shi chang", "\(engine.currentState.preedit)")
+            #expect(try selectCandidate(engine, "是长").committedText == "你好是长")
+            writer.flush()
+            let learned = try store.allEntries()
+            #expect(learned.isEmpty, "\(learned)")
+        }
+
+        /// Xiaohe double pinyin under a name with no double-pinyin marker (`wanxiang_fixture`,
+        /// `custom_sp`) and as `double_pinyin_flypy`: `noema_learned.lua` stays off, since
+        /// its keys are full pinyin and Xiaohe `shui` is `sang shi`. With `(shui, 水)` and
+        /// `(shui, 税)` imported into the userdb and exported to the TSV, `shui` offers `丧失`
+        /// and neither phrase; `uv` (Xiaohe for `shui`) offers both, 税 only from the
+        /// userdb. A phrase only the TSV holds is served for neither.
+        @Test(arguments: ["wanxiang_fixture", "custom_sp", "double_pinyin_flypy"])
+        func learnedTranslatorStaysOffOnDoublePinyin(_ schemaID: String) async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.useDoublePinyinFlypy(in: .wanxiang, appending: "丧\tsang\t500\n失\tshi\t500\n丧失\tsang shi\t100000\n")
+            try workspace.addSchema(schemaID, copying: "wanxiang_fixture", in: .wanxiang)
+            #expect(!LexiconWorkspace.dictionary(of: .wanxiang).contains("税"))
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let learned = ["水", "税"].map { LearningCommitEvent(rawInput: "shui", preedit: "shui", text: $0) }
+            #expect(try store.recordBatch(learned) == 2)
+
+            let report = try await engine.switchSchemaSet(
+                to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: schemaID,
+                learningStore: store, luaFile: LexiconWorkspace.lua)
+            #expect(engine.currentState.schemaID == schemaID && report.learnedLines == 2)
+            let live = try String(
+                contentsOf: workspace.setDir(.wanxiang).appending(path: "build/\(schemaID).schema.yaml"), encoding: .utf8)
+            #expect(live.contains("lua_translator@*noema_learned"), "the deployer dropped the translator")
+            let tsv = try String(contentsOf: workspace.setDir(.wanxiang).appending(path: NoemaPaths.learnedTSVFileName), encoding: .utf8)
+            #expect(tsv.contains("shui\t水\t") && tsv.contains("shui\t税\t"), "\(tsv)")
+
+            let sangShi = candidates(engine, "shui")
+            #expect(sangShi.contains("丧失") && !sangShi.contains("水") && !sangShi.contains("税"), "\(sangShi)")
+            let shui = candidates(engine, "uv")
+            #expect(shui.contains("水") && shui.contains("税"), "\(shui)")
+
+            // A phrase only the TSV holds: no Lua lookup serves it under the raw keys.
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "shui", preedit: "shui", text: "睡")]) == 1)
+            #expect(engine.refreshLearnedPhrases(from: store) == 3)
+            engine.resetSession()
+            let after = candidates(engine, "shui")
+            #expect(!after.contains("睡") && !after.contains("水"), "noema_learned.lua served a full-pinyin key: \(after)")
+        }
+
+        /// A full-pinyin speller with fuzzy `derive`, jianpin `abbrev`, `erase`, and a tone
+        /// `xform` (rime_ice's shape) keeps every full-pinyin syllable as typed, so
+        /// `noema_learned.lua` stays on: a phrase only the TSV holds is served for `nihao`
+        /// and `ni'hao`.
+        @Test func learnedTranslatorStaysOnForFullPinyinWithDerivedSpellings() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.useJianpinAbbreviations(in: .rimeIce, appending: "")
+            try workspace.replace(in: .rimeIce, "rime_ice_fixture.schema.yaml", "    - abbrev/^([a-z]).+$/$1/\n", with: """
+                    - abbrev/^([a-z]).+$/$1/
+                    - derive/^([zcs])h/$1/
+                    - derive/([dtngkhrzcs])o(u|ng)$/$1o/
+                    - erase/^hm$/
+                    - erase/^ng$/
+                    - xform/[1-5]$//
+                    - xform/^([nl])ue$/$1ve/
+
+                """)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let host = SwitcherHost(workspace: workspace, engine: engine)
+            #expect(try await host.switchAndWait(.rimeIce, "rime_ice_fixture").phase == .ready)
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            #expect(!candidates(engine, "nihao").contains("霓昊"))
+            #expect(engine.refreshLearnedPhrases(from: store) == 1)
+            engine.resetSession()
+            #expect(candidates(engine, "nihao").contains("霓昊"), "noema_learned.lua is off on a full-pinyin schema")
+            #expect(candidates(engine, "ni'hao").contains("霓昊"))
+        }
+
         /// Double pinyin and jianpin through real librime: 万象 runs `double_pinyin_flypy`'s
         /// speller (`uijx` shows the preedit `shi jia`), 雾凇 adds jianpin abbreviations (`nh`
         /// shows `n h`, `shij` shows `shi j`). `learning.sqlite` stores full pinyin, never the
@@ -740,6 +867,15 @@ final class LexiconWorkspace {
         try appendToDictionary(of: set, appendix)
     }
 
+    /// Copies `set`'s schema `source` to a new schema `schemaID` (same dictionary) and lists
+    /// it in the set's `default.yaml`, so librime deploys it. A no-op for `source` itself.
+    func addSchema(_ schemaID: String, copying source: String, in set: SchemaSetID) throws {
+        guard schemaID != source else { return }
+        let schema = try String(contentsOf: schemaDir(set).appending(path: "\(source).schema.yaml"), encoding: .utf8)
+        try write(schema.replacingOccurrences(of: "schema_id: \(source)", with: "schema_id: \(schemaID)"), "\(schemaID).schema.yaml", in: set)
+        try replace(in: set, "default.yaml", "  - schema: \(source)", with: "  - schema: \(source)\n  - schema: \(schemaID)")
+    }
+
     func appendToDictionary(of set: SchemaSetID, _ appendix: String) throws {
         let url = schemaDir(set).appending(path: "\(Self.fixture(set).schemaID).dict.yaml")
         try (try String(contentsOf: url, encoding: .utf8) + appendix).write(to: url, atomically: true, encoding: .utf8)
@@ -834,6 +970,34 @@ func commit(_ engine: RimeEngine, _ input: String, _ text: String, pages: Int = 
     Issue.record("no candidate \(text) for \(input) (preedit \(preedit))")
     engine.clearComposition()
     throw CancellationError()
+}
+
+/// Selects the candidate `text` from up to `pages` pages of the current composition.
+@MainActor
+func selectCandidate(_ engine: RimeEngine, _ text: String, pages: Int = 8) throws -> KeyHandlingResult {
+    for _ in 0..<pages {
+        if let index = engine.currentState.candidates.firstIndex(where: { $0.text == text }) {
+            return engine.selectCandidate(at: index)
+        }
+        engine.changePage(backward: false)
+    }
+    Issue.record("no candidate \(text) in \(engine.currentState.candidates.map(\.text))")
+    throw CancellationError()
+}
+
+/// `nihaoshijie`, select `你好` (preedit `你好shi jie`), then End, Left, three forward
+/// Deletes (`jie` is gone), and `replacement` typed in its place.
+@MainActor
+func typeSelectAndEditTail(_ engine: RimeEngine, replacingThreeKeysWith replacement: String) throws {
+    for character in "nihaoshijie" { _ = engine.processKey(.text(character)) }
+    try #require(engine.currentState.preedit == "ni hao shi jie", "\(engine.currentState.preedit)")
+    #expect(try selectCandidate(engine, "你好").committedText == nil)
+    try #require(engine.currentState.preedit == "你好shi jie", "\(engine.currentState.preedit)")
+    _ = engine.processKey(.key(VirtualKeyCode.end, ""))
+    _ = engine.processKey(.key(VirtualKeyCode.leftArrow, ""))
+    for _ in 0..<3 { _ = engine.processKey(.key(VirtualKeyCode.forwardDelete, "")) }
+    try #require(engine.currentState.preedit == "你好shi", "\(engine.currentState.preedit)")
+    for character in replacement { _ = engine.processKey(.text(character)) }
 }
 
 /// Every candidate text for `input` across up to `pages` pages; leaves no composition.

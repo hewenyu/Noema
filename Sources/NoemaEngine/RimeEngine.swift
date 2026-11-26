@@ -447,32 +447,42 @@ public final class RimeEngine: TypingEngine {
         KeyHandlingResult(handled: false, state: currentState, degradation: .safeMode)
     }
 
-    /// The latest all-pinyin preedit of the current composition (`ni hao shi jie`), kept
-    /// while a commit is observed: after a partial selection the preedit reads
-    /// `你好shi jie` and no longer spells the whole raw input, so the commit that finishes
-    /// the composition takes its syllable breaks from here. Cleared when composing ends.
-    private var lastSegmentedPreedit: String?
+    /// The latest all-pinyin preedit of the current composition (`ni hao shi jie`) and the
+    /// raw input it spelled, kept while a commit is observed: after a partial selection the
+    /// preedit reads `你好shi jie` and no longer spells the whole raw input, so the commit
+    /// that finishes the composition takes its syllable breaks from here. Dropped when
+    /// composing ends and as soon as the raw input changes under a Han preedit (the user
+    /// edited the rest after the selection: `你好shi jian` must not reuse `shi jie`).
+    private var lastSegmentedPreedit: (rawInput: String, preedit: String)?
 
     private func noteSegmentedPreedit() {
         guard onCommitObservation != nil, currentState.isComposing else {
             lastSegmentedPreedit = nil
             return
         }
+        let raw = noema_rime_get_input(resources.session).map { String(cString: $0) } ?? ""
         let preedit = currentState.preedit
         if !TextNormalization.containsHanCharacters(preedit), !TextNormalization.tonelessPinyinKey(preedit).isEmpty {
-            lastSegmentedPreedit = preedit
+            lastSegmentedPreedit = (raw, preedit)
+        } else if lastSegmentedPreedit?.rawInput != raw {
+            lastSegmentedPreedit = nil
         }
     }
 
     /// The raw input and preedit before a call that may commit; nil when nobody observes.
     /// A preedit holding Han characters from a partial selection is replaced by the last
-    /// all-pinyin preedit (`LearningCommitEvent.normalized` still checks it spells the raw input).
+    /// all-pinyin preedit only when that preedit spelled this very raw input; otherwise an
+    /// empty preedit goes out so `LearningCommitEvent.normalized` never pairs the tail's
+    /// syllables with the committed Han characters and instead verifies `rawInput`.
     private func captureBeforeCommit() -> (rawInput: String, preedit: String)? {
         guard onCommitObservation != nil else { return nil }
         let raw = noema_rime_get_input(resources.session).map { String(cString: $0) } ?? ""
         let preedit = currentState.preedit
-        if TextNormalization.containsHanCharacters(preedit), let segmented = lastSegmentedPreedit {
-            return (raw, segmented)
+        if TextNormalization.containsHanCharacters(preedit) {
+            if let segmented = lastSegmentedPreedit, segmented.rawInput == raw {
+                return (raw, segmented.preedit)
+            }
+            return (raw, "")
         }
         return (raw, preedit)
     }

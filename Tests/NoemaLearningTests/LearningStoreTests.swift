@@ -88,8 +88,12 @@ func permissions(_ url: URL) -> mode_t {
 
     @Test func normalizationKeysFullPinyinFromThePreeditOrTheReading() {
         #expect(event("nihao", "你好", preedit: "ni hao").normalized()?.pinyinNorm == "ni hao")
-        // A preedit holding Han text: the raw input spells the reading.
+        // A preedit holding Han text: the raw input spells the reading; never pair tail
+        // syllables alone against a trimmed Han prefix (`你xiao` for `你😄` must not learn `xiao -> 你`).
         #expect(event("nihao", "你好", preedit: "你 hao").normalized()?.pinyinNorm == "ni hao")
+        #expect(event("nixiao", "你😄", preedit: "你xiao").normalized() == nil)
+        #expect(event("nime", "你me", preedit: "你me").normalized() == nil)
+        #expect(event("nihaoshijian", "你好时间", preedit: "你好shi jian").normalized()?.pinyinNorm == "ni hao shi jian")
         #expect(event("xian", "西安", preedit: "xi'an").normalized()?.pinyinNorm == "xi an")
         #expect(event("xian", "西安").normalized()?.pinyinNorm == "xi an")
         #expect(event("lv", "绿", preedit: "lü").normalized()?.pinyinNorm == "lv")

@@ -69,10 +69,12 @@ public struct LearningCommitEvent: Sendable, Hashable {
         han.append(contentsOf: text.unicodeScalars.filter(TextNormalization.isHanIdeograph))
         let count = han.count
         let reading = TextNormalization.mandarinPinyinSyllables(for: String(han))
-        let typed = TextNormalization.tonelessPinyinKey(preedit).split(separator: " ").map { syllable in
-            // `lue`/`nue` is how many schemas spell `lve`/`nve`.
-            syllable == "lue" || syllable == "nue" ? String(syllable.prefix(1)) + "ve" : String(syllable)
-        }
+        let typed = TextNormalization.containsHanCharacters(preedit)
+            ? []
+            : TextNormalization.tonelessPinyinKey(preedit).split(separator: " ").map { syllable in
+                // `lue`/`nue` is how many schemas spell `lve`/`nve`.
+                syllable == "lue" || syllable == "nue" ? String(syllable.prefix(1)) + "ve" : String(syllable)
+            }
         if typed.count == count {
             var result: [String] = []
             for (index, observed) in typed.enumerated() {
