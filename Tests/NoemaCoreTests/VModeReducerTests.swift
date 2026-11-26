@@ -301,8 +301,9 @@ import Testing
 
     @Test func menuItemsAndQuickActions() {
         #expect(VMenuItem.allCases.count == 9 && VMenuItem.at(index: 8) == .settings && VMenuItem.at(index: 9) == nil)
-        #expect(QuickActionID.allCases.filter(\.isImplemented) == [.settings])
-        #expect(QuickActionID.clipboard.plannedMilestone == "M3" && QuickActionID.rewrite.plannedMilestone == "M4")
+        #expect(QuickActionID.allCases.filter(\.isImplemented) == [.clipboard, .settings])
+        #expect(QuickActionID.clipboard.plannedMilestone == nil && QuickActionID.voiceInput.plannedMilestone == "M3")
+        #expect(QuickActionID.rewrite.plannedMilestone == "M4")
         #expect(VModeEnvironment(pageSize: 40).pageSize == 9 && VModeEnvironment(pageSize: 0).pageSize == 1)
     }
 }

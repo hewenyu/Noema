@@ -44,8 +44,9 @@ import Testing
             #expect(layout.hitTest(CGPoint(x: a.pillFrame.midX, y: a.pillFrame.midY)) == a.index)
         }
         #expect(layout.highlightedPillFrame == layout.items[4].pillFrame && layout.items[4].isHighlighted)
-        // Agent actions that ship later are dimmed; settings and the offline tools are not.
-        #expect(layout.items.filter(\.isDimmed).map(\.index) == [1, 3, 5, 6])
+        // Agent actions that ship later are dimmed; the clipboard (v2), settings, and the
+        // offline tools are not.
+        #expect(layout.items.filter(\.isDimmed).map(\.index) == [3, 5, 6])
         #expect(layout.hitTest(CGPoint(x: -5, y: -5)) == nil)
         #expect(layout.itemsViewport == nil && layout.maxVerticalScrollOffset == 0)
     }

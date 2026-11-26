@@ -19,16 +19,16 @@ public enum QuickActionID: String, Codable, Sendable, Hashable, CaseIterable {
         }
     }
 
-    /// Whether the agent can run the action today; the others answer with a non-activating
-    /// "coming soon" toast.
-    public var isImplemented: Bool { self == .settings }
+    /// Whether the agent can run the action today (`v2` opens the clipboard history panel,
+    /// `v9` Settings); the others answer with a non-activating "coming soon" toast.
+    public var isImplemented: Bool { self == .settings || self == .clipboard }
 
     /// The milestone that ships an action not yet implemented; nil once implemented.
     public var plannedMilestone: String? {
         switch self {
-        case .clipboard, .voiceInput: "M3"
+        case .voiceInput: "M3"
         case .translate, .rewrite: "M4"
-        case .settings: nil
+        case .clipboard, .settings: nil
         }
     }
 }
