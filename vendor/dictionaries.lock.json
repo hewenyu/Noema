@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "wanxiang",
+      "kind": "schemaSet",
+      "schemaSetID": "wanxiang",
+      "displayName": "万象拼音 (base)",
+      "upstream": "https://github.com/amzxyz/rime_wanxiang",
+      "release": "v18.2.1",
+      "publishedAt": "2026-11-23T23:38:57Z",
+      "url": "https://github.com/amzxyz/rime-wanxiang/releases/download/v18.2.1/rime-wanxiang-base.zip",
+      "sha256": "e74bd5fcc3636d6c50d0bb1198da9346d4de862407519bd20ea5cc335cc2d26b",
+      "size": 26151104,
+      "license": "CC-BY-4.0",
+      "archive": "zip",
+      "stripComponents": 0,
+      "defaultSchemaID": "wanxiang",
+      "optionalGramID": "wanxiang-lts-zh-hans"
+    },
+    {
+      "id": "rime-ice",
+      "kind": "schemaSet",
+      "schemaSetID": "rime-ice",
+      "displayName": "雾凇拼音 (full)",
+      "upstream": "https://github.com/iDvel/rime-ice",
+      "release": "2026.06.30",
+      "publishedAt": "2026-06-30T06:15:47Z",
+      "url": "https://github.com/iDvel/rime-ice/releases/download/2026.06.30/full.zip",
+      "sha256": "675d23b070be00e1b800f9a6db033ef98f4493cd5b568ed8aa3b3541769c46ac",
+      "size": 16050491,
+      "license": "GPL-3.0",
+      "archive": "zip",
+      "stripComponents": 0,
+      "defaultSchemaID": "rime_ice"
+    },
+    {
+      "id": "mint",
+      "kind": "schemaSet",
+      "schemaSetID": "mint",
+      "displayName": "薄荷输入法 (oh-my-rime)",
+      "upstream": "https://github.com/Mintimate/oh-my-rime",
+      "release": "0cf3d63c61d07a84834c031bad4ef8ac39b322d0",
+      "publishedAt": "2026-11-14T12:31:18Z",
+      "url": "https://codeload.github.com/Mintimate/oh-my-rime/zip/0cf3d63c61d07a84834c031bad4ef8ac39b322d0",
+      "sha256": "379bd6ca4b16bd6728bd584579cb54ebe6450653ff4f2d726934edda6b2f71bd",
+      "size": 24008403,
+      "license": "GPL-3.0",
+      "archive": "zip",
+      "stripComponents": 1,
+      "defaultSchemaID": "rime_mint"
+    },
+    {
+      "id": "wanxiang-lts-zh-hans",
+      "kind": "gram",
+      "displayName": "万象语言模型 LTS (简体)",
+      "upstream": "https://github.com/amzxyz/RIME-LMDG",
+      "release": "LTS",
+      "publishedAt": "2025-12-07T07:13:21Z",
+      "url": "https://github.com/amzxyz/rime-wanxiang-data/releases/download/LTS/wanxiang-lts-zh-hans.gram",
+      "sha256": "e9ddd501b7d536bc5ea1346f8f900ae49a719a05be349e0a17cb27e717143ca5",
+      "size": 390786092,
+      "license": "CC-BY-4.0",
+      "archive": "raw",
+      "fileName": "wanxiang-lts-zh-hans.gram"
+    }
+  ]
+}

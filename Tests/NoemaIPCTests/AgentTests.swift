@@ -88,7 +88,8 @@ import Testing
         snapshot.connectedPeers = 2
         model.apply(snapshot)
         #expect(model.service.listenerState == .standbyNotLaunchdManaged && model.service.connectedPeers == 2)
-        #expect(SettingsSectionID.allCases.map(\.title) == ["基础设置", "快速操作", "其他"])
+        #expect(SettingsSectionID.sidebarOrder.map(\.title) == ["基础设置", "快速操作", "词库", "其他"])
+        #expect(Set(SettingsSectionID.sidebarOrder) == Set(SettingsSectionID.allCases), "every section is in the sidebar")
     }
 
     @Test func unbundledSMAppServiceReportsAStatus() {

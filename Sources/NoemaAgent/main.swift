@@ -70,6 +70,7 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
                 }
             })
         self.coordinator = coordinator
+        model.lexicon = LexiconController(requestSwitch: coordinator.schemaSwitchRequester)
 
         switch coordinator.start() {
         case .listening:

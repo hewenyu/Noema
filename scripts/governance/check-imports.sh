@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Mechanical boundary checks for AGENTS.md standing rules 1, 5, and 6.
 #
-#   1. Sources/NoemaIME, Sources/NoemaIMEShell, Sources/NoemaUI, and Sources/NoemaIPC (the
-#      IMKit shell, its library, the candidate panel, and the IPC library it links) import
-#      no networking, audio/speech, AX, event-tap, pasteboard, or screen-capture frameworks
-#      and call none of those APIs (thin shell, zero TCC), nor ServiceManagement or
-#      NoemaAgentCore (the agent's side of the boundary). Each directory must exist and
-#      hold source files. Carbon/HIToolbox and InputMethodKit stay allowed:
+#   1. Every source directory linked into NoemaIME: Sources/NoemaIME, NoemaIMEShell,
+#      NoemaUI, NoemaIPC (the IMKit shell, its library, the candidate panel, the IPC
+#      library) and NoemaCore, NoemaEngine, NoemaText, NoemaLearning (the engine, text, and
+#      learning libraries it links) import no networking, audio/speech, AX, event-tap,
+#      pasteboard, or screen-capture frameworks and call none of those APIs (thin shell,
+#      zero TCC), nor ServiceManagement, NoemaAgentCore, or NoemaLexiconAdmin (the agent's
+#      side of the boundary: downloads and archive extraction). Each directory must exist
+#      and hold source files. Carbon/HIToolbox and InputMethodKit stay allowed:
 #      IsSecureEventInputEnabled() lives in Carbon.
 #   2. No .xcassets/.xib/.storyboard/.xcodeproj/.xcworkspace anywhere, no `import XCTest`,
 #      and no xcodebuild invocation in Sources, Tests, Resources, scripts, .kiln, or
@@ -45,7 +47,7 @@ IFS= read -r -d '' LEXER <<'JS' || true
 const fs = require('fs');
 const path = require('path');
 
-const BANNED_MODULES = 'AVFoundation|AVFAudio|Speech|SoundAnalysis|CoreAudio|AudioToolbox|Network|CFNetwork|WebKit|ApplicationServices|HIServices|ScreenCaptureKit|Contacts|CoreLocation|EventKit|Photos|ServiceManagement|NoemaAgentCore';
+const BANNED_MODULES = 'AVFoundation|AVFAudio|Speech|SoundAnalysis|CoreAudio|AudioToolbox|Network|CFNetwork|WebKit|ApplicationServices|HIServices|ScreenCaptureKit|Contacts|CoreLocation|EventKit|Photos|ServiceManagement|NoemaAgentCore|NoemaLexiconAdmin';
 const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|NSPasteboard[A-Za-z]*';
 const ATTR = '@[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?\\s*';
 const ACCESS = '(?:public|package|internal|fileprivate|private)\\s+';
@@ -295,17 +297,20 @@ report_hits() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. NoemaIME, NoemaIMEShell, NoemaUI, and NoemaIPC stay a thin IMKit shell
+# 1. Everything NoemaIME links stays a thin, zero-TCC IMKit shell
 # ---------------------------------------------------------------------------
 
-IME_SOURCE_DIRS=(Sources/NoemaIME Sources/NoemaIMEShell Sources/NoemaUI Sources/NoemaIPC)
+IME_SOURCE_DIRS=(
+  Sources/NoemaIME Sources/NoemaIMEShell Sources/NoemaUI Sources/NoemaIPC
+  Sources/NoemaCore Sources/NoemaEngine Sources/NoemaText Sources/NoemaLearning
+)
 for dir in "${IME_SOURCE_DIRS[@]}"; do
   if [[ ! -d "${dir}" || -L "${dir}" ]]; then
     bad "${dir} is missing or a symlink"
   elif [[ -z "$(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print -quit)" ]]; then
     bad "${dir} has no source files to scan"
   else
-    report_hits "${dir} must not use networking/audio/AX/pasteboard/LaunchAgent APIs or NoemaAgentCore (AGENTS.md rule 1)" \
+    report_hits "${dir} must not use networking/audio/AX/pasteboard/LaunchAgent APIs, NoemaAgentCore, or NoemaLexiconAdmin (AGENTS.md rule 1)" \
       node -e "${LEXER}" -- ime < <(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print0)
   fi
 done
@@ -354,4 +359,4 @@ if (( failures > 0 )); then
   printf '[check-imports] %d violation(s)\n' "${failures}" >&2
   exit 1
 fi
-printf '[check-imports] ok: NoemaIME/NoemaIMEShell/NoemaUI/NoemaIPC imports, CLT-only artifacts, CLAUDE.md aliases, Kiln boundary\n'
+printf '[check-imports] ok: imports of every NoemaIME-linked target (%d dirs), CLT-only artifacts, CLAUDE.md aliases, Kiln boundary\n' "${#IME_SOURCE_DIRS[@]}"

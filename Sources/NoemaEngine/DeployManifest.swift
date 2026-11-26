@@ -15,7 +15,12 @@ import Foundation
 ///   `build/` holds nothing else (no extra files, no symlinks).
 /// - `requiredDictionaries`: the compiled schema's dictionaries (`translator/dictionary`,
 ///   `reverse_lookup/dictionary`, and `<tag>/dictionary` of each tagged script or table
-///   translator); each needs non-empty `<dict>.table.bin` and `<dict>.prism.bin` among `outputs`.
+///   translator); each needs a non-empty `<dict>.table.bin` among `outputs`.
+/// - `requiredPrisms` (optional, appended to version 1): the prisms of those translators,
+///   `<namespace>/prism` or else its dictionary; each needs a non-empty `<prism>.prism.bin`.
+///   A manifest without it (written before it existed) requires `<dict>.prism.bin` for every
+///   required dictionary, exactly as before.
+/// - `schemaSetID` (optional, appended to version 1): the schema set the build belongs to.
 public struct DeployManifest: Codable, Equatable, Sendable {
     public struct ManifestEntry: Codable, Hashable, Sendable {
         /// `/`-separated, relative, without `.` or `..` components.
@@ -39,20 +44,31 @@ public struct DeployManifest: Codable, Equatable, Sendable {
     public var inputs: [ManifestEntry]
     public var outputs: [ManifestEntry]
     public var requiredDictionaries: [String]
+    /// Nil in manifests written before prisms were recorded separately; see `effectivePrisms`.
+    public var requiredPrisms: [String]?
+    public var schemaSetID: String?
 
     public init(
         version: Int = DeployManifest.currentVersion,
         schemaID: String,
         inputs: [ManifestEntry],
         outputs: [ManifestEntry],
-        requiredDictionaries: [String]
+        requiredDictionaries: [String],
+        requiredPrisms: [String]? = nil,
+        schemaSetID: String? = nil
     ) {
         self.version = version
         self.schemaID = schemaID
         self.inputs = inputs
         self.outputs = outputs
         self.requiredDictionaries = requiredDictionaries
+        self.requiredPrisms = requiredPrisms
+        self.schemaSetID = schemaSetID
     }
+
+    /// The prisms a build must contain: `requiredPrisms`, or `requiredDictionaries` for a
+    /// manifest that predates it.
+    public var effectivePrisms: [String] { requiredPrisms ?? requiredDictionaries }
 
     public enum Failure: Error, Equatable, Sendable {
         /// A path could not be read, listed, or hashed.
@@ -68,10 +84,32 @@ public struct DeployManifest: Codable, Equatable, Sendable {
 
     // MARK: Required outputs
 
-    /// Outputs a usable build of `schemaID` must contain.
-    public static func requiredOutputPaths(schemaID: String, dictionaries: [String]) -> [String] {
-        ["default.yaml", "\(schemaID).schema.yaml"]
-            + dictionaries.flatMap { ["\($0).table.bin", "\($0).prism.bin"] }
+    /// Outputs a usable build of `schemaID` must contain: `default.yaml`, the schema, a
+    /// `<dict>.table.bin` per dictionary, and a `<prism>.prism.bin` per prism (`prisms` nil:
+    /// one per dictionary). Deduplicated, in order.
+    public static func requiredOutputPaths(schemaID: String, dictionaries: [String], prisms: [String]? = nil) -> [String] {
+        var paths = ["default.yaml", "\(schemaID).schema.yaml"]
+        for path in dictionaries.map({ "\($0).table.bin" }) + (prisms ?? dictionaries).map({ "\($0).prism.bin" })
+        where !paths.contains(path) {
+            paths.append(path)
+        }
+        return paths
+    }
+
+    /// The optional inputs a deployment also depends on beyond `inputs(sharedDataDir:userDataDir:)`:
+    /// the learned-phrase translator, recorded as `noema/lua/<name>`, since its presence
+    /// changes the schema patch the deployer writes.
+    public static func extraInputs(luaFile: URL?) throws(Failure) -> [ManifestEntry] {
+        guard let luaFile else { return [] }
+        let (size, digest) = try hashFile(luaFile, followSymlink: false)
+        return [ManifestEntry(relativePath: "noema/lua/\(luaFile.lastPathComponent)", size: size, sha256: digest)]
+    }
+
+    /// `inputs(sharedDataDir:userDataDir:)` plus `extraInputs(luaFile:)`, sorted by path.
+    public static func inputs(sharedDataDir: URL, userDataDir: URL, luaFile: URL?) throws(Failure) -> [ManifestEntry] {
+        let base = try inputs(sharedDataDir: sharedDataDir, userDataDir: userDataDir)
+        guard luaFile != nil else { return base }
+        return (base + (try extraInputs(luaFile: luaFile))).sorted { $0.relativePath < $1.relativePath }
     }
 
     // MARK: Inputs
@@ -132,8 +170,8 @@ public struct DeployManifest: Codable, Equatable, Sendable {
 
     /// The manifest in `buildDir` when the build is complete and intact: the manifest is a
     /// regular file of at most `maxReadSize` bytes, decodes with `version == 1` and
-    /// `schemaID`, lists `default.yaml`, the schema, and both compiled files of every required
-    /// dictionary, each non-empty, and equals a fresh `outputs(buildDir:)` exactly, so every
+    /// `schemaID`, lists `default.yaml`, the schema, the table of every required dictionary,
+    /// and the prism of every `effectivePrisms` entry, each non-empty, and equals a fresh `outputs(buildDir:)` exactly, so every
     /// listed file is still a regular file with the recorded size and SHA-256 and `build/`
     /// holds no unlisted file and no symlink. Nil otherwise.
     public static func validated(buildDir: URL, schemaID: String) -> DeployManifest? {
@@ -141,10 +179,13 @@ public struct DeployManifest: Codable, Equatable, Sendable {
               let data = try? readRegularFile(buildDir.appending(path: fileName)),
               let manifest = try? JSONDecoder().decode(DeployManifest.self, from: data),
               manifest.version == currentVersion, manifest.schemaID == schemaID,
-              isSafeName(schemaID), manifest.requiredDictionaries.allSatisfy(isSafeName)
+              isSafeName(schemaID), manifest.requiredDictionaries.allSatisfy(isSafeName),
+              manifest.effectivePrisms.allSatisfy(isSafeName),
+              manifest.schemaSetID.map(isSafeName) ?? true
         else { return nil }
         let sizes = Dictionary(manifest.outputs.map { ($0.relativePath, $0.size) }, uniquingKeysWith: { _, _ in 0 })
-        guard requiredOutputPaths(schemaID: schemaID, dictionaries: manifest.requiredDictionaries)
+        guard requiredOutputPaths(
+                schemaID: schemaID, dictionaries: manifest.requiredDictionaries, prisms: manifest.requiredPrisms)
                 .allSatisfy({ (sizes[$0] ?? 0) > 0 }),
               let actual = try? outputs(buildDir: buildDir), actual == manifest.outputs
         else { return nil }
@@ -166,7 +207,7 @@ public struct DeployManifest: Codable, Equatable, Sendable {
     public static func hashFile(_ url: URL, followSymlink: Bool = true) throws(Failure) -> (UInt64, String) {
         let flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK | (followSymlink ? 0 : O_NOFOLLOW)
         let descriptor = open(url.path, flags)
-        guard descriptor >= 0 else { throw .unreadable(url.path) }
+        guard descriptor >= 0 else { throw !followSymlink && errno == ELOOP ? .notRegular(url.path) : .unreadable(url.path) }
         defer { close(descriptor) }
         var info = stat()
         guard fstat(descriptor, &info) == 0 else { throw .unreadable(url.path) }

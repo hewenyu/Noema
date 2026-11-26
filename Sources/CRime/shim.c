@@ -60,5 +60,25 @@ bool noema_rime_engine_api_available(void) {
          RIME_PROVIDED(api, free_commit) && RIME_PROVIDED(api, get_context) &&
          RIME_PROVIDED(api, free_context) && RIME_PROVIDED(api, get_status) &&
          RIME_PROVIDED(api, free_status) && RIME_PROVIDED(api, set_option) &&
-         RIME_PROVIDED(api, get_option);
+         RIME_PROVIDED(api, get_option) && RIME_PROVIDED(api, get_input);
+}
+
+RimeLeversApi *noema_rime_get_levers_api(void) {
+  RimeApi *api = noema_rime_get_api();
+  if (!api || !RIME_PROVIDED(api, find_module)) return NULL;
+  RimeModule *module = api->find_module("levers");
+  if (!module || !module->get_api) return NULL;
+  RimeLeversApi *levers = (RimeLeversApi *)module->get_api();
+  if (!levers || !RIME_PROVIDED(levers, user_dict_iterator_init) ||
+      !RIME_PROVIDED(levers, user_dict_iterator_destroy) || !RIME_PROVIDED(levers, next_user_dict) ||
+      !RIME_PROVIDED(levers, export_user_dict) || !RIME_PROVIDED(levers, import_user_dict)) {
+    return NULL;
+  }
+  return levers;
+}
+
+const char *noema_rime_get_input(RimeSessionId session) {
+  RimeApi *api = noema_rime_get_api();
+  if (!api || !RIME_PROVIDED(api, get_input) || session == 0) return NULL;
+  return api->get_input(session);
 }

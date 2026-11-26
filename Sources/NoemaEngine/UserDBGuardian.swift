@@ -1,0 +1,464 @@
+import CRime
+import Darwin
+import Foundation
+import NoemaCore
+import NoemaLearning
+import NoemaText
+
+/// The librime levers calls `UserDBGuardian` makes. `RimeUserDictLevers` is the real one; it
+/// is valid only between `initialize` and `finalize`, with no session open, so no userdb is
+/// held by a translator. `backup_user_dict`/`restore_user_dict` are deliberately absent:
+/// they write into the working directory and report success on a corrupt userdb.
+public protocol UserDictLevers {
+    /// Names of the `*.userdb` in `user_data_dir`.
+    func userDictNames() -> [String]
+    /// Entries exported to `file` (`<text>\t<code>\t<weight>`), or a negative number on failure.
+    func exportUserDict(_ name: String, to file: URL) -> Int
+    /// Entries imported from `file` (`<text>\t<code>\t<weight>`), or a negative number on failure.
+    func importUserDict(_ name: String, from file: URL) -> Int
+}
+
+/// The levers API of the in-process librime.
+struct RimeUserDictLevers: UserDictLevers {
+    let levers: UnsafeMutablePointer<RimeLeversApi>
+
+    init?() {
+        guard let levers = noema_rime_get_levers_api() else { return nil }
+        self.levers = levers
+    }
+
+    func userDictNames() -> [String] {
+        var iterator = RimeUserDictIterator()
+        guard levers.pointee.user_dict_iterator_init(&iterator) != 0 else { return [] }
+        defer { levers.pointee.user_dict_iterator_destroy(&iterator) }
+        var names: [String] = []
+        while let name = levers.pointee.next_user_dict(&iterator) { names.append(String(cString: name)) }
+        return names
+    }
+
+    func exportUserDict(_ name: String, to file: URL) -> Int {
+        Int(levers.pointee.export_user_dict(name, file.path))
+    }
+
+    func importUserDict(_ name: String, from file: URL) -> Int {
+        Int(levers.pointee.import_user_dict(name, file.path))
+    }
+}
+
+/// How a schema's dictionary spells its codes, and so how `learning.sqlite`'s toneless
+/// `pinyin_norm` must be spelled to land in that schema's userdb: a userdb code is found only
+/// when each of its syllables is one of the dictionary's syllables.
+public enum UserDictCodeFormat: String, Sendable, Hashable, Codable {
+    /// `ni hao`: 雾凇, the built-in `noema_pinyin`, double pinyin over toneless dictionaries.
+    case toneless
+    /// `ní hào`, NFC tone marks, `ü` kept (`nǚ`, `lüè`), the neutral tone unmarked: 万象 and
+    /// 薄荷 (which imports 万象's dictionaries), whose `speller/algebra` rewrites the marks.
+    case unicodeToned
+
+    /// The code `entry` is imported under.
+    public func code(for entry: LearnedEntry) -> String {
+        switch self {
+        case .toneless: entry.pinyinNorm
+        case .unicodeToned: TextNormalization.unicodeTonedPinyinKey(pinyinNorm: entry.pinyinNorm, text: entry.text)
+        }
+    }
+}
+
+/// Keeps one schema set's LevelDB userdbs healthy and in step with `learning.sqlite`.
+/// Runs only in a quiescent window (librime initialized, no session), on the one process
+/// that holds the root lock.
+///
+/// - **Health**: `<dict>.userdb` must be a real directory (`lstat`; a symlink is corrupt),
+///   hold no LevelDB `lost/` directory (left by a repair that dropped data), export
+///   (`export_user_dict >= 0`) into a private probe file, and export at least half the
+///   entries the store last projected into it. Every watermark read or written here is the
+///   one of `(schemaSet, dictName)`, never a set-wide one.
+/// - **Snapshots**: `snapshots/<set>/<dict>.snapshot.tsv` plus `<dict>.snapshot.meta.json`
+///   (SHA-256, size, entry count, the `learningRevision` it contains), written only after a
+///   successful export, each through a `0600` temporary file, `fsync`, and `rename(2)`.
+/// - **Recovery ladder**: quarantine the corrupt `.userdb` into `.quarantine/`; import the
+///   latest snapshot whose SHA-256 verifies and replay store entries newer than its
+///   `learningRevision`; or else rebuild from every store entry. Then the export must succeed
+///   again, and the watermark records what the userdb now holds.
+/// - **Code format**: entries are imported spelled `codeFormat` (the schema's dictionary
+///   spelling). The watermark and snapshot metadata record it; a userdb last projected in
+///   another spelling replays every store entry, so a userdb filled with toneless codes a
+///   toned dictionary never finds is repaired on the next maintenance.
+public struct UserDBGuardian {
+    public enum Corruption: String, Sendable, Hashable, Codable {
+        case notADirectory
+        case lostDirectory
+        case exportFailed
+    }
+
+    public enum Health: Sendable, Hashable {
+        case healthy(exported: Int)
+        /// No `<dict>.userdb` yet.
+        case missing
+        case corrupted(Corruption)
+        /// Readable, but holds far fewer entries than were projected into it.
+        case diverged(exported: Int, projected: Int64)
+    }
+
+    public enum RecoveryMethod: String, Sendable, Hashable, Codable {
+        case snapshotAndReplay
+        case fullRebuild
+    }
+
+    public struct RecoveryReport: Sendable, Hashable {
+        public var method: RecoveryMethod
+        public var quarantined: URL?
+        public var imported: Int
+        public var exported: Int
+
+        public init(method: RecoveryMethod, quarantined: URL?, imported: Int, exported: Int) {
+            self.method = method
+            self.quarantined = quarantined
+            self.imported = imported
+            self.exported = exported
+        }
+    }
+
+    public enum MaintenanceOutcome: Sendable, Hashable {
+        case healthy(projected: Int)
+        case recovered(RecoveryReport)
+        case reprojected(imported: Int)
+        case nothingToDo
+    }
+
+    public enum Failure: Error, Sendable, Hashable {
+        case io(String)
+        case exportFailed(String)
+        case importFailed(String)
+        case store(LearningStoreError)
+        case cancelled
+    }
+
+    public struct SnapshotMetadata: Codable, Sendable, Hashable {
+        public static let currentVersion = 1
+        public var version: Int
+        public var schemaSetID: String
+        public var dictName: String
+        public var sha256: String
+        public var size: UInt64
+        public var entryCount: Int
+        /// The store revision the userdb (and so this snapshot) holds every entry up to.
+        public var learningRevision: Int64
+        public var createdAt: Date
+        /// The code spelling of the store entries in the snapshot; nil (older snapshots) is
+        /// `toneless`.
+        public var codeFormat: UserDictCodeFormat?
+    }
+
+    public let schemaSet: SchemaSetID
+    /// The set's librime `user_data_dir` (`sets/<set>/`).
+    public let userDataDir: URL
+    /// `snapshots/<set>/`.
+    public let snapshotsDir: URL
+    public let levers: any UserDictLevers
+    /// How the schema's dictionary spells codes; entries are imported in that spelling.
+    public let codeFormat: UserDictCodeFormat
+
+    public static let quarantineDirectoryName = ".quarantine"
+    /// Entries imported per `levers.importUserDict` call so large projections can stop
+    /// promptly when a boot is cancelled without advancing the watermark halfway.
+    public static let importBatchSize = 2_000
+
+    public init(
+        schemaSet: SchemaSetID, userDataDir: URL, snapshotsDir: URL, levers: any UserDictLevers,
+        codeFormat: UserDictCodeFormat = .toneless
+    ) {
+        self.schemaSet = schemaSet
+        self.userDataDir = userDataDir
+        self.snapshotsDir = snapshotsDir
+        self.levers = levers
+        self.codeFormat = codeFormat
+    }
+
+    public func userDBURL(_ dictName: String) -> URL { userDataDir.appending(path: "\(dictName).userdb") }
+
+    public static func snapshotURL(_ dictName: String, in directory: URL) -> URL {
+        directory.appending(path: "\(dictName).snapshot.tsv")
+    }
+
+    public static func snapshotMetadataURL(_ dictName: String, in directory: URL) -> URL {
+        directory.appending(path: "\(dictName).snapshot.meta.json")
+    }
+
+    // MARK: Health
+
+    public func checkHealth(_ dictName: String, store: LearningStore? = nil) throws(Failure) -> Health {
+        try requirePlainName(dictName)
+        let userdb = userDBURL(dictName)
+        guard let type = FileSafety.fileType(userdb) else { return .missing }
+        guard type == S_IFDIR else { return .corrupted(.notADirectory) }
+        if FileSafety.fileType(userdb.appending(path: "lost")) != nil { return .corrupted(.lostDirectory) }
+        let exported = try withProbe { probe in levers.exportUserDict(dictName, to: probe) }
+        guard exported >= 0 else { return .corrupted(.exportFailed) }
+        if let store, let mark = try storeCall({ () throws(LearningStoreError) in try store.watermark(for: schemaSet, dictName: dictName) }),
+           mark.projectedCount > 0, Int64(exported) * 2 < mark.projectedCount {
+            return .diverged(exported: exported, projected: mark.projectedCount)
+        }
+        return .healthy(exported: exported)
+    }
+
+    // MARK: Projection
+
+    /// Imports the store entries changed after the watermark of `(schemaSet, dictName)` and
+    /// advances it; other userdbs of the set keep their own. A watermark ahead of the store
+    /// (a replaced store) or of another `codeFormat` replays everything. Returns how many
+    /// entries were imported. When `isCancelled()` becomes true mid-projection, throws
+    /// `.cancelled` without advancing the watermark so the next run finishes cleanly.
+    @discardableResult
+    public func project(
+        _ dictName: String, store: LearningStore, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> Int {
+        try requirePlainName(dictName)
+        if isCancelled() { throw .cancelled }
+        let latest = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
+        let mark = try storeCall { () throws(LearningStoreError) in try store.watermark(for: schemaSet, dictName: dictName) }
+        var since = mark?.codeFormat == codeFormat.rawValue ? mark?.lastRevision ?? 0 : 0
+        if since > latest { since = 0 }
+        let entries = try storeCall { () throws(LearningStoreError) in try store.entriesSince(revision: since) }
+        if isCancelled() { throw .cancelled }
+        let imported = entries.isEmpty ? 0 : try importEntries(entries, into: dictName, isCancelled: isCancelled)
+        if isCancelled() { throw .cancelled }
+        try setWatermark(dictName, store: store, lastRevision: latest)
+        return imported
+    }
+
+    // MARK: Recovery
+
+    /// Quarantines `<dict>.userdb` (when present) and rebuilds it: verified snapshot plus
+    /// replay, else every store entry. Throws when the rebuilt userdb still cannot export,
+    /// or `.cancelled` when `isCancelled()` flips true (leaving watermark and snapshot
+    /// untouched so the next run completes the recovery).
+    public func recover(
+        _ dictName: String, store: LearningStore?, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> RecoveryReport {
+        try requirePlainName(dictName)
+        if isCancelled() { throw .cancelled }
+        var quarantined = try quarantine(dictName)
+        // Drop any stale watermark before touching the rebuilt userdb: if recovery is
+        // cancelled or crashes after importing a snapshot or partial batch, the next boot
+        // must replay every store entry instead of trusting the pre-corruption watermark.
+        if let store {
+            try storeCall { () throws(LearningStoreError) in try store.resetWatermark(for: schemaSet, dictName: dictName) }
+        }
+        var method = RecoveryMethod.fullRebuild
+        var imported = 0
+        var revision: Int64 = 0
+        if !isCancelled(), let (snapshot, metadata) = Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir) {
+            let count = levers.importUserDict(dictName, from: snapshot)
+            if count >= 0 {
+                method = .snapshotAndReplay
+                imported = count
+                // A snapshot of another spelling keeps the schema's own learning; every store
+                // entry is replayed in this spelling.
+                revision = (metadata.codeFormat ?? .toneless) == codeFormat ? metadata.learningRevision : 0
+            } else if let again = try quarantine(dictName) {
+                quarantined = quarantined ?? again
+            }
+        }
+        if isCancelled() { throw .cancelled }
+        if let store {
+            let latest = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
+            if revision > latest { revision = 0 }
+            let entries = try storeCall { () throws(LearningStoreError) in
+                method == .snapshotAndReplay ? try store.entriesSince(revision: revision) : try store.allEntries()
+            }
+            if isCancelled() { throw .cancelled }
+            if !entries.isEmpty { imported += try importEntries(entries, into: dictName, isCancelled: isCancelled) }
+            if isCancelled() { throw .cancelled }
+            try setWatermark(dictName, store: store, lastRevision: latest)
+            revision = latest
+        }
+        if isCancelled() { throw .cancelled }
+        let exported = try withProbe { probe in levers.exportUserDict(dictName, to: probe) }
+        guard exported >= 0 else { throw .exportFailed("\(dictName) still fails to export after recovery") }
+        if !isCancelled() { _ = try? writeSnapshot(dictName, learningRevision: revision) }
+        return RecoveryReport(method: method, quarantined: quarantined, imported: imported, exported: exported)
+    }
+
+    /// Health check, then the cheapest fix: incremental projection and a fresh snapshot when
+    /// healthy; a full re-projection when diverged; the recovery ladder when corrupt; a
+    /// rebuild from the store when missing and the store has entries.
+    public func maintain(
+        _ dictName: String, store: LearningStore?, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> MaintenanceOutcome {
+        if isCancelled() { throw .cancelled }
+        switch try checkHealth(dictName, store: store) {
+        case .healthy:
+            guard let store else { return .healthy(projected: 0) }
+            let projected = try project(dictName, store: store, isCancelled: isCancelled)
+            if isCancelled() { throw .cancelled }
+            let revision = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
+            if projected > 0 || Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir)?.1.codeFormat != codeFormat {
+                if !isCancelled() { _ = try? writeSnapshot(dictName, learningRevision: revision) }
+            }
+            return .healthy(projected: projected)
+        case .diverged:
+            guard let store else { return .nothingToDo }
+            if isCancelled() { throw .cancelled }
+            try storeCall { () throws(LearningStoreError) in try store.resetWatermark(for: schemaSet, dictName: dictName) }
+            return .reprojected(imported: try project(dictName, store: store, isCancelled: isCancelled))
+        case .corrupted:
+            return .recovered(try recover(dictName, store: store, isCancelled: isCancelled))
+        case .missing:
+            guard let store, try storeCall({ () throws(LearningStoreError) in try store.stats() }).entryCount > 0 else {
+                return .nothingToDo
+            }
+            return .recovered(try recover(dictName, store: store, isCancelled: isCancelled))
+        }
+    }
+
+    /// Moves `<dict>.userdb` into `.quarantine/<dict>.userdb.<epoch>.<uuid>`; nil when absent.
+    @discardableResult
+    public func quarantine(_ dictName: String) throws(Failure) -> URL? {
+        let userdb = userDBURL(dictName)
+        guard FileSafety.fileType(userdb) != nil else { return nil }
+        let directory = userDataDir.appending(path: Self.quarantineDirectoryName, directoryHint: .isDirectory)
+        try makePrivateDirectory(directory)
+        let target = directory.appending(
+            path: "\(dictName).userdb.\(Int(Date().timeIntervalSince1970)).\(UUID().uuidString.prefix(8))")
+        guard rename(userdb.path, target.path) == 0 else { throw .io("quarantining \(userdb.path): errno \(errno)") }
+        FileSafety.syncDirectory(userDataDir)
+        return target
+    }
+
+    // MARK: Snapshots
+
+    /// Exports `<dict>.userdb` and, only when that succeeds, replaces the snapshot and its
+    /// metadata atomically.
+    @discardableResult
+    public func writeSnapshot(_ dictName: String, learningRevision: Int64) throws(Failure) -> SnapshotMetadata {
+        try requirePlainName(dictName)
+        try makePrivateDirectory(snapshotsDir)
+        let (count, data) = try withProbe { probe throws(Failure) -> (Int, Data?) in
+            let count = levers.exportUserDict(dictName, to: probe)
+            guard count >= 0 else { return (count, nil) }
+            do {
+                return (count, try DeployManifest.readRegularFile(probe, maxSize: 1 << 30))
+            } catch {
+                throw .io("reading the export of \(dictName): \(error)")
+            }
+        }
+        guard count >= 0, let data else { throw .exportFailed(dictName) }
+        let metadata = SnapshotMetadata(
+            version: SnapshotMetadata.currentVersion, schemaSetID: schemaSet.rawValue, dictName: dictName,
+            sha256: DeployManifest.sha256(of: data) ?? "", size: UInt64(data.count), entryCount: count,
+            // Whole seconds: the ISO 8601 sidecar keeps no fraction, so a reread compares equal.
+            learningRevision: learningRevision, createdAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
+            codeFormat: codeFormat)
+        do {
+            try FileSafety.writeAtomically(data, to: Self.snapshotURL(dictName, in: snapshotsDir))
+            try FileSafety.writeAtomically(
+                try JSONEncoder.noema.encode(metadata), to: Self.snapshotMetadataURL(dictName, in: snapshotsDir))
+        } catch {
+            throw .io("writing the snapshot of \(dictName): \(error)")
+        }
+        return metadata
+    }
+
+    /// The snapshot of `dictName` and its metadata when both are regular files, the metadata
+    /// names this set and dictionary, and the snapshot's size and SHA-256 match it.
+    public static func verifiedSnapshot(
+        _ dictName: String, schemaSet: SchemaSetID, in directory: URL
+    ) -> (URL, SnapshotMetadata)? {
+        let snapshot = snapshotURL(dictName, in: directory)
+        guard let data = try? DeployManifest.readRegularFile(snapshotMetadataURL(dictName, in: directory), maxSize: 64 << 10),
+              let metadata = try? JSONDecoder.noema.decode(SnapshotMetadata.self, from: data),
+              metadata.version == SnapshotMetadata.currentVersion,
+              metadata.schemaSetID == schemaSet.rawValue, metadata.dictName == dictName,
+              let (size, digest) = try? DeployManifest.hashFile(snapshot, followSymlink: false),
+              size == metadata.size, digest == metadata.sha256
+        else { return nil }
+        return (snapshot, metadata)
+    }
+
+    /// `<text>\t<code>\t<frequency>` lines, the levers import format, each code
+    /// `pinyin_norm` spelled `codeFormat`. Entries that could inject a line or a comment
+    /// (`LearnedEntry.isSafeForTSV`, and a code with a control character) are skipped.
+    public static func importTSV(_ entries: [LearnedEntry], codeFormat: UserDictCodeFormat = .toneless) -> Data {
+        var text = ""
+        for entry in entries where entry.isSafeForTSV {
+            let code = codeFormat.code(for: entry)
+            guard !code.isEmpty, !code.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { continue }
+            text += "\(entry.text)\t\(code)\t\(max(entry.frequency, 1))\n"
+        }
+        return Data(text.utf8)
+    }
+
+    // MARK: Helpers
+
+    private func importEntries(
+        _ entries: [LearnedEntry], into dictName: String, isCancelled: () -> Bool = { false }
+    ) throws(Failure) -> Int {
+        var total = 0
+        var start = 0
+        while start < entries.count {
+            if isCancelled() { throw .cancelled }
+            let end = min(start + Self.importBatchSize, entries.count)
+            let chunk = Array(entries[start..<end])
+            let count = try withProbe { probe throws(Failure) -> Int in
+                do {
+                    try FileSafety.writeAtomically(Self.importTSV(chunk, codeFormat: codeFormat), to: probe)
+                } catch {
+                    throw .io("writing the import of \(dictName): \(error)")
+                }
+                return levers.importUserDict(dictName, from: probe)
+            }
+            guard count >= 0 else { throw .importFailed(dictName) }
+            total += count
+            start = end
+        }
+        return total
+    }
+
+    /// Runs `body` with a fresh `0600` file in a private temporary directory under
+    /// `snapshotsDir`, removed afterwards.
+    /// Records that the userdb holds every store entry up to `lastRevision`, in `codeFormat`.
+    private func setWatermark(_ dictName: String, store: LearningStore, lastRevision: Int64) throws(Failure) {
+        let count = try storeCall { () throws(LearningStoreError) in try store.stats() }.entryCount
+        try storeCall { () throws(LearningStoreError) in
+            try store.setWatermark(
+                for: schemaSet, dictName: dictName, lastRevision: lastRevision, projectedCount: count,
+                codeFormat: codeFormat.rawValue)
+        }
+    }
+
+    private func withProbe<T>(_ body: (URL) throws(Failure) -> T) throws(Failure) -> T {
+        try makePrivateDirectory(snapshotsDir)
+        let directory = snapshotsDir.appending(path: ".probe.\(getpid()).\(UUID().uuidString)", directoryHint: .isDirectory)
+        guard mkdir(directory.path, 0o700) == 0 else { throw .io("creating \(directory.path): errno \(errno)") }
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let probe = directory.appending(path: "probe.tsv")
+        let descriptor = open(probe.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw .io("creating \(probe.path): errno \(errno)") }
+        close(descriptor)
+        return try body(probe)
+    }
+
+    private func makePrivateDirectory(_ url: URL) throws(Failure) {
+        if FileSafety.isRealDirectory(url) { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        } catch {
+            throw .io("creating \(url.path): \(error)")
+        }
+        guard FileSafety.isRealDirectory(url) else { throw .io("\(url.path) is not a directory") }
+    }
+
+    private func requirePlainName(_ name: String) throws(Failure) {
+        guard FileSafety.isPlainName(name) else { throw .io("not a plain dictionary name: \(name)") }
+    }
+
+    private func storeCall<T>(_ body: () throws(LearningStoreError) -> T) throws(Failure) -> T {
+        do {
+            return try body()
+        } catch {
+            throw .store(error)
+        }
+    }
+}

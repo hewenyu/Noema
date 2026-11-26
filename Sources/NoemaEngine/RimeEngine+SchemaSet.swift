@@ -1,0 +1,427 @@
+import CRime
+import Darwin
+import Dispatch
+import Foundation
+import NoemaCore
+import NoemaLearning
+
+/// What `switchSchemaSet` did.
+public struct SchemaSetSwitchReport: Sendable {
+    public var schemaSetID: SchemaSetID
+    public var schemaID: String
+    /// The userdb the guardian checked (`translator/user_dict`, else `translator/dictionary`),
+    /// nil when the schema has none or disables it.
+    public var userDictName: String?
+    /// Whether the target schema spells Mandarin pinyin. When false the guardian still checks
+    /// the userdb but never projects `learning.sqlite` (full-pinyin keys) into it.
+    public var isMandarinPinyinSchema: Bool
+    /// How the target schema's dictionary spells codes, the spelling the guardian projects
+    /// `learning.sqlite` in (`userDictCodeFormat(schemaID:)`).
+    public var userDictCodeFormat: UserDictCodeFormat
+    /// The guardian's outcome; nil when it did not run (no levers API, no user dict).
+    public var userDBOutcome: UserDBGuardian.MaintenanceOutcome?
+    /// Why the guardian failed, if it did; the switch still completes.
+    public var userDBFailure: UserDBGuardian.Failure?
+    /// Lines written to `<set>/noema_learned.tsv`; nil without a learning store.
+    public var learnedLines: Int?
+    /// The `.gram` linked into the set, if any.
+    public var linkedGram: URL?
+    public var savedActiveRecord: Bool
+}
+
+/// Hot switch between isolated schema sets under one root lock.
+///
+/// Every set has its own librime `user_data_dir` at `<root>/sets/<set>/` (`build/`,
+/// userdbs, `lua/`, `noema_learned.tsv`, `*.custom.yaml`), so their LevelDB userdbs never
+/// mix; the boot guard, its lock, `learning.sqlite`, and `active-schema-set.json` stay in
+/// `<root>`. The switch keeps serving keys on the current set while the target is prepared
+/// and deployed off the main actor. The final quiescent step (destroy the session, finalize,
+/// initialize the target, check its userdb, open a session) also runs off the main actor,
+/// holding librime exclusively: meanwhile every key passes through (`.engineUnavailable`).
+extension RimeEngine {
+    /// Switches to `set`, whose schema sources are in `sharedDataDir`, opening `schemaID`
+    /// (default: the set's `defaultSchemaID`).
+    ///
+    /// 1. Off the main actor: create `sets/<set>/`, copy `luaFile` to its `lua/`, hard-link
+    ///    `gramPath` (`link(2)`, same volume) as `sets/<set>/<name>.gram`, and make its
+    ///    `build/` loadable (`prepareBuild`, the isolated deployer). Failure throws and leaves
+    ///    the current set running untouched.
+    ///    With `waitUntilIdle`, the switch then waits (awaiting it again after every wake)
+    ///    until no composition is open, so the user's preedit is never destroyed.
+    /// 2. `learningWriter.flushAsync()` (on the writer's queue), arm the boot sentinel, and
+    ///    set `isInExclusiveMaintenance`: from here until step 4 returns, every key passes
+    ///    through and the main actor makes no librime call.
+    /// 3. Off the main actor (`switchQuiescently`): destroy the session, finalize, and
+    ///    `RimeLibrary.initializeAndMaintain` the target: with no session open,
+    ///    `UserDBGuardian` checks the userdb and projects `learningStore` into it, spelled as
+    ///    the schema's dictionary spells codes (`userDictCodeFormat`); export
+    ///    `noema_learned.tsv`. Open a session on `schemaID` and save `active-schema-set.json`.
+    /// 4. Back on the main actor: disarm and adopt the target. If the target would not open,
+    ///    the previous set was restored (or, failing that, Safe Mode) and this throws.
+    @discardableResult
+    public func switchSchemaSet(
+        to set: SchemaSetID,
+        sharedDataDir: URL,
+        schemaID: String? = nil,
+        learningStore: LearningStore? = nil,
+        learningWriter: LearningStoreWriter? = nil,
+        luaFile: URL? = nil,
+        gramPath: URL? = nil,
+        cancellation: DeployCancellation = DeployCancellation(),
+        waitUntilIdle: (@MainActor () async -> Void)? = nil
+    ) async throws(NoemaError) -> SchemaSetSwitchReport {
+        guard isOperational else { throw .engineUnavailable(reason: "engine is in Safe Mode or shut down") }
+        guard !isSwitchingSchemaSet else { throw .engineUnavailable(reason: "a schema-set switch is already running") }
+        let targetSchema = schemaID ?? set.defaultSchemaID
+        guard FileSafety.isPlainName(targetSchema) else { throw .invalidArgument("schema ID is not a plain name: \(targetSchema)") }
+        isSwitchingSchemaSet = true
+        defer { isSwitchingSchemaSet = false }
+
+        var target = configuration
+        target.schemaSetID = set
+        target.sharedDataDir = sharedDataDir
+        target.schemaID = targetSchema
+        target.luaFile = luaFile
+        let prepared = await withCheckedContinuation { (continuation: CheckedContinuation<URL??, Never>) in
+            // Entered so `cancellation.cancelAndFinishCleanup` waits for the staging cleanup.
+            guard let group = cancellation.enterPrepare() else {
+                continuation.resume(returning: nil)
+                return
+            }
+            let configuration = target
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { cancellation.leavePrepare(group) }
+                guard let gram = Self.prepareSchemaSetWorkspace(configuration, gramPath: gramPath),
+                      Self.prepareBuild(configuration: configuration, cancellation: cancellation)
+                else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: .some(gram))
+            }
+        }
+        guard isOperational, !cancellation.isCancelled else { throw .engineUnavailable(reason: "switch cancelled") }
+        guard let linkedGram = prepared else {
+            throw .engineCallFailed(function: "prepare schema set \(set.rawValue)")
+        }
+        // Never destroy a composition: wait for the next idle boundary, then drain the
+        // learning queue off the main actor. Re-checked after every wake and every drain,
+        // because a key may start a new composition before this task resumes.
+        while true {
+            if let waitUntilIdle {
+                while currentState.isComposing, isOperational, !cancellation.isCancelled {
+                    await waitUntilIdle()
+                    // A hook that returned while still composing never spins the main actor.
+                    if currentState.isComposing { try? await Task.sleep(for: .milliseconds(20)) }
+                }
+            }
+            await learningWriter?.flushAsync()
+            guard isOperational, !cancellation.isCancelled else { throw .engineUnavailable(reason: "switch cancelled") }
+            if waitUntilIdle == nil || !currentState.isComposing { break }
+        }
+
+        guard case .proceed = resources.bootGuard.arm() else {
+            throw .engineUnavailable(reason: "boot guard refused the switch")
+        }
+        // librime is this switch's alone from here: keys pass through and nothing else on the
+        // main actor calls librime until the quiescent step returns.
+        let previous = configuration
+        isInExclusiveMaintenance = true
+        currentState = .empty(generationID: nextGeneration(), schemaID: currentState.schemaID)
+        let next = target
+        let outcome = await runExclusively { library in
+            Self.switchQuiescently(library, from: previous, to: next, store: learningStore, linkedGram: linkedGram)
+        }
+        isInExclusiveMaintenance = false
+        // `shutdown()` waited for the quiescent step, disarmed, and released librime.
+        guard !isShutDown else { throw .engineUnavailable(reason: "engine shut down during the switch") }
+        switch outcome {
+        case .switched(let opening, let report):
+            configuration = target
+            noteOpenedSession(opening)
+            resources.bootGuard.disarm()
+            refreshState()
+            return report
+        case .restored(let opening):
+            noteOpenedSession(opening)
+            resources.bootGuard.disarm()
+            refreshState()
+            throw .engineCallFailed(function: "select_schema \(targetSchema)")
+        case .failed:
+            enterSafeMode(.engineInitFailed)
+            throw .engineCallFailed(function: "select_schema \(targetSchema)")
+        }
+    }
+
+    /// What the quiescent step of a switch ended with.
+    enum QuiescentSwitch: Sendable {
+        case switched(RimeLibrary.SessionOpening, SchemaSetSwitchReport)
+        /// The target would not open; the previous set runs again.
+        case restored(RimeLibrary.SessionOpening)
+        /// Neither opened.
+        case failed
+    }
+
+    /// Steps 2–4 of `switchSchemaSet`, off the main actor while the switch holds librime
+    /// exclusively: finalize, `initializeAndMaintain` the target (all `learning.sqlite`
+    /// reads, toned spelling, userdb import/export, snapshots, the TSV), open its session and
+    /// save `active-schema-set.json`; if it will not open, initialize and open `previous`.
+    nonisolated static func switchQuiescently(
+        _ library: RimeLibrary, from previous: RimeEngineConfiguration, to target: RimeEngineConfiguration,
+        store: LearningStore?, linkedGram: URL?
+    ) -> QuiescentSwitch {
+        library.resources.finalizeRime()
+        let maintenance = library.initializeAndMaintain(target, migration: nil, store: .given(store))
+        var report = SchemaSetSwitchReport(
+            schemaSetID: target.schemaSetID ?? .builtin, schemaID: target.schemaID, userDictName: maintenance.userDictName,
+            isMandarinPinyinSchema: maintenance.isMandarinPinyin, userDictCodeFormat: maintenance.codeFormat,
+            userDBOutcome: maintenance.outcome, userDBFailure: maintenance.failure, learnedLines: maintenance.learnedLines,
+            linkedGram: linkedGram, savedActiveRecord: false)
+        let opening = library.openSession(target.schemaID)
+        if opening.opened {
+            let record = ActiveSchemaSetRecord(schemaSetID: report.schemaSetID, schemaID: target.schemaID)
+            report.savedActiveRecord = (try? record.save(to: NoemaPaths.activeSchemaSetURL(root: target.userDataDir))) != nil
+            return .switched(opening, report)
+        }
+        library.resources.finalizeRime()
+        library.initialize(previous)
+        let restored = library.openSession(previous.schemaID)
+        return restored.opened ? .restored(restored) : .failed
+    }
+
+    /// Re-exports `noema_learned.tsv` for the running set; the translator picks it up on
+    /// its next size check or session. Returns the number of lines, or nil without a set.
+    @discardableResult
+    public func refreshLearnedPhrases(from store: LearningStore) -> Int? {
+        guard configuration.schemaSetID != nil else { return nil }
+        return try? LearnedSnapshotExporter.export(
+            from: store, to: configuration.rimeUserDataDir.appending(path: NoemaPaths.learnedTSVFileName))
+    }
+}
+
+extension RimeLibrary {
+    /// The userdb librime opens for the compiled schema (`UserDictionaryComponent::Create`):
+    /// `translator/user_dict` verbatim, else the language component of
+    /// `translator/dictionary` (`defaultUserDictName(fromDictionary:)`); nil when neither is
+    /// set, `translator/enable_user_dict` is false, or the name is not plain.
+    func userDictName(schemaID: String) -> String? {
+        guard let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring
+        else { return nil }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return nil }
+        defer { _ = configClose(&config) }
+        if let getBool = api.pointee.config_get_bool {
+            var enabled: Int32 = 1
+            if getBool(&config, "translator/enable_user_dict", &enabled) != 0, enabled == 0 { return nil }
+        }
+        if let value = getCString(&config, "translator/user_dict").map({ String(cString: $0) }), !value.isEmpty {
+            return FileSafety.isPlainName(value) ? value : nil
+        }
+        if let value = getCString(&config, "translator/dictionary").map({ String(cString: $0) }), !value.isEmpty {
+            guard FileSafety.isPlainName(value) else { return nil }
+            return RimeEngine.defaultUserDictName(fromDictionary: value)
+        }
+        return nil
+    }
+
+    /// How the compiled schema `schemaID`'s dictionary spells codes: `.unicodeToned` when a
+    /// `speller/algebra` rule names a Mandarin tone-marked vowel (万象's `xform/(ā|ē|…)…①/`,
+    /// 薄荷's `xlit/āáǎà…/aaaa…/`, both over 万象's `ní hào` dictionaries), else `.toneless`
+    /// (雾凇, `noema_pinyin`, `double_pinyin_flypy`, and a schema that will not open).
+    func userDictCodeFormat(schemaID: String) -> UserDictCodeFormat {
+        guard !schemaID.isEmpty, let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring, let listSize = api.pointee.config_list_size
+        else { return .toneless }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return .toneless }
+        defer { _ = configClose(&config) }
+        for index in 0..<listSize(&config, "speller/algebra") {
+            guard let rule = getCString(&config, "speller/algebra/@\(index)") else { continue }
+            if String(cString: rule).precomposedStringWithCanonicalMapping.unicodeScalars
+                .contains(where: RimeEngine.mandarinToneMarkedVowels.contains) {
+                return .unicodeToned
+            }
+        }
+        return .toneless
+    }
+
+    /// Whether the compiled schema `schemaID` spells Mandarin pinyin (full, double, or
+    /// jianpin): `engine/translators` lists an untagged `script_translator` and no untagged
+    /// `table_translator` (the primary translator of Wubi, Cangjie, Stroke, Zhengma; full
+    /// pinyin uses only tagged ones such as `table_translator@custom_phrase`), and neither
+    /// the schema ID, `translator/dictionary`, nor `translator/prism` names a
+    /// `nonMandarinPinyinMarkers` entry. Fail-closed: false for an empty ID, a schema that
+    /// will not open, or a librime without the config API.
+    func isMandarinPinyinSchema(schemaID: String) -> Bool {
+        guard !schemaID.isEmpty, let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring, let listSize = api.pointee.config_list_size
+        else { return false }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return false }
+        defer { _ = configClose(&config) }
+        let translators = (0..<listSize(&config, "engine/translators")).compactMap { index in
+            getCString(&config, "engine/translators/@\(index)").map { String(cString: $0) }
+        }
+        guard translators.contains("script_translator"), !translators.contains("table_translator") else { return false }
+        var names = [schemaID]
+        for key in ["translator/dictionary", "translator/prism"] {
+            if let value = getCString(&config, key) { names.append(String(cString: value)) }
+        }
+        return !names.contains { name in
+            let lowered = name.lowercased()
+            return RimeEngine.nonMandarinPinyinMarkers.contains { lowered.contains($0) }
+        }
+    }
+
+    /// The compiled schema `schemaID`'s secondary-input rules: the non-empty `<ns>/prefix` of
+    /// `reverse_lookup` and of every tagged `engine/translators` or `engine/segmentors` entry
+    /// (`table_translator@wubi98_mint` reads `wubi98_mint/prefix`), and every
+    /// `recognizer/patterns` entry with a non-empty key that compiles as an
+    /// `NSRegularExpression` (one that does not is skipped, as librime skips a bad pattern).
+    /// Empty for a schema that will not open or a librime without the config API.
+    func secondaryInputRules(schemaID: String) -> SecondaryInputRules {
+        guard !schemaID.isEmpty, let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring, let listSize = api.pointee.config_list_size
+        else { return SecondaryInputRules() }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return SecondaryInputRules() }
+        defer { _ = configClose(&config) }
+        var namespaces = ["reverse_lookup"]
+        for list in ["engine/translators", "engine/segmentors"] {
+            for index in 0..<listSize(&config, list) {
+                guard let entry = getCString(&config, "\(list)/@\(index)").map({ String(cString: $0) }),
+                      let at = entry.firstIndex(of: "@") else { continue }
+                let tag = String(entry[entry.index(after: at)...])
+                if !tag.isEmpty, !namespaces.contains(tag) { namespaces.append(tag) }
+            }
+        }
+        var rules = SecondaryInputRules()
+        for namespace in namespaces {
+            if let prefix = getCString(&config, "\(namespace)/prefix").map({ String(cString: $0) }), !prefix.isEmpty,
+               !rules.prefixes.contains(prefix) {
+                rules.prefixes.append(prefix)
+            }
+        }
+        if let beginMap = api.pointee.config_begin_map, let next = api.pointee.config_next, let end = api.pointee.config_end {
+            var iterator = RimeConfigIterator()
+            if beginMap(&iterator, &config, "recognizer/patterns") != 0 {
+                defer { end(&iterator) }
+                while next(&iterator) != 0 {
+                    guard let key = iterator.key.map({ String(cString: $0) }), !key.isEmpty,
+                          let path = iterator.path, let value = getCString(&config, path).map({ String(cString: $0) }),
+                          !value.isEmpty, let pattern = try? NSRegularExpression(pattern: value)
+                    else { continue }
+                    rules.patterns.append(pattern)
+                }
+            }
+        }
+        return rules
+    }
+
+}
+
+extension RimeEngine {
+    /// The userdb name librime derives from a `translator/dictionary` when no
+    /// `translator/user_dict` is set: `Language::get_language_component`, the name up to its
+    /// first `.` past index 0 (`noema_pinyin.extra` → `noema_pinyin`, `a.b.c` → `a`), else
+    /// the whole name.
+    nonisolated static func defaultUserDictName(fromDictionary dictionary: String) -> String {
+        guard let dot = dictionary.firstIndex(of: "."), dot != dictionary.startIndex else { return dictionary }
+        return String(dictionary[..<dot])
+    }
+
+    /// The NFC precomposed Mandarin tone-marked vowels (tones 1–4) a toned dictionary's
+    /// `speller/algebra` rewrites; a plain `ü` is not one.
+    nonisolated static let mandarinToneMarkedVowels: Set<Unicode.Scalar> = Set("āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜ".unicodeScalars)
+
+    /// Lowercase substrings of a schema ID, `translator/dictionary`, or `translator/prism`
+    /// that mark a schema whose codes are not Mandarin pinyin (shape codes, Zhuyin,
+    /// Cantonese and other languages), even one whose primary translator is
+    /// `script_translator` (Jyutping, Zhuyin). Double pinyin (`double_pinyin_flypy`,
+    /// `xiaohe`) is Mandarin pinyin: its preedit spells full pinyin and its userdb is keyed
+    /// by it, so it is not listed.
+    nonisolated static let nonMandarinPinyinMarkers = [
+        "wubi", "cangjie", "stroke", "erbi", "zhengma", "bopomofo", "zhuyin", "jyutping", "jyut6ping3",
+        "cantonese", "hakka", "array", "quick", "dayi", "kana", "hangul", "easy_en", "melt_eng", "english",
+        "tiger", "wugniu", "soutzoe", "xingma",
+    ]
+
+    /// Creates `sets/<set>/` (and its `lua/`), installs `luaFile` there as
+    /// `noema_learned.lua`, and hard-links `gramPath` into it. Returns the linked gram (or
+    /// `.some(nil)` with none), nil on failure. Makes no librime call.
+    nonisolated static func prepareSchemaSetWorkspace(_ configuration: RimeEngineConfiguration, gramPath: URL?) -> URL?? {
+        let directory = configuration.rimeUserDataDir
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        guard FileSafety.isRealDirectory(directory) else { return nil }
+        if let luaFile = configuration.luaFile {
+            let luaDirectory = directory.appending(path: "lua", directoryHint: .isDirectory)
+            guard (try? fileManager.createDirectory(at: luaDirectory, withIntermediateDirectories: true)) != nil,
+                  FileSafety.isRealDirectory(luaDirectory),
+                  let data = try? DeployManifest.readRegularFile(luaFile),
+                  (try? FileSafety.writeAtomically(
+                      data, to: luaDirectory.appending(path: NoemaPaths.learnedLuaFileName), mode: 0o644)) != nil
+            else { return nil }
+        }
+        guard let gramPath else { return .some(nil) }
+        guard let linked = linkGram(gramPath, into: directory) else { return nil }
+        return .some(linked)
+    }
+
+    /// Hard-links the regular file `gram` as `<directory>/<name>.gram`, atomically replacing
+    /// a different file of that name (`link(2)` to a temporary name, then `rename(2)`).
+    nonisolated static func linkGram(_ gram: URL, into directory: URL) -> URL? {
+        guard gram.pathExtension == "gram", FileSafety.isPlainName(gram.lastPathComponent) else { return nil }
+        var source = stat()
+        guard lstat(gram.path, &source) == 0, source.st_mode & S_IFMT == S_IFREG else { return nil }
+        let target = directory.appending(path: gram.lastPathComponent)
+        var existing = stat()
+        if lstat(target.path, &existing) == 0, existing.st_mode & S_IFMT == S_IFREG,
+           existing.st_dev == source.st_dev, existing.st_ino == source.st_ino {
+            return target
+        }
+        let temporary = directory.appending(path: ".\(gram.lastPathComponent).link.\(getpid()).\(UUID().uuidString)")
+        guard link(gram.path, temporary.path) == 0 else { return nil }
+        guard rename(temporary.path, target.path) == 0 else {
+            unlink(temporary.path)
+            return nil
+        }
+        FileSafety.syncDirectory(directory)
+        return target
+    }
+}
+
+/// Input a pinyin schema hands to a translator other than its primary pinyin one, whose
+/// commits are therefore never pinyin readings (`RimeEngine.secondaryInputRules(schemaID:)`).
+struct SecondaryInputRules {
+    /// Reverse-lookup and tagged-translator prefixes (`Uw`, `` ` ``). Prefixes containing any
+    /// character outside lowercase `[a-z']` match anywhere in the raw input (catching a
+    /// reverse-lookup segment appended after a pinyin prefix, like ``nihao`wo``); pure
+    /// lowercase prefixes match only at the start so normal pinyin is never claimed mid-word.
+    var prefixes: [String] = []
+    /// `recognizer/patterns`; one claims the input when a non-empty match ends at the input's
+    /// end, as librime's `RecognizerPatterns::GetMatch` requires.
+    var patterns: [NSRegularExpression] = []
+
+    func claims(_ rawInput: String) -> Bool {
+        for prefix in prefixes {
+            let hasNonLowerPinyinScalar = prefix.unicodeScalars.contains { scalar in
+                !(scalar >= "a" && scalar <= "z") && scalar != "'"
+            }
+            if hasNonLowerPinyinScalar ? rawInput.contains(prefix) : rawInput.hasPrefix(prefix) {
+                return true
+            }
+        }
+        let whole = NSRange(rawInput.startIndex..., in: rawInput)
+        return patterns.contains { pattern in
+            pattern.matches(in: rawInput, range: whole).contains {
+                $0.range.length > 0 && $0.range.upperBound == whole.upperBound
+            }
+        }
+    }
+}

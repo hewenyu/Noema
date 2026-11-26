@@ -125,7 +125,8 @@ final class ReplSession {
         }
         engineConfiguration = RimeEngineConfiguration(
             sharedDataDir: shared, userDataDir: user, logDir: logs,
-            schemaID: configuration.schemaID, deployerURL: deployer)
+            schemaID: configuration.schemaID, deployerURL: deployer,
+            openccDataDir: NoemaPaths.resolveOpenCCDataDir(bundle: .main))
         fputs("noema repl: schema \(configuration.schemaID), user dir \(user.path)\(ephemeralRoot == nil ? "" : " (ephemeral)"); :help for help\n", stderr)
         fflush(stderr)
     }

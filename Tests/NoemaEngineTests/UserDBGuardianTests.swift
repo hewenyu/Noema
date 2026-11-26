@@ -1,0 +1,406 @@
+import Darwin
+import Foundation
+import NoemaCore
+import NoemaEngine
+import NoemaLearning
+import Testing
+
+/// Stands in for librime's levers API (the external boundary): each `<dict>.userdb/` holds a
+/// `rows.tsv` of `<text>\t<code>\t<weight>`; import merges by keeping the larger weight, as
+/// librime's `UserDbImporter` does. Real-librime coverage lives in CRimeTests.
+final class FakeLevers: UserDictLevers {
+    let userDataDir: URL
+    var failingExports: Set<String> = []
+    var failingImports: Set<String> = []
+    var onImport: ((String, Int) -> Void)?
+    private(set) var imports: [(String, String)] = []
+
+    init(userDataDir: URL) { self.userDataDir = userDataDir }
+
+    func rowsURL(_ name: String) -> URL { userDataDir.appending(path: "\(name).userdb/rows.tsv") }
+
+    func rows(_ name: String) -> [String: Int] {
+        guard let text = try? String(contentsOf: rowsURL(name), encoding: .utf8) else { return [:] }
+        var rows: [String: Int] = [:]
+        for line in text.split(separator: "\n") where !line.hasPrefix("#") {
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 3, let weight = Int(fields[2]) else { continue }
+            rows["\(fields[0])\t\(fields[1])"] = weight
+        }
+        return rows
+    }
+
+    func userDictNames() -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: userDataDir.path)) ?? [])
+            .filter { $0.hasSuffix(".userdb") }.map { String($0.dropLast(".userdb".count)) }
+    }
+
+    func exportUserDict(_ name: String, to file: URL) -> Int {
+        guard !failingExports.contains(name), FileSafety.isRealDirectory(userDataDir.appending(path: "\(name).userdb")) else {
+            return -1
+        }
+        let rows = rows(name)
+        let text = "# Rime user dictionary\n" + rows.keys.sorted().map { "\($0)\t\(rows[$0]!)\n" }.joined()
+        guard (try? Data(text.utf8).write(to: file)) != nil else { return -1 }
+        return rows.count
+    }
+
+    func importUserDict(_ name: String, from file: URL) -> Int {
+        guard !failingImports.contains(name), let text = try? String(contentsOf: file, encoding: .utf8) else { return -1 }
+        imports.append((name, text))
+        try? FileManager.default.createDirectory(
+            at: userDataDir.appending(path: "\(name).userdb"), withIntermediateDirectories: true)
+        var rows = rows(name)
+        var count = 0
+        for line in text.split(separator: "\n") where !line.hasPrefix("#") {
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 3, let weight = Int(fields[2]) else { continue }
+            let key = "\(fields[0])\t\(fields[1])"
+            rows[key] = max(rows[key] ?? 0, weight)
+            count += 1
+        }
+        let output = rows.keys.sorted().map { "\($0)\t\(rows[$0]!)\n" }.joined()
+        guard (try? Data(output.utf8).write(to: rowsURL(name))) != nil else { return -1 }
+        onImport?(name, count)
+        return count
+    }
+}
+
+@Suite struct UserDBGuardianTests {
+    let root: URL
+    let levers: FakeLevers
+    let store: LearningStore
+    var setDir: URL { NoemaPaths.schemaSetUserDataDir(.rimeIce, root: root) }
+    var snapshots: URL { NoemaPaths.userDBSnapshotsDir(.rimeIce, root: root) }
+    var guardian: UserDBGuardian {
+        UserDBGuardian(schemaSet: .rimeIce, userDataDir: setDir, snapshotsDir: snapshots, levers: levers)
+    }
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory.appending(path: "noema-guardian-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: NoemaPaths.schemaSetUserDataDir(.rimeIce, root: root), withIntermediateDirectories: true)
+        levers = FakeLevers(userDataDir: NoemaPaths.schemaSetUserDataDir(.rimeIce, root: root))
+        store = try LearningStore(url: NoemaPaths.learningStoreURL(root: root))
+    }
+
+    private func cleanUp() {
+        store.close()
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func learn(_ pairs: [(String, String)]) throws {
+        try store.recordBatch(pairs.map { LearningCommitEvent(rawInput: $0.0.replacingOccurrences(of: " ", with: ""), preedit: $0.0, text: $0.1) })
+    }
+
+    /// The levers import file never carries a control character or a `#` comment from an
+    /// entry: such entries are skipped, so none can add rows of its own.
+    @Test func importTSVSkipsEntriesThatWouldInjectRows() {
+        defer { cleanUp() }
+        func entry(_ norm: String, _ text: String) -> LearnedEntry {
+            LearnedEntry(id: 1, pinyinNorm: norm, pinyinCompact: norm.replacingOccurrences(of: " ", with: ""), text: text,
+                         frequency: 2, isUserPhrase: false, updatedAt: Date(), revision: 1)
+        }
+        let hostile = [
+            entry("ni hao", "你好\t坏 huai\t999\n坏"), entry("ni hao", "你好\n坏\tni hao\t999"), entry("ni hao", "你好\r"),
+            entry("ni hao", "你\u{0}好"), entry("ni hao", "#你好"), entry("ni hao", ""),
+            entry("ni\thao", "你好"), entry("ni\nhao", "你好"), entry("", "你好"),
+        ]
+        let data = UserDBGuardian.importTSV(hostile + [entry("shi jie", "世界")])
+        #expect(String(decoding: data, as: UTF8.self) == "世界\tshi jie\t2\n")
+    }
+
+    /// `.unicodeToned` spells each code as a toned dictionary does; `.toneless` keeps
+    /// `pinyin_norm`; a hostile entry is still skipped.
+    @Test func importTSVSpellsCodesInTheDictionaryFormat() {
+        defer { cleanUp() }
+        func entry(_ norm: String, _ text: String) -> LearnedEntry {
+            LearnedEntry(id: 1, pinyinNorm: norm, pinyinCompact: norm.replacingOccurrences(of: " ", with: ""), text: text,
+                         frequency: 3, isUserPhrase: false, updatedAt: Date(), revision: 1)
+        }
+        let entries = [entry("ni hao", "霓昊"), entry("nv hai", "女孩"), entry("yin hang", "银行"), entry("ni hao", "你好\n坏")]
+        #expect(String(decoding: UserDBGuardian.importTSV(entries, codeFormat: .unicodeToned), as: UTF8.self)
+                == "霓昊\tní hào\t3\n女孩\tnǚ hái\t3\n银行\tyín hāng\t3\n")
+        #expect(String(decoding: UserDBGuardian.importTSV(entries), as: UTF8.self)
+                == "霓昊\tni hao\t3\n女孩\tnv hai\t3\n银行\tyin hang\t3\n")
+    }
+
+    /// A userdb last projected in another spelling (a toneless watermark at the latest
+    /// revision, a toneless snapshot) replays every store entry in the guardian's spelling,
+    /// both on the healthy path and from the snapshot, which keeps the native rows.
+    @Test func anotherCodeFormatReplaysEveryEntry() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "霓昊"), ("nv hai", "女孩")])
+        #expect(try guardian.maintain("wanxiang", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        #expect(try store.watermark(for: .rimeIce, dictName: "wanxiang")?.codeFormat == "toneless")
+        _ = levers.importUserDict("wanxiang", from: try tsv("原生\tyuán shēng\t5\n"))
+        try guardian.writeSnapshot("wanxiang", learningRevision: 2)
+        let toned = UserDBGuardian(schemaSet: .rimeIce, userDataDir: setDir, snapshotsDir: snapshots, levers: levers, codeFormat: .unicodeToned)
+
+        #expect(try toned.maintain("wanxiang", store: store) == .healthy(projected: 2))
+        #expect(levers.imports.last?.1 == "霓昊\tní hào\t1\n女孩\tnǚ hái\t1\n")
+        #expect(try store.watermark(for: .rimeIce, dictName: "wanxiang")?.codeFormat == "unicodeToned")
+        #expect(UserDBGuardian.verifiedSnapshot("wanxiang", schemaSet: .rimeIce, in: snapshots)?.1.codeFormat == .unicodeToned)
+        #expect(try toned.maintain("wanxiang", store: store) == .healthy(projected: 0), "replayed only once")
+
+        // A toneless snapshot restored by a toned guardian: its rows come back, every entry is replayed toned.
+        try guardian.writeSnapshot("wanxiang", learningRevision: 2)
+        try FileManager.default.createDirectory(at: setDir.appending(path: "wanxiang.userdb/lost"), withIntermediateDirectories: true)
+        guard case .recovered(let report) = try toned.maintain("wanxiang", store: store) else {
+            Issue.record("expected recovery")
+            return
+        }
+        #expect(report.method == .snapshotAndReplay)
+        #expect(levers.imports.last?.1 == "霓昊\tní hào\t1\n女孩\tnǚ hái\t1\n")
+        #expect(levers.rows("wanxiang")["原生\tyuán shēng"] == 5)
+    }
+
+    // MARK: Snapshots
+
+    @Test func snapshotIsWrittenOnlyFromASuccessfulExportAndVerifiedBySHA256() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        _ = try guardian.project("rime_ice", store: store)
+        let metadata = try guardian.writeSnapshot("rime_ice", learningRevision: 2)
+        #expect(metadata.entryCount == 2 && metadata.learningRevision == 2 && metadata.schemaSetID == "rime-ice")
+        let (url, verified) = try #require(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots))
+        #expect(verified == metadata)
+        #expect(try String(contentsOf: url, encoding: .utf8).contains("你好\tni hao\t1"))
+        for file in [url, UserDBGuardian.snapshotMetadataURL("rime_ice", in: snapshots)] {
+            var info = stat()
+            #expect(lstat(file.path, &info) == 0 && info.st_mode & 0o777 == 0o600)
+        }
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .mint, in: snapshots) == nil, "another set's snapshot")
+
+        // A failing export never replaces the good snapshot.
+        levers.failingExports = ["rime_ice"]
+        #expect(throws: UserDBGuardian.Failure.exportFailed("rime_ice")) { try guardian.writeSnapshot("rime_ice", learningRevision: 9) }
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots)?.1 == metadata)
+        let probes = try FileManager.default.contentsOfDirectory(atPath: snapshots.path).filter { $0.hasPrefix(".probe.") }
+        #expect(probes.isEmpty)
+    }
+
+    @Test func tamperedOrSymlinkedSnapshotsFailVerification() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好")])
+        _ = try guardian.project("rime_ice", store: store)
+        try guardian.writeSnapshot("rime_ice", learningRevision: 1)
+        let tsv = UserDBGuardian.snapshotURL("rime_ice", in: snapshots)
+        let meta = UserDBGuardian.snapshotMetadataURL("rime_ice", in: snapshots)
+        let original = try Data(contentsOf: tsv)
+
+        var flipped = original
+        flipped[flipped.count - 2] ^= 0x01
+        try flipped.write(to: tsv)
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots) == nil, "same size, other bytes")
+        try original.write(to: tsv)
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots) != nil, "negative control")
+
+        let metaData = try Data(contentsOf: meta)
+        var object = try #require(try JSONSerialization.jsonObject(with: metaData) as? [String: Any])
+        object["sha256"] = String(repeating: "0", count: 64)
+        try JSONSerialization.data(withJSONObject: object).write(to: meta)
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots) == nil, "sidecar digest")
+        try metaData.write(to: meta)
+
+        let elsewhere = root.appending(path: "elsewhere.tsv")
+        try FileManager.default.moveItem(at: tsv, to: elsewhere)
+        try FileManager.default.createSymbolicLink(at: tsv, withDestinationURL: elsewhere)
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots) == nil, "symlinked snapshot")
+    }
+
+    // MARK: Health
+
+    @Test func healthCheckDetectsMissingSymlinkedLostAndUnexportableUserDBs() throws {
+        defer { cleanUp() }
+        #expect(try guardian.checkHealth("rime_ice") == .missing)
+        let userdb = setDir.appending(path: "rime_ice.userdb")
+        let decoy = root.appending(path: "decoy.userdb")
+        try FileManager.default.createDirectory(at: decoy, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: userdb, withDestinationURL: decoy)
+        #expect(try guardian.checkHealth("rime_ice") == .corrupted(.notADirectory))
+        try FileManager.default.removeItem(at: userdb)
+
+        try FileManager.default.createDirectory(at: userdb, withIntermediateDirectories: true)
+        #expect(try guardian.checkHealth("rime_ice") == .healthy(exported: 0))
+        try FileManager.default.createDirectory(at: userdb.appending(path: "lost"), withIntermediateDirectories: true)
+        #expect(try guardian.checkHealth("rime_ice") == .corrupted(.lostDirectory))
+        try FileManager.default.removeItem(at: userdb.appending(path: "lost"))
+        levers.failingExports = ["rime_ice"]
+        #expect(try guardian.checkHealth("rime_ice") == .corrupted(.exportFailed))
+        #expect(throws: UserDBGuardian.Failure.self) { try guardian.checkHealth("../x") }
+    }
+
+    @Test func healthCheckFlagsAUserDBThatLostMostProjectedEntries() throws {
+        defer { cleanUp() }
+        try learn([("a", "啊"), ("ba", "吧"), ("ma", "吗"), ("ni", "你")])
+        _ = try guardian.project("rime_ice", store: store)
+        #expect(try guardian.checkHealth("rime_ice", store: store) == .healthy(exported: 4))
+        try Data("啊\ta\t1\n".utf8).write(to: levers.rowsURL("rime_ice"))
+        #expect(try guardian.checkHealth("rime_ice", store: store) == .diverged(exported: 1, projected: 4))
+        #expect(try guardian.maintain("rime_ice", store: store) == .reprojected(imported: 4))
+        #expect(levers.rows("rime_ice").count == 4)
+    }
+
+    // MARK: Projection and recovery
+
+    @Test func projectionIsIncrementalAndAdvancesTheWatermark() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        #expect(try guardian.project("rime_ice", store: store) == 2)
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice")?.lastRevision == 2)
+        #expect(try guardian.project("rime_ice", store: store) == 0, "nothing new")
+        try learn([("ni hao", "你好"), ("zai jian", "再见")])
+        #expect(try guardian.project("rime_ice", store: store) == 2)
+        #expect(levers.imports.last?.1 == "你好\tni hao\t2\n再见\tzai jian\t1\n", "only the changes, as <text>\\t<code>\\t<weight>")
+        #expect(levers.rows("rime_ice")["你好\tni hao"] == 2)
+        let mark = try #require(try store.watermark(for: .rimeIce, dictName: "rime_ice"))
+        #expect(mark.lastRevision == 4 && mark.projectedCount == 3)
+        #expect(try store.watermark(for: .mint, dictName: "rime_ice") == nil)
+    }
+
+    /// Two userdbs of one set keep their own watermarks: projecting a new entry into
+    /// `dict_b` leaves `dict_a` behind it, so `dict_a` still receives the entry; resetting a
+    /// diverged `dict_a` leaves `dict_b`'s watermark untouched.
+    @Test func userDBsOfOneSetKeepSeparateWatermarks() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        #expect(try guardian.maintain("dict_a", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        #expect(try guardian.maintain("dict_b", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        try learn([("shi jian", "时见")])
+        #expect(try guardian.maintain("dict_b", store: store) == .healthy(projected: 1))
+        #expect(try store.watermark(for: .rimeIce, dictName: "dict_a")?.lastRevision == 2)
+        #expect(try guardian.maintain("dict_a", store: store) == .healthy(projected: 1))
+        #expect(levers.rows("dict_a")["时见\tshi jian"] == 1 && levers.rows("dict_b")["时见\tshi jian"] == 1)
+        #expect(try guardian.maintain("dict_a", store: store) == .healthy(projected: 0))
+
+        try Data("你好\tni hao\t1\n".utf8).write(to: levers.rowsURL("dict_a"))
+        #expect(try guardian.maintain("dict_a", store: store) == .reprojected(imported: 3))
+        let b = try #require(try store.watermark(for: .rimeIce, dictName: "dict_b"))
+        #expect(b.lastRevision == 3 && b.projectedCount == 3, "resetting dict_a clobbered dict_b: \(b)")
+        #expect(try store.stats().watermarks.map(\.dictName) == ["dict_a", "dict_b"])
+    }
+
+    @Test func corruptUserDBIsQuarantinedAndRestoredFromSnapshotPlusReplay() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        #expect(try guardian.maintain("rime_ice", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        let snapshotRevision = try #require(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots)).1.learningRevision
+        #expect(snapshotRevision == 2)
+        // A phrase Rime learned natively lives only in the userdb (and so in the snapshot).
+        _ = levers.importUserDict("rime_ice", from: try tsv("原生\tyuan sheng\t5\n"))
+        try guardian.writeSnapshot("rime_ice", learningRevision: 2)
+        // Newer store entries the snapshot predates.
+        try learn([("zai jian", "再见")])
+
+        let userdb = setDir.appending(path: "rime_ice.userdb")
+        try FileManager.default.createDirectory(at: userdb.appending(path: "lost"), withIntermediateDirectories: true)
+        guard case .recovered(let report) = try guardian.maintain("rime_ice", store: store) else {
+            Issue.record("expected recovery")
+            return
+        }
+        #expect(report.method == .snapshotAndReplay)
+        let quarantined = try #require(report.quarantined)
+        #expect(quarantined.deletingLastPathComponent().lastPathComponent == UserDBGuardian.quarantineDirectoryName)
+        #expect(FileManager.default.fileExists(atPath: quarantined.appending(path: "lost").path), "the corrupt db is kept aside")
+        #expect(!FileManager.default.fileExists(atPath: userdb.appending(path: "lost").path))
+        let rows = levers.rows("rime_ice")
+        #expect(rows["原生\tyuan sheng"] == 5, "restored from the snapshot")
+        #expect(rows["再见\tzai jian"] == 1, "replayed from learning.sqlite")
+        #expect(levers.imports.last?.1 == "再见\tzai jian\t1\n", "only entries newer than the snapshot are replayed")
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice")?.lastRevision == 3)
+    }
+
+    @Test func withoutAUsableSnapshotTheUserDBIsRebuiltFromTheStore() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("ni hao", "你好"), ("shi jie", "世界")])
+        let userdb = setDir.appending(path: "rime_ice.userdb")
+        try FileManager.default.createDirectory(at: userdb, withIntermediateDirectories: true)
+        levers.failingExports = ["rime_ice"]
+        #expect(try guardian.checkHealth("rime_ice") == .corrupted(.exportFailed))
+        levers.failingExports = []
+        // The snapshot on disk is corrupt, so the ladder skips it.
+        try FileManager.default.createDirectory(at: snapshots, withIntermediateDirectories: true)
+        try Data("junk".utf8).write(to: UserDBGuardian.snapshotURL("rime_ice", in: snapshots))
+        try Data("{}".utf8).write(to: UserDBGuardian.snapshotMetadataURL("rime_ice", in: snapshots))
+        let report = try guardian.recover("rime_ice", store: store)
+        #expect(report.method == .fullRebuild && report.quarantined != nil && report.exported == 2)
+        #expect(levers.rows("rime_ice") == ["你好\tni hao": 2, "世界\tshi jie": 1])
+        #expect(UserDBGuardian.verifiedSnapshot("rime_ice", schemaSet: .rimeIce, in: snapshots)?.1.learningRevision == 3)
+    }
+
+    @Test func recoveryFailsLoudlyWhenTheRebuiltUserDBStillCannotExport() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好")])
+        levers.failingExports = ["rime_ice"]
+        #expect(throws: UserDBGuardian.Failure.exportFailed("rime_ice still fails to export after recovery")) {
+            try guardian.recover("rime_ice", store: store)
+        }
+    }
+
+    @Test func cancelledChunkedProjectionStopsEarlyAndLeavesWatermarkUnchanged() throws {
+        defer { cleanUp() }
+        let total = UserDBGuardian.importBatchSize * 2 + 500
+        let batch = (0..<total).map { index -> LearningCommitEvent in
+            let first = Unicode.Scalar(0x4E00 + (index / 100))!
+            let second = Unicode.Scalar(0x4E00 + (index % 100))!
+            return LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "\(Character(first))\(Character(second))")
+        }
+        #expect(try store.recordBatch(batch) == total)
+
+        var cancelled = false
+        var chunks = 0
+        levers.onImport = { _, _ in
+            chunks += 1
+            if chunks == 1 { cancelled = true }
+        }
+        #expect(throws: UserDBGuardian.Failure.cancelled) {
+            try guardian.maintain("rime_ice", store: store, isCancelled: { cancelled })
+        }
+        #expect(chunks == 1, "expected chunked projection to stop after the first batch, saw \(chunks)")
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice") == nil, "cancelled projection must not advance watermark")
+
+        // A follow-up uncancelled run finishes projecting every entry and writes the watermark.
+        levers.onImport = nil
+        #expect(try guardian.maintain("rime_ice", store: store) == .healthy(projected: total))
+        let mark = try #require(try store.watermark(for: .rimeIce, dictName: "rime_ice"))
+        #expect(mark.lastRevision == Int64(total) && mark.projectedCount == Int64(total))
+        #expect(levers.rows("rime_ice").count == total)
+    }
+
+    @Test func cancelledRecoveryClearsStaleWatermarkSoNextBootReplaysMissedEntries() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        _ = try guardian.maintain("rime_ice", store: store)
+        try guardian.writeSnapshot("rime_ice", learningRevision: 2)
+        // Project newer entries without updating the snapshot, then corrupt the userdb.
+        try learn([("zai jian", "再见")])
+        _ = try guardian.project("rime_ice", store: store)
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice")?.lastRevision == 3)
+        try FileManager.default.createDirectory(
+            at: setDir.appending(path: "rime_ice.userdb/lost"), withIntermediateDirectories: true)
+
+        var cancelled = false
+        // Cancel immediately after the snapshot import, before replaying revision 3.
+        levers.onImport = { _, _ in cancelled = true }
+        #expect(throws: UserDBGuardian.Failure.cancelled) {
+            try guardian.maintain("rime_ice", store: store, isCancelled: { cancelled })
+        }
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice") == nil)
+
+        levers.onImport = nil
+        #expect(try guardian.maintain("rime_ice", store: store) == .healthy(projected: 3))
+        #expect(levers.rows("rime_ice")["再见\tzai jian"] == 1)
+    }
+
+    private func tsv(_ text: String) throws -> URL {
+        let url = root.appending(path: "import-\(UUID().uuidString).tsv")
+        try Data(text.utf8).write(to: url)
+        return url
+    }
+}

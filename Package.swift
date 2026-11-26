@@ -37,8 +37,18 @@ let package = Package(
         // IME <-> agent IPC: wire format, XPC transport, peer verification, and the IME's
         // connection state machine. Zero TCC, like NoemaIME, which links it.
         .target(name: "NoemaIPC", dependencies: ["NoemaCore"]),
-        .target(name: "NoemaEngine", dependencies: ["CRime", "NoemaCore"]),
-        .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine"]),
+        // The canonical learning store: SQLite WAL `learning.sqlite`, its non-blocking writer, and
+        // the `noema_learned.tsv` exporter. Zero networking; system SQLite3 only.
+        .target(
+            name: "NoemaLearning",
+            dependencies: ["NoemaCore", "NoemaText"],
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
+        .target(name: "NoemaEngine", dependencies: ["CRime", "NoemaCore", "NoemaLearning", "NoemaText"]),
+        // Dictionary lockfile, verified downloads, safe archive extraction, and the installed
+        // lexicon inventory. Runs in the agent or noema-cli, never in NoemaIME.
+        .target(name: "NoemaLexiconAdmin", dependencies: ["NoemaCore", "NoemaLearning"]),
+        .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine", "NoemaLearning", "NoemaLexiconAdmin"]),
         // Engine-independent IMKit shell logic: session coordination, NSEvent bridging, and
         // the text-client and candidate-presenter seams. Zero TCC, like NoemaIME.
         .target(name: "NoemaIMEShell", dependencies: ["NoemaCore"]),
@@ -46,10 +56,11 @@ let package = Package(
         // NSPanel that implements CandidatePresenting. Zero TCC, like NoemaIME.
         .target(name: "NoemaUI", dependencies: ["NoemaCore", "NoemaIMEShell"]),
         // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
-        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaUI"]),
+        .executableTarget(
+            name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaLearning", "NoemaUI"]),
         // The companion agent's logic: IPC service, LaunchAgent control, and the SwiftUI
         // Settings window. Never linked into NoemaIME.
-        .target(name: "NoemaAgentCore", dependencies: ["NoemaCore", "NoemaIPC"]),
+        .target(name: "NoemaAgentCore", dependencies: ["NoemaCore", "NoemaIPC", "NoemaLearning", "NoemaLexiconAdmin"]),
         // The companion agent executable bundled into Noema.app; no librime.
         .executableTarget(name: "NoemaAgent", dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore"]),
         // Isolated Rime deployment subprocess, bundled beside NoemaIME in Contents/MacOS.
@@ -57,9 +68,15 @@ let package = Package(
         .executableTarget(name: "noema-rime-deployer", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
         .testTarget(name: "NoemaCoreTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaText"]),
         // IPC wire format, state machine, real libxpc and SecCode, and the real NoemaAgent.
-        .testTarget(name: "NoemaIPCTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore", "NoemaAgent"]),
+        .testTarget(
+            name: "NoemaIPCTests",
+            dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore", "NoemaAgent", "NoemaLearning", "NoemaLexiconAdmin"]),
         // Pure engine logic (key mapping, boot guard); never initializes librime.
-        .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine"]),
+        .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine", "NoemaLearning"]),
+        // The SQLite learning store, its writer, and the learned-phrase TSV export.
+        .testTarget(name: "NoemaLearningTests", dependencies: ["NoemaCore", "NoemaLearning", "NoemaText"]),
+        // Lockfile validation, loopback downloads, safe ZIP extraction, and the inventory.
+        .testTarget(name: "NoemaLexiconAdminTests", dependencies: ["NoemaCore", "NoemaLearning", "NoemaLexiconAdmin"]),
         // NSEvent bridging and other shell logic that needs no engine.
         .testTarget(name: "NoemaIMEShellTests", dependencies: ["NoemaCore", "NoemaIMEShell"]),
         // Headless CoreText layout, width hysteresis, and caret placement of the panel.
@@ -70,7 +87,7 @@ let package = Package(
         .testTarget(
             name: "CRimeTests",
             dependencies: [
-                "CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaAgentCore", "NoemaUI",
+                "CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaAgentCore", "NoemaUI", "NoemaLearning",
                 "noema-rime-deployer", "noema-cli", "NoemaIME",
             ]
         ),

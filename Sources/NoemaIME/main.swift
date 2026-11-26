@@ -135,5 +135,10 @@ default:
         fputs(usage + "\n", stderr)
         exit(2)
     }
+    // While the process is still single-threaded: the bundled standard OpenCC data, the same
+    // directory `EngineHost` passes as `openccDataDir`, so the engine never needs `setenv` later.
+    if let opencc = RimeEngineConfiguration.bundledOpenCCDataDir() {
+        setenv(RimeEngineConfiguration.openccDataDirVariable, opencc.path, 1)
+    }
     runInputMethodServer()
 }
