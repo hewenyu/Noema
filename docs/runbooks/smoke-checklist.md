@@ -38,3 +38,16 @@ Type `nihao`, then select with Space, a number key, and a mouse click, in each a
 - [ ] A second display left of or below the main one (negative coordinates): the panel stays on the caret's display.
 - [ ] `defaults write dev.noema.inputmethod.NoemaIME InlinePreeditDisabledBundleIDs -array com.apple.Terminal`, then `noema-cli reload`: Terminal shows no marked text; the panel draws the preedit with its caret above a hairline. `defaults delete` the key afterwards.
 - [ ] `NSGlassEffectView` backdrop by default; the `.visualEffect` fallback (set `backdropMode` in a debug build) shows a shadowed HUD backdrop with the same layout.
+
+## 5. v-mode and emoji
+
+In TextEdit unless noted:
+
+- [ ] `v`: marked `v` and a 2-column menu of nine cells beside the caret; 剪贴板, 语音输入, 翻译, 改写 dimmed; the candidate panel never shows at the same time.
+- [ ] `v1+2` Space inserts `3`; `v=2+3` ↓ Return inserts `2+3=5`; `v8` `1` inserts today's date; `v3` `xx` `1` inserts 谢谢！; `v5` Tab switches symbol category.
+- [ ] Arrow keys move through the grid (↓ from 7 or 8 lands on 9); clicking a cell or row selects it.
+- [ ] `vv` inserts `v`; `vim` Return inserts `vim`; `lv` Space inserts 绿; `nv` Space inserts 女.
+- [ ] `v` then Esc, a click elsewhere in the document, or ⌘-Tab away: the `v` disappears and nothing is inserted.
+- [ ] `v2`: a HUD 剪贴板将在 M3 推出 appears near the top of the screen for about two seconds without taking focus from TextEdit; `v9` opens Settings.
+- [ ] Password field: `v` passes through as a plain character, no panel.
+- [ ] `nihao`: 你好 first, 👋 second; Settings › 快速操作 › Emoji off removes 👋 on the next keystroke; on again restores it.
