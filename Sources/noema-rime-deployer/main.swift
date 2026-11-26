@@ -168,7 +168,7 @@ func installLearnedTranslator(
     guard let text = String(data: bytes, encoding: .utf8) else { fail("\(patchURL.path) is not UTF-8") }
     if SchemaPatch.names(learnedTranslator, in: text) { return }
     let configID = SchemaPatch.userPatchConfigID(schemaID: options.schemaID)
-    let keys = userPatchKeys(api: api, yaml: text, path: patchURL.path)
+    let keys = userPatchKeys(api: api, yaml: text, path: patchURL.path, options: options)
     guard let wrapper = SchemaPatch.wrapper(appending: learnedTranslator, userConfigID: configID, userPatchKeys: keys) else {
         fail("\(patchURL.path) already uses every key that could append \(learnedTranslator): \(SchemaPatch.wrapperAppendKeys)")
     }
@@ -177,23 +177,180 @@ func installLearnedTranslator(
     requireNoThrow("writing \(patchURL.path)") { try Data(wrapper.utf8).write(to: patchURL, options: .atomic) }
 }
 
-/// The top-level keys of the `patch` mapping of `yaml`, read with librime's own YAML parser
-/// (keys with `/` stay whole; values are never read by path). Empty when `patch` is absent or
-/// not a mapping; a file librime cannot parse fails the deployment.
-func userPatchKeys(api: UnsafeMutablePointer<RimeApi>, yaml: String, path: String) -> [String] {
+/// The effective top-level keys of the `patch` mapping of `yaml`, read with librime's own
+/// YAML parser (keys with `/` stay whole) and recursively following any `__include` /
+/// `__patch` directives across `--staging-dir` and `--shared-dir` (plus local `:/...`
+/// references), so keys introduced indirectly (such as `engine/translators/@next` via
+/// `patch: { __include: common:/patch }`) are never overwritten by the wrapper.
+func userPatchKeys(api: UnsafeMutablePointer<RimeApi>, yaml: String, path: String, options: Options) -> [String] {
     guard let load = api.pointee.config_load_string, let close = api.pointee.config_close,
-          let begin = api.pointee.config_begin_map, let next = api.pointee.config_next, let end = api.pointee.config_end
+          let begin = api.pointee.config_begin_map, let next = api.pointee.config_next, let end = api.pointee.config_end,
+          let getCString = api.pointee.config_get_cstring
     else { fail("librime lacks the config API to read \(path)") }
+
+    func resolveYAMLFile(stem: String) -> (url: URL, inShared: Bool)? {
+        let trimmed = stem.hasSuffix(".yaml") ? String(stem.dropLast(5)) : stem
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, parts.allSatisfy(DeployManifest.isSafeName) else { return nil }
+        for (base, inShared) in [(options.staging, false), (options.shared, true)] {
+            var url = base
+            for component in parts.dropLast() { url = url.appending(path: component, directoryHint: .isDirectory) }
+            url = url.appending(path: "\(parts.last!).yaml")
+            if FileManager.default.fileExists(atPath: url.path) { return (url, inShared) }
+        }
+        return nil
+    }
+
+    /// Reads an external YAML file: `O_NOFOLLOW` under `--staging-dir` (never follows user
+    /// symlinks), and allows regular-file symlinks under `--shared-dir` (matching
+    /// `DeployManifest.inputs` and librime).
+    func readExternalYAML(_ resolved: (url: URL, inShared: Bool)) -> String? {
+        if !resolved.inShared {
+            guard let bytes = try? DeployManifest.readRegularFile(resolved.url) else { return nil }
+            return String(data: bytes, encoding: .utf8)
+        }
+        let maxYAMLBytes = 16 << 20
+        let descriptor = open(resolved.url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        defer { Darwin.close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_size >= 0, info.st_size <= Int64(maxYAMLBytes)
+        else { return nil }
+        var data = Data()
+        data.reserveCapacity(Int(info.st_size))
+        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+        while true {
+            let count = read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                if data.count + count > maxYAMLBytes { return nil }
+                data.append(buffer, count: count)
+            } else if count == 0 {
+                break
+            } else if errno == EINTR {
+                continue
+            } else {
+                return nil
+            }
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func parseReference(_ raw: String) -> (stem: String?, mapPath: String) {
+        let ref = raw.hasSuffix("?") ? String(raw.dropLast()) : raw
+        guard let colon = ref.firstIndex(of: ":") else {
+            return (nil, ref.hasPrefix("/") ? String(ref.dropFirst()) : ref)
+        }
+        let left = String(ref[..<colon])
+        let right = String(ref[ref.index(after: colon)...])
+        let mapPath = right.hasPrefix("/") ? String(right.dropFirst()) : right
+        return (left.isEmpty ? nil : left, mapPath)
+    }
+
+    func splitDirective(
+        in config: inout RimeConfig, at directivePath: String, refs: inout [String], inlineMaps: inout [String]
+    ) {
+        let listCount = api.pointee.config_list_size(&config, directivePath)
+        if listCount > 0 {
+            for index in 0..<listCount {
+                let itemPath = "\(directivePath)/@\(index)"
+                if let ref = getCString(&config, itemPath).map({ String(cString: $0) }), !ref.isEmpty {
+                    refs.append(ref)
+                } else {
+                    inlineMaps.append(itemPath)
+                }
+            }
+        } else if let single = getCString(&config, directivePath).map({ String(cString: $0) }), !single.isEmpty {
+            refs.append(single)
+        } else {
+            inlineMaps.append(directivePath)
+        }
+    }
+
+    var keys: [String] = []
+    var visitedPatch: Set<String> = []
+    var visitedRoot: Set<String> = []
+
+    func collectPatch(in config: inout RimeConfig, fileKey: String, mapPath: String, depth: Int) {
+        guard depth < 16 else { return }
+        let token = "\(fileKey)#\(mapPath)"
+        guard visitedPatch.insert(token).inserted else { return }
+        var iterator = RimeConfigIterator()
+        guard begin(&iterator, &config, mapPath) != 0 else { return }
+        defer { end(&iterator) }
+        var nestedRefs: [String] = []
+        var inlineMapPaths: [String] = []
+        while next(&iterator) != 0 {
+            guard let rawKey = iterator.key else { continue }
+            let key = String(cString: rawKey)
+            if key == "__include" || key == "__patch" {
+                let directivePath = iterator.path.map { String(cString: $0) } ?? (mapPath.isEmpty ? key : "\(mapPath)/\(key)")
+                splitDirective(in: &config, at: directivePath, refs: &nestedRefs, inlineMaps: &inlineMapPaths)
+            } else if !keys.contains(key) {
+                keys.append(key)
+            }
+        }
+        for inlinePath in inlineMapPaths {
+            collectPatch(in: &config, fileKey: fileKey, mapPath: inlinePath, depth: depth + 1)
+        }
+        for ref in nestedRefs {
+            let (stem, targetPath) = parseReference(ref)
+            if let stem {
+                guard let resolved = resolveYAMLFile(stem: stem), let text = readExternalYAML(resolved) else { continue }
+                var external = RimeConfig()
+                defer { _ = close(&external) }
+                guard load(&external, text) != 0 else { continue }
+                collectPatch(in: &external, fileKey: resolved.url.path, mapPath: targetPath, depth: depth + 1)
+            } else {
+                collectPatch(in: &config, fileKey: fileKey, mapPath: targetPath, depth: depth + 1)
+            }
+        }
+    }
+
+    /// Recursively traverses document/mapping roots (`__include` / `__patch` at root level,
+    /// including multi-hop root includes and inline root `__patch` maps) and collects keys
+    /// from any `patch` mapping found along the chain.
+    func collectRoot(in config: inout RimeConfig, fileKey: String, rootPath: String, depth: Int) {
+        guard depth < 16 else { return }
+        let token = "\(fileKey)#\(rootPath)"
+        guard visitedRoot.insert(token).inserted else { return }
+        let patchPath = rootPath.isEmpty ? "patch" : "\(rootPath)/patch"
+        collectPatch(in: &config, fileKey: fileKey, mapPath: patchPath, depth: depth)
+
+        var refs: [String] = []
+        var inlineMaps: [String] = []
+        var iterator = RimeConfigIterator()
+        if begin(&iterator, &config, rootPath) != 0 {
+            defer { end(&iterator) }
+            while next(&iterator) != 0 {
+                guard let rawKey = iterator.key else { continue }
+                let key = String(cString: rawKey)
+                guard key == "__include" || key == "__patch" else { continue }
+                let directivePath = iterator.path.map { String(cString: $0) } ?? (rootPath.isEmpty ? key : "\(rootPath)/\(key)")
+                splitDirective(in: &config, at: directivePath, refs: &refs, inlineMaps: &inlineMaps)
+            }
+        }
+        for inlinePath in inlineMaps {
+            collectRoot(in: &config, fileKey: fileKey, rootPath: inlinePath, depth: depth + 1)
+        }
+        for ref in refs {
+            let (stem, targetPath) = parseReference(ref)
+            if let stem {
+                guard let resolved = resolveYAMLFile(stem: stem), let text = readExternalYAML(resolved) else { continue }
+                var external = RimeConfig()
+                defer { _ = close(&external) }
+                guard load(&external, text) != 0 else { continue }
+                collectRoot(in: &external, fileKey: resolved.url.path, rootPath: targetPath, depth: depth + 1)
+            } else {
+                collectRoot(in: &config, fileKey: fileKey, rootPath: targetPath, depth: depth + 1)
+            }
+        }
+    }
+
     var config = RimeConfig()
     defer { _ = close(&config) }
     guard load(&config, yaml) != 0 else { fail("\(path) is not YAML librime can parse") }
-    var iterator = RimeConfigIterator()
-    guard begin(&iterator, &config, "patch") != 0 else { return [] }
-    defer { end(&iterator) }
-    var keys: [String] = []
-    while next(&iterator) != 0 {
-        if let key = iterator.key { keys.append(String(cString: key)) }
-    }
+    collectRoot(in: &config, fileKey: path, rootPath: "", depth: 0)
     return keys
 }
 

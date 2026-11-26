@@ -815,6 +815,117 @@ extension LibrimeSerializedTests {
             #expect(candidates(engine, "zzzz") == ["zzzz"])
         }
 
+        /// A user patch that adds a translator indirectly via `__include` (Codex Round 9:
+        /// `patch: { __include: common:/patch }` where `shared/common.yaml` sets
+        /// `"engine/translators/@next": table_translator@audit_custom`, plus multi-hop and
+        /// local `:/...` includes): `noema-rime-deployer` resolves effective keys across
+        /// `__include`/`__patch` so the wrapper picks `@after last` instead of colliding with
+        /// `@next`; both the custom translator's candidates and `lua_translator@*noema_learned`
+        /// survive in the live engine.
+        @Test func deployerPreservesTranslatorsIncludedThroughPatchDirectives() throws {
+            let workspace = try LexiconWorkspace()
+            let shared = workspace.root.appending(path: "shared-include", directoryHint: .isDirectory)
+            try FileManager.default.copyItem(at: LexiconWorkspace.builtin, to: shared)
+            try """
+                ---
+                name: audit_custom
+                version: "1"
+                sort: by_weight
+                ...
+                自定义短语\tnihao\t99999
+                """.write(to: shared.appending(path: "audit_custom.dict.yaml"), atomically: true, encoding: .utf8)
+            try """
+                schema:
+                  schema_id: audit_custom
+                  name: Audit Custom
+                translator:
+                  dictionary: audit_custom
+                  enable_user_dict: false
+                """.write(to: shared.appending(path: "audit_custom.schema.yaml"), atomically: true, encoding: .utf8)
+            let defaultYAML = try String(contentsOf: shared.appending(path: "default.yaml"), encoding: .utf8)
+            try defaultYAML.replacingOccurrences(
+                of: "  - schema: noema_pinyin", with: "  - schema: noema_pinyin\n  - schema: audit_custom"
+            ).write(to: shared.appending(path: "default.yaml"), atomically: true, encoding: .utf8)
+            try """
+                patch:
+                  "engine/translators/@next": "table_translator@audit_custom"
+                  "audit_custom/dictionary": "audit_custom"
+                  "audit_custom/enable_user_dict": false
+                  "menu/page_size": 9
+                """.write(to: shared.appending(path: "base_common.yaml"), atomically: true, encoding: .utf8)
+            try """
+                patch:
+                  __include: "base_common:/patch"
+                """.write(to: shared.appending(path: "common.yaml"), atomically: true, encoding: .utf8)
+
+            let userPatch = "patch:\n  __include: \"common:/patch\"\n"
+            try FileManager.default.createDirectory(at: workspace.setDir(.builtin), withIntermediateDirectories: true)
+            try userPatch.write(to: workspace.setDir(.builtin).appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+
+            // Also verify a local `:/local_patch` include with `@next` avoids collision.
+            let deployer = try #require(RimeEngine.locateDeployer())
+            let localUser = workspace.root.appending(path: "local-include-user", directoryHint: .isDirectory)
+            let localStaging = workspace.root.appending(path: "local-include-staging", directoryHint: .isDirectory)
+            for dir in [localUser, localStaging] { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+            try """
+                local_patch:
+                  "engine/translators/@next": "echo_translator"
+                patch:
+                  __include: ":/local_patch"
+                """.write(to: localUser.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            let localResult = try Tool.run(deployer.path, [
+                "--shared-dir", shared.path, "--user-dir", localUser.path, "--staging-dir", localStaging.path,
+                "--log-dir", workspace.logs.path, "--schema", "noema_pinyin", "--lua-file", LexiconWorkspace.lua.path,
+            ])
+            #expect(localResult.status == 0, "\(localResult)")
+            let localCompiled = try String(contentsOf: localStaging.appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+            #expect(localCompiled.contains("echo_translator") && localCompiled.contains("lua_translator@*noema_learned"), "\(localCompiled)")
+
+            // Also verify multi-hop root `__include`, root inline `__patch` maps, and regular-file symlinks in `--shared-dir`.
+            try FileManager.default.createSymbolicLink(
+                at: shared.appending(path: "linked_common.yaml"), withDestinationURL: shared.appending(path: "common.yaml"))
+            try "__include: \"linked_common:/\"\n".write(
+                to: shared.appending(path: "root_hop.yaml"), atomically: true, encoding: .utf8)
+            let extraCases: [(name: String, yaml: String, expectedTranslator: String)] = [
+                ("root-hop-symlink", "__include: \"root_hop:/\"\n", "table_translator@audit_custom"),
+                ("root-inline-patch", "__patch:\n  - patch:\n      \"engine/translators/@next\": \"echo_translator\"\n", "echo_translator"),
+            ]
+            for extra in extraCases {
+                let u = workspace.root.appending(path: "\(extra.name)-user", directoryHint: .isDirectory)
+                let s = workspace.root.appending(path: "\(extra.name)-staging", directoryHint: .isDirectory)
+                for dir in [u, s] { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+                try extra.yaml.write(to: u.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+                let r = try Tool.run(deployer.path, [
+                    "--shared-dir", shared.path, "--user-dir", u.path, "--staging-dir", s.path,
+                    "--log-dir", workspace.logs.path, "--schema", "noema_pinyin", "--lua-file", LexiconWorkspace.lua.path,
+                ])
+                #expect(r.status == 0, "\(extra.name): \(r)")
+                let c = try String(contentsOf: s.appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+                #expect(c.contains(extra.expectedTranslator) && c.contains("lua_translator@*noema_learned"), "\(extra.name): \(c)")
+            }
+
+            // Boot real RimeEngine on the multi-hop `common:/patch -> base_common:/patch` setup.
+            let configuration = RimeEngineConfiguration(
+                sharedDataDir: shared, userDataDir: workspace.user, logDir: workspace.logs,
+                schemaID: "noema_pinyin", deployerURL: deployer, schemaSetID: .builtin, luaFile: LexiconWorkspace.lua)
+            let engine = try RimeEngine(configuration: configuration)
+            defer { engine.shutdown() }
+            try #require(!engine.isSafeMode)
+            let live = try String(
+                contentsOf: workspace.setDir(.builtin).appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+            #expect(live.contains("table_translator@audit_custom") && live.contains("lua_translator@*noema_learned"), "\(live)")
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            #expect(engine.refreshLearnedPhrases(from: store) == 1)
+            engine.resetSession()
+            let served = candidates(engine, "nihao")
+            #expect(served.contains("自定义短语") && served.contains("霓昊"), "missing custom or learned candidate: \(served)")
+            _ = engine.processKey(.text("n"))
+            #expect(engine.currentState.pageSize == 9)
+            engine.clearComposition()
+        }
+
         /// Every YAML form a user `noema_pinyin.custom.yaml` may take (Codex #4711912896):
         /// flow `patch: {...}` (one line, multi-line, empty, nested, with `#`/`,`/`}` inside
         /// strings), block keys with inline sequences, the wrapper's own append key, CRLF,
