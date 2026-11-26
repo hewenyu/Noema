@@ -51,7 +51,7 @@ let package = Package(
         .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine", "NoemaLearning", "NoemaLexiconAdmin"]),
         // Engine-independent IMKit shell logic: session coordination, NSEvent bridging, and
         // the text-client and candidate-presenter seams. Zero TCC, like NoemaIME.
-        .target(name: "NoemaIMEShell", dependencies: ["NoemaCore"]),
+        .target(name: "NoemaIMEShell", dependencies: ["NoemaCore", "NoemaText"]),
         // The candidate panel: CoreText layout, caret placement, and the non-activating
         // NSPanel that implements CandidatePresenting. Zero TCC, like NoemaIME.
         .target(name: "NoemaUI", dependencies: ["NoemaCore", "NoemaIMEShell"]),
@@ -87,7 +87,7 @@ let package = Package(
         .testTarget(
             name: "CRimeTests",
             dependencies: [
-                "CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaAgentCore", "NoemaUI", "NoemaLearning",
+                "CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaAgentCore", "NoemaUI", "NoemaLearning", "NoemaText",
                 "noema-rime-deployer", "noema-cli", "NoemaIME",
             ]
         ),

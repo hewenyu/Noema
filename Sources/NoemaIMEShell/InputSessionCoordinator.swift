@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import NoemaCore
+import NoemaText
 
 /// Routes the key and lifecycle calls of every input controller in the process to the one
 /// process-wide `TypingEngine`, and applies each `KeyHandlingResult` to the client.
@@ -19,6 +20,13 @@ import NoemaCore
 /// marked text: the candidate panel draws the preedit instead. Clicks on the panel arrive
 /// through `selectCandidate(at:expectedGenerationID:)` and
 /// `changePage(backward:expectedGenerationID:)`, which ignore stale generations.
+///
+/// v-mode: while the engine is idle, a plain `v` opens the v-mode menu (`VModeReducer`); its
+/// offline tools (`CalculatorEvaluator`, `SnippetStore`, `SymbolPalette`,
+/// `DateTimeTemplates`) commit text directly, and its agent cells call `onQuickAction`. While
+/// the engine composes, every key goes to the engine, so `lv` still spells 绿. Secure input,
+/// Safe Mode, ASCII mode, focus loss, `commitComposition`, and `hidePalettes` end v-mode at
+/// once: its marked text is cleared and its panel hidden. v-mode itself sends no IPC.
 @MainActor
 public final class InputSessionCoordinator {
     /// A mode ID that switches the engine to ASCII. `Info.plist.in` declares only
@@ -27,8 +35,25 @@ public final class InputSessionCoordinator {
 
     private let engineProvider: @MainActor () -> (any TypingEngine)?
     private let candidatePresenter: any CandidatePresenting
+    private let vModePresenter: any VModePresenting
     private let isSecureInputEnabled: @MainActor () -> Bool
     private let inlinePreeditDisabledBundleIDs: Set<String>
+    private let now: @MainActor () -> Date
+    private let timeZone: TimeZone
+    private let snippetStore: SnippetStore
+
+    /// Where v-mode is; `.idle` or `.composing` whenever it shows nothing.
+    public private(set) var vModeState: VModeState = .idle
+    /// Strictly increases with every v-mode panel state presented; clicks carry it back.
+    public private(set) var vModeGenerationID: UInt64 = 0
+    /// Called on the main actor when the user picks a v-mode agent action (`v2`, `v4`, `v6`,
+    /// `v7`, `v9`). Never called under secure input. `EngineHost` hands it to
+    /// `CompositionIPCReporter.requestQuickAction(_:)`.
+    public var onQuickAction: (@MainActor (QuickActionID) -> Void)?
+    /// The instant the `v8` candidates describe, fixed while the date list is open.
+    private var dateAnchor = Date(timeIntervalSince1970: 0)
+    /// The snippets read when `v3` opened, kept while the list is open.
+    private var snippetCache: [Snippet]?
 
     /// The session that owns the engine's composition, and its client.
     public private(set) var activeToken: UUID?
@@ -43,16 +68,25 @@ public final class InputSessionCoordinator {
     /// generation gate on every call but sends nothing while secure input is on.
     public var onCompositionChange: (@MainActor (CompositionState) -> Void)?
 
+    /// `now`, `timeZone`, and `snippetStore` feed v-mode's date list and snippets; tests pin them.
     public init(
         engineProvider: @escaping @MainActor () -> (any TypingEngine)?,
         candidatePresenter: any CandidatePresenting = NoOpCandidatePresenter(),
+        vModePresenter: any VModePresenting = NoOpVModePresenter(),
         isSecureInputEnabled: @escaping @MainActor () -> Bool = { IsSecureEventInputEnabled() },
-        inlinePreeditDisabledBundleIDs: Set<String> = []
+        inlinePreeditDisabledBundleIDs: Set<String> = [],
+        now: @escaping @MainActor () -> Date = { Date() },
+        timeZone: TimeZone = .current,
+        snippetStore: SnippetStore = SnippetStore(fileURL: NoemaPaths.snippetsURL())
     ) {
         self.engineProvider = engineProvider
         self.candidatePresenter = candidatePresenter
+        self.vModePresenter = vModePresenter
         self.isSecureInputEnabled = isSecureInputEnabled
         self.inlinePreeditDisabledBundleIDs = inlinePreeditDisabledBundleIDs
+        self.now = now
+        self.timeZone = timeZone
+        self.snippetStore = snippetStore
     }
 
     // MARK: - Lifecycle
@@ -60,7 +94,10 @@ public final class InputSessionCoordinator {
     /// A controller's client gained focus (`activateServer:`).
     public func activate(token: UUID, client: any TextInputClient) {
         take(token: token, client: client)
-        if isSecureInputEnabled() { candidatePresenter.hide() }
+        if isSecureInputEnabled() {
+            candidatePresenter.hide()
+            endVMode()
+        }
     }
 
     /// A controller's client lost focus (`deactivateServer:`). Ignored unless `token` owns
@@ -83,6 +120,11 @@ public final class InputSessionCoordinator {
     /// secure input nothing is inserted: the composition is dropped instead.
     public func commitComposition(token: UUID, client: any TextInputClient) {
         guard activeToken == token else { return }
+        // v-mode commits nothing on a click outside: its marked text is only cleared.
+        if vModeState.isActive {
+            endVMode()
+            return
+        }
         if isSecureInputEnabled() {
             dropComposition()
             return
@@ -111,6 +153,8 @@ public final class InputSessionCoordinator {
     public func hidePalettes(token: UUID) {
         guard activeToken == nil || activeToken == token else { return }
         candidatePresenter.hide()
+        // v-mode has no composition to keep: it ends with its panel.
+        endVMode()
     }
 
     /// The user picked an input mode (`setValue:forTag:client:` with
@@ -121,6 +165,7 @@ public final class InputSessionCoordinator {
     public func setInputMode(_ modeID: String, token: UUID, client: any TextInputClient) {
         guard modeID == Self.asciiInputModeID else { return }
         take(token: token, client: client)
+        endVMode()
         if isSecureInputEnabled() {
             dropComposition()
         } else {
@@ -148,6 +193,7 @@ public final class InputSessionCoordinator {
         //    composition without marked text (preedit drawn in the panel) is dropped too.
         if isSecureInputEnabled() {
             candidatePresenter.hide()
+            endVMode()
             if activeToken != token || hasMarkedText || (engineProvider()?.currentState.isComposing == true) {
                 dropComposition()
                 activeToken = token
@@ -161,6 +207,7 @@ public final class InputSessionCoordinator {
 
         // 3. No engine or Safe Mode: everything passes through.
         guard let engine = engineProvider(), !engine.currentState.isSafeMode else {
+            endVMode()
             if hasMarkedText { client.clearMarkedText() }
             hasMarkedText = false
             candidatePresenter.hide()
@@ -170,16 +217,187 @@ public final class InputSessionCoordinator {
         // 4. Idle ASCII mode: the key is the client's, with no engine call.
         let before = engine.currentState
         if before.isASCIIMode && !before.isComposing {
+            endVMode()
             if hasMarkedText { client.clearMarkedText() }
             hasMarkedText = false
             candidatePresenter.hide()
             return false
         }
 
-        // 5–6. Ask the engine, then apply its result: committed text first.
+        // 5. v-mode, unless the engine composes (then the key is the engine's: `lv` is 绿).
+        if !before.isComposing {
+            let (next, effect) = runVMode(.key(event), isEngineComposing: false)
+            if effect != .passToRime { return applyVMode(next, effect, client: client) }
+            vModeState = .idle
+        }
+
+        // 6–7. Ask the engine, then apply its result: committed text first.
         let result = engine.processKey(event)
+        vModeState = result.state.isComposing ? .composing : .idle
         applyResult(result, to: client)
         return result.handled
+    }
+
+    // MARK: - v-mode
+
+    /// The user clicked item `index` (a menu cell or a row on the current page) of the
+    /// v-mode panel showing `expectedGenerationID`. Acts like the key that selects it and
+    /// returns true; returns false and changes nothing under secure input (which also ends
+    /// v-mode), without an owner, engine, or v-mode, in Safe Mode, or for a stale panel.
+    @discardableResult
+    public func selectVModeItem(at index: Int, expectedGenerationID: UInt64) -> Bool {
+        if isSecureInputEnabled() {
+            candidatePresenter.hide()
+            endVMode()
+            return false
+        }
+        guard vModeState.isActive, activeToken != nil, let client = activeClient, expectedGenerationID == vModeGenerationID
+        else { return false }
+        guard let engine = engineProvider(), !engine.currentState.isSafeMode else {
+            endVMode()
+            return false
+        }
+        let (next, effect) = runVMode(.click(index: index), isEngineComposing: engine.currentState.isComposing)
+        _ = applyVMode(next, effect, client: client)
+        return true
+    }
+
+    /// The reducer over this coordinator's offline tools.
+    private var vModeReducer: VModeReducer {
+        let snippets = snippetCache ?? []
+        let palette = SymbolPalette.builtIn
+        let templates = DateTimeTemplates(timeZone: timeZone)
+        let anchor = dateAnchor
+        return VModeReducer(environment: VModeEnvironment(
+            pageSize: 9,
+            calculate: { CalculatorEvaluator.evaluateFormatted($0) },
+            snippets: { SnippetStore.matching(snippets, query: $0) },
+            symbolCategories: palette.categoryNames,
+            symbols: { palette.symbols(categoryIndex: $0, query: $1) },
+            dateTimeItems: { templates.candidates(for: anchor) }))
+    }
+
+    /// One reducer step. The date list's instant is fixed when it opens, and the snippets
+    /// are read once when `v3` opens.
+    private func runVMode(_ input: VModeInput, isEngineComposing: Bool) -> (VModeState, VModeEffect) {
+        if case .vSub(.dateTime) = vModeState {} else { dateAnchor = now() }
+        let context = VModeContext(isEngineComposing: isEngineComposing)
+        let (next, effect) = vModeReducer.reduce(vModeState, input, context: context)
+        if case .vSub(.snippets) = next {
+            if snippetCache == nil { snippetCache = snippetStore.load() }
+        } else {
+            snippetCache = nil
+        }
+        return (next, effect)
+    }
+
+    /// Applies a v-mode transition to the owner's client; returns whether the client must
+    /// not receive the key.
+    private func applyVMode(_ next: VModeState, _ effect: VModeEffect, client: any TextInputClient) -> Bool {
+        switch effect {
+        case .passToRime:
+            vModeState = next
+            return false
+        case .passThroughToClient:
+            endVMode()
+            return false
+        case .consumeOnly:
+            vModeState = next
+            if next.isActive { presentVMode(on: client) } else { endVMode() }
+            return true
+        case .commitText(let text):
+            vModeState = .idle
+            snippetCache = nil
+            vModePresenter.hideVMode()
+            client.insertText(text)
+            // insertText replaced the marked text.
+            hasMarkedText = false
+            return true
+        case .dispatchAgent(let action):
+            endVMode()
+            // Defense in depth: secure input never reaches here, and never dispatches.
+            if !isSecureInputEnabled() { onQuickAction?(action) }
+            return true
+        }
+    }
+
+    /// Shows `vModeState` as marked text (or only in the panel for inline-preedit-disabled
+    /// clients) and refreshes the panel under a new generation.
+    private func presentVMode(on client: any TextInputClient) {
+        let preedit = vModeState.preedit
+        let inPanel = rendersPreeditInPanel(for: client)
+        if inPanel {
+            if hasMarkedText { client.clearMarkedText() }
+            hasMarkedText = false
+        } else {
+            let length = preedit.utf16.count
+            client.setMarkedText(preedit: preedit, caretUTF16Offset: length, selectionUTF16Range: 0..<length)
+            hasMarkedText = true
+        }
+        candidatePresenter.hide()
+        vModeGenerationID &+= 1
+        guard let state = vModePanelState() else { return }
+        vModePresenter.updateVMode(
+            state, client: client, options: CandidatePresentationOptions(rendersPreeditInPanel: inPanel, sessionToken: activeToken))
+    }
+
+    /// The panel content for `vModeState`, or nil when v-mode is not active.
+    func vModePanelState() -> VModePanelState? {
+        let preedit = vModeState.preedit
+        switch vModeState {
+        case .idle, .composing:
+            return nil
+        case .vMenu(let highlighted):
+            return .menu(items: VModeMenuCell.all, highlightedIndex: highlighted, preedit: preedit, generationID: vModeGenerationID)
+        case .vSub(let sub):
+            let reducer = vModeReducer
+            let texts = reducer.rows(for: sub)
+            var rows = texts.enumerated().map { VModeSubRow(label: String($0.offset + 1), text: $0.element) }
+            var title: String
+            var hint: String?
+            var pageInfo: String?
+            var highlighted = 0
+            switch sub {
+            case .calculator(let expression, let pendingOne, let index):
+                title = VMenuItem.calculator.title
+                highlighted = index
+                rows = zip(["结果", "算式"], texts).map { VModeSubRow(label: $0, text: $1) }
+                if rows.isEmpty { hint = (pendingOne || !expression.isEmpty) ? "算式不完整" : "输入算式，如 1+2*3" }
+            case .snippets(let query, let index, let page):
+                title = VMenuItem.snippets.title
+                highlighted = index
+                hint = query.isEmpty ? "输入字母筛选" : "筛选：\(query)"
+                pageInfo = "\(page + 1)/\(reducer.pageCount(for: sub))"
+            case .symbols(let category, let query, let index, let page):
+                let names = SymbolPalette.builtIn.categoryNames
+                title = "\(VMenuItem.symbols.title) · \(names[min(max(category, 0), names.count - 1)])"
+                highlighted = index
+                hint = query.isEmpty ? "Tab 切换分类" : "筛选：\(query)"
+                pageInfo = "\(page + 1)/\(reducer.pageCount(for: sub))"
+            case .dateTime(let index):
+                title = VMenuItem.dateTime.title
+                highlighted = index
+            case .literal:
+                title = "原样输入"
+                rows = texts.map { VModeSubRow(label: "↵", text: $0) }
+                hint = "回车或空格上屏"
+            }
+            if rows.isEmpty { highlighted = 0 } else { highlighted = min(max(highlighted, 0), rows.count - 1) }
+            return .subMode(
+                title: title, preedit: preedit, queryHint: hint, rows: rows, highlightedIndex: highlighted, pageInfo: pageInfo,
+                generationID: vModeGenerationID)
+        }
+    }
+
+    /// Ends v-mode: clears its marked text from the owner's client (only if the shell put it
+    /// there) and hides its panel. Idempotent; a no-op unless v-mode is active.
+    private func endVMode() {
+        snippetCache = nil
+        guard vModeState.isActive else { return }
+        vModeState = .idle
+        if hasMarkedText { activeClient?.clearMarkedText() }
+        hasMarkedText = false
+        vModePresenter.hideVMode()
     }
 
     // MARK: - Panel clicks
@@ -291,6 +509,8 @@ public final class InputSessionCoordinator {
     /// composition, keeping `ascii_mode`, and hides the menu. Inserts nothing. A cleared
     /// composition is reported, so neither the agent nor the local gate keeps the old one.
     private func dropComposition() {
+        endVMode()
+        if vModeState == .composing { vModeState = .idle }
         if hasMarkedText { activeClient?.clearMarkedText() }
         hasMarkedText = false
         var clearedState: CompositionState?

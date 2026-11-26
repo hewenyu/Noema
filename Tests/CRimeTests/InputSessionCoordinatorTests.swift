@@ -3,6 +3,7 @@ import Foundation
 import NoemaCore
 import NoemaEngine
 import NoemaIMEShell
+import NoemaText
 @testable import NoemaUI
 import Testing
 
@@ -1161,7 +1162,10 @@ final class Harness {
         dictionaryAppendix: String? = nil,
         isSecureInputEnabled: @escaping @MainActor () -> Bool = { false },
         inlinePreeditDisabledBundleIDs: Set<String> = [],
-        candidatePresenter: (any CandidatePresenting)? = nil
+        candidatePresenter: (any CandidatePresenting)? = nil,
+        vModePresenter: any VModePresenting = NoOpVModePresenter(),
+        now: @escaping @MainActor () -> Date = { Date() },
+        timeZone: TimeZone = .current
     ) throws {
         if withoutPunctuator || pageSize != nil || dictionaryAppendix != nil {
             workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
@@ -1181,8 +1185,9 @@ final class Harness {
         try #require(!engine.isSafeMode)
         self.engine = engine
         coordinator = InputSessionCoordinator(
-            engineProvider: { [engine] in engine }, candidatePresenter: candidatePresenter ?? presenter, isSecureInputEnabled: isSecureInputEnabled,
-            inlinePreeditDisabledBundleIDs: inlinePreeditDisabledBundleIDs)
+            engineProvider: { [engine] in engine }, candidatePresenter: candidatePresenter ?? presenter, vModePresenter: vModePresenter,
+            isSecureInputEnabled: isSecureInputEnabled, inlinePreeditDisabledBundleIDs: inlinePreeditDisabledBundleIDs, now: now,
+            timeZone: timeZone, snippetStore: SnippetStore(fileURL: nil))
     }
 
     func shutdown() {

@@ -18,18 +18,26 @@ final class NonActivatingCandidatePanel: NSPanel {
 ///
 /// Zero flicker: the panel is ordered front only on the hidden → visible transition, its
 /// frame is set only when it changes, and every layer change runs with actions disabled.
+///
+/// The same panel presents v-mode (`VModePresenting`): `VModePanelView` and the candidate
+/// view share one content host on the one backdrop, and exactly one of them is visible, so
+/// the v-mode menu and the candidate menu never overlap. Both place through the one
+/// `CaretPositionResolver` (one caret cache) at the same window level and screen bounds.
+/// `hide()` hides only the candidate menu and `hideVMode()` only v-mode; `hideAll()` both.
 @MainActor
-public final class CandidatePanelController: CandidatePresenting {
+public final class CandidatePanelController: CandidatePresenting, VModePresenting {
     /// A candidate was clicked: page index and the generation the panel showed.
     public var onSelectCandidate: (@MainActor (Int, UInt64) -> Void)?
     /// The panel was scrolled: `true` pages backward; the generation the panel showed.
     public var onChangePage: (@MainActor (Bool, UInt64) -> Void)?
+    /// A v-mode item was clicked: its index and the v-mode generation the panel showed.
+    public var onSelectVModeItem: (@MainActor (Int, UInt64) -> Void)?
 
     public var backdropMode: CandidatePanelStyle.BackdropMode {
         didSet {
             guard backdropMode != oldValue else { return }
             installBackdrop()
-            rerender()
+            rerenderCurrent()
         }
     }
 
@@ -37,12 +45,20 @@ public final class CandidatePanelController: CandidatePresenting {
     public private(set) var isVisible = false
     public private(set) var isExpanded = false
     public private(set) var currentLayout: CandidatePanelLayout?
+    /// The v-mode layout on screen; nil unless v-mode is shown.
+    public private(set) var currentVModeLayout: VModePanelLayout?
+    /// True while the panel shows v-mode rather than candidates.
+    public private(set) var isShowingVMode = false
 
     private let layoutEngine: CandidateLayoutEngine
     private var hysteresis: WidthHysteresis
     private var resolver: CaretPositionResolver
     private let panel: NonActivatingCandidatePanel
     private let candidateView: CandidatePanelView
+    private let vModeView: VModePanelView
+    private let vModeLayoutEngine: VModeLayoutEngine
+    /// Holds the candidate view and the v-mode view, each sized to its bounds.
+    private let contentHost = PanelContentHost()
     private var glassView: NSGlassEffectView?
     private var effectView: NSVisualEffectView?
     private var lastAppliedFrame: CGRect?
@@ -58,6 +74,16 @@ public final class CandidatePanelController: CandidatePresenting {
         let windowLevel: Int?
     }
     private var presentation: Presentation?
+
+    private struct VModePresentation {
+        let state: VModePanelState
+        let options: CandidatePresentationOptions
+        let caretRect: CGRect?
+        let clientKey: String
+        let windowLevel: Int?
+    }
+    private var vModePresentation: VModePresentation?
+    private var vModeScrollOffset: CGFloat = 0
     /// The mouse location a composition with no valid or cached caret is anchored to,
     /// sampled once per client and session so paging, scrolling, or expanding with the
     /// pointer over the panel never re-anchors it under that pointer. Cleared when a valid
@@ -75,6 +101,7 @@ public final class CandidatePanelController: CandidatePresenting {
     /// The pointer location sampled for the mouse fallback anchor.
     var mouseLocationProvider: @MainActor () -> CGPoint = { NSEvent.mouseLocation }
     var panelViewForTesting: CandidatePanelView { candidateView }
+    var vModeViewForTesting: VModePanelView { vModeView }
     var panelForTesting: NSPanel { panel }
 
     public init(style: CandidatePanelStyle = CandidatePanelStyle()) {
@@ -84,6 +111,11 @@ public final class CandidatePanelController: CandidatePresenting {
         hysteresis = WidthHysteresis(style: style)
         resolver = CaretPositionResolver(style: style)
         candidateView = CandidatePanelView(style: style)
+        vModeView = VModePanelView(style: style)
+        vModeLayoutEngine = VModeLayoutEngine(style: style)
+        contentHost.addSubview(candidateView)
+        contentHost.addSubview(vModeView)
+        vModeView.isHidden = true
 
         panel = NonActivatingCandidatePanel(
             contentRect: CGRect(x: 0, y: 0, width: style.minPanelWidth, height: 36),
@@ -110,6 +142,14 @@ public final class CandidatePanelController: CandidatePresenting {
             verticalScrollOffset = offset
             rerender(ensureHighlightVisible: false)
         }
+        vModeView.onSelectItem = { [weak self] index, generation in
+            self?.onSelectVModeItem?(index, generation)
+        }
+        vModeView.onScroll = { [weak self] offset, generation in
+            guard let self, generation == currentVModeLayout?.generationID else { return }
+            vModeScrollOffset = offset
+            rerenderVMode(ensureHighlightVisible: false)
+        }
         candidateView.onToggleExpand = { [weak self] in
             guard let self else { return }
             isExpanded.toggle()
@@ -127,6 +167,7 @@ public final class CandidatePanelController: CandidatePresenting {
             hide()
             return
         }
+        if isShowingVMode { leaveVMode() }
         // Index 0 of the marked text: the panel stays put while the caret moves inside it.
         let clientKey = client.uniqueClientIdentifier.flatMap { $0.isEmpty ? nil : $0 }
             ?? options.sessionToken?.uuidString ?? "default"
@@ -138,7 +179,15 @@ public final class CandidatePanelController: CandidatePresenting {
         rerender()
     }
 
+    /// Hides the candidate menu; a no-op while the panel shows v-mode.
     public func hide() {
+        guard !isShowingVMode else { return }
+        hideAll()
+    }
+
+    /// Hides the panel, whatever it shows. Idempotent.
+    public func hideAll() {
+        if isShowingVMode { leaveVMode() }
         if isVisible { panel.orderOut(nil) }
         isVisible = false
         isExpanded = false
@@ -149,6 +198,120 @@ public final class CandidatePanelController: CandidatePresenting {
         mouseFallbackAnchor = nil
         currentLayout = nil
         candidateView.reset()
+    }
+
+    // MARK: - VModePresenting
+
+    public func updateVMode(_ state: VModePanelState, client: any TextInputClient, options: CandidatePresentationOptions) {
+        if !isShowingVMode {
+            // The candidate menu's per-composition state ends; the panel and caret cache stay.
+            isExpanded = false
+            verticalScrollOffset = 0
+            hysteresis.reset()
+            presentation = nil
+            currentLayout = nil
+            candidateView.reset()
+            candidateView.isHidden = true
+            vModeView.isHidden = false
+            isShowingVMode = true
+        }
+        let clientKey = client.uniqueClientIdentifier.flatMap { $0.isEmpty ? nil : $0 }
+            ?? options.sessionToken?.uuidString ?? "default"
+        if vModePresentation.map({ Self.sameList($0.state, state) }) != true { vModeScrollOffset = 0 }
+        vModePresentation = VModePresentation(
+            state: state, options: options, caretRect: client.caretScreenRect(atUTF16Offset: 0), clientKey: clientKey,
+            windowLevel: client.windowLevel)
+        rerenderVMode()
+    }
+
+    /// Hides v-mode; a no-op while the panel shows candidates.
+    public func hideVMode() {
+        guard isShowingVMode else { return }
+        hideAll()
+    }
+
+    /// Switches the content host back to the candidate view and forgets v-mode.
+    private func leaveVMode() {
+        isShowingVMode = false
+        vModePresentation = nil
+        currentVModeLayout = nil
+        vModeScrollOffset = 0
+        vModeView.reset()
+        vModeView.isHidden = true
+        candidateView.isHidden = false
+    }
+
+    /// Whether two v-mode states show the same list (only the highlight may differ).
+    private static func sameList(_ a: VModePanelState, _ b: VModePanelState) -> Bool {
+        switch (a, b) {
+        case (.menu, .menu): true
+        case (.subMode(let t1, _, let h1, let r1, _, let p1, _), .subMode(let t2, _, let h2, let r2, _, let p2, _)):
+            t1 == t2 && h1 == h2 && r1 == r2 && p1 == p2
+        default: false
+        }
+    }
+
+    /// Lays out and places v-mode exactly as `rerender` does the candidates: bounded by the
+    /// target screen's visible frame, at the caret (cached caret, then a fixed mouse anchor).
+    private func rerenderVMode(ensureHighlightVisible: Bool = true) {
+        guard let presentation = vModePresentation else { return }
+        let screens = screensProvider()
+        let mouseLocation: CGPoint
+        if let saved = mouseFallbackAnchor, saved.clientKey == presentation.clientKey,
+            saved.sessionToken == presentation.options.sessionToken
+        {
+            mouseLocation = saved.location
+        } else {
+            mouseLocation = mouseLocationProvider()
+        }
+        guard let screen = resolver.targetScreen(
+            caretRect: presentation.caretRect, clientKey: presentation.clientKey, screens: screens,
+            fallbackMouseLocation: mouseLocation)
+        else {
+            hideAll()
+            return
+        }
+        let margins = 2 * style.screenMargin
+        let visible = screen.visibleFrame
+        let maxWidth = visible.width > margins + style.minPanelWidth ? visible.width - margins : visible.width
+        let maxHeight = visible.height > margins + 80 ? visible.height - margins : visible.height
+        let layout = vModeLayoutEngine.layout(
+            state: presentation.state, options: presentation.options, maxWidth: maxWidth, maxHeight: maxHeight,
+            verticalScrollOffset: vModeScrollOffset, ensureHighlightVisible: ensureHighlightVisible)
+        vModeScrollOffset = layout.verticalScrollOffset
+        guard let resolution = resolver.resolve(
+            caretRect: presentation.caretRect, clientKey: presentation.clientKey, panelSize: layout.panelSize,
+            screens: screens, fallbackMouseLocation: mouseLocation)
+        else {
+            hideAll()
+            return
+        }
+        mouseFallbackAnchor = resolution.usedMouseFallback
+            ? (presentation.clientKey, presentation.options.sessionToken, mouseLocation) : nil
+        currentVModeLayout = layout
+        let target = CGRect(origin: resolution.origin, size: layout.panelSize)
+        let level = Self.windowLevel(above: presentation.windowLevel)
+        if panel.level != level { panel.level = level }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if target != lastAppliedFrame {
+            let sizeChanged = lastAppliedFrame?.size != target.size
+            panel.setFrame(target, display: false)
+            if sizeChanged && backdropMode == .visualEffect { panel.invalidateShadow() }
+            lastAppliedFrame = target
+        }
+        glassView?.cornerRadius = layout.cornerRadius
+        effectView?.layer?.cornerRadius = layout.cornerRadius
+        contentHost.syncSubviewFrames()
+        vModeView.apply(layout)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        CATransaction.commit()
+
+        if !isVisible {
+            if shouldOrderFront { panel.orderFrontRegardless() }
+            isVisible = true
+        }
     }
 
     // MARK: - Rendering
@@ -212,6 +375,7 @@ public final class CandidatePanelController: CandidatePresenting {
         }
         glassView?.cornerRadius = layout.cornerRadius
         effectView?.layer?.cornerRadius = layout.cornerRadius
+        contentHost.syncSubviewFrames()
         candidateView.apply(layout)
         panel.contentView?.layoutSubtreeIfNeeded()
         CATransaction.commit()
@@ -232,10 +396,10 @@ public final class CandidatePanelController: CandidatePresenting {
     }
 
     private func installBackdrop() {
-        let radius = currentLayout?.cornerRadius ?? style.expandedCornerRadius
-        // Detach the view from the previous backdrop first.
+        let radius = currentVModeLayout?.cornerRadius ?? currentLayout?.cornerRadius ?? style.expandedCornerRadius
+        // Detach the host from the previous backdrop first.
         glassView?.contentView = nil
-        candidateView.removeFromSuperview()
+        contentHost.removeFromSuperview()
         glassView = nil
         effectView = nil
 
@@ -244,9 +408,9 @@ public final class CandidatePanelController: CandidatePresenting {
             let glass = NSGlassEffectView()
             glass.style = .regular
             glass.cornerRadius = radius
-            candidateView.translatesAutoresizingMaskIntoConstraints = true
-            candidateView.autoresizingMask = [.width, .height]
-            glass.contentView = candidateView
+            contentHost.translatesAutoresizingMaskIntoConstraints = true
+            contentHost.autoresizingMask = [.width, .height]
+            glass.contentView = contentHost
             glassView = glass
             panel.contentView = glass
             panel.hasShadow = false
@@ -258,19 +422,56 @@ public final class CandidatePanelController: CandidatePresenting {
             effect.wantsLayer = true
             effect.layer?.cornerRadius = radius
             effect.layer?.masksToBounds = true
-            candidateView.translatesAutoresizingMaskIntoConstraints = false
-            effect.addSubview(candidateView)
+            contentHost.translatesAutoresizingMaskIntoConstraints = false
+            effect.addSubview(contentHost)
             NSLayoutConstraint.activate([
-                candidateView.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-                candidateView.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-                candidateView.topAnchor.constraint(equalTo: effect.topAnchor),
-                candidateView.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+                contentHost.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+                contentHost.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+                contentHost.topAnchor.constraint(equalTo: effect.topAnchor),
+                contentHost.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
             ])
             effectView = effect
             panel.contentView = effect
             panel.hasShadow = true
         }
         candidateView.needsLayout = true
+        vModeView.needsLayout = true
         lastAppliedFrame = nil
+    }
+
+    /// Re-applies the shown content after a backdrop switch.
+    private func rerenderCurrent() {
+        if isShowingVMode { rerenderVMode() } else { rerender() }
+    }
+}
+
+/// The backdrop's content: the candidate view and the v-mode view, each always exactly the
+/// host's bounds (set explicitly, never by autoresizing deltas).
+@MainActor
+final class PanelContentHost: NSView {
+    override var isFlipped: Bool { true }
+
+    override func resizeSubviews(withOldSize oldSize: NSSize) {
+        syncSubviewFrames()
+    }
+
+    override func layout() {
+        super.layout()
+        syncSubviewFrames()
+    }
+
+    func syncSubviewFrames() {
+        for view in subviews where view.frame != bounds { view.frame = bounds }
+    }
+
+    /// Clicks go to whichever content view is visible.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let superview else { return nil }
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        for view in subviews.reversed() where !view.isHidden {
+            if let hit = view.hitTest(local) { return hit }
+        }
+        return nil
     }
 }
