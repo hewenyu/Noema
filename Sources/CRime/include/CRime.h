@@ -5,6 +5,7 @@
 // vendor-out/librime is produced by scripts/build/librime.sh.
 #include <stdbool.h>
 #include "../../../vendor-out/librime/include/rime_api.h"
+#include "../../../vendor-out/librime/include/rime_levers_api.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,8 +32,19 @@ int noema_rime_api_available(void);
 
 // True when the API table provides every member RimeEngine and noema-rime-deployer call: setup, deployment,
 // session lifecycle, key processing, candidate selection/paging, commit/context/status
-// readers with their free functions, and option get/set.
+// readers with their free functions, option get/set, and the raw input reader.
 bool noema_rime_engine_api_available(void);
+
+// The levers API of the merged `levers` module, or NULL when the module is not registered
+// or lacks a member Noema calls (`user_dict_iterator_*`, `export_user_dict`,
+// `import_user_dict`). The module's components exist only between `deployer_initialize` or
+// `initialize` and `finalize`. Noema never calls `backup_user_dict` or `restore_user_dict`:
+// they write into the process's working directory and report success on a corrupt userdb.
+RimeLeversApi *_Nullable noema_rime_get_levers_api(void);
+
+// The raw input of `session` (e.g. `nihao`), or NULL. The pointer is valid until the
+// session's next call; copy it before calling librime again.
+const char *_Nullable noema_rime_get_input(RimeSessionId session);
 
 #pragma clang assume_nonnull end
 
