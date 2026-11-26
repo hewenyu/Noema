@@ -169,6 +169,17 @@ import Testing
         #expect(locked.retryUnlock() == .ready)
         #expect(locked.items().map(\.id) == [saved.id] && locked.items(query: "lock").count == 1)
         #expect(try locked.content(id: saved.id) == .text("before the lock"))
+
+        // Codex PR #23 round 2: runtime keychain lock transitions `.ready` -> `.keychainLocked`,
+        // wipes `:memory:` FTS5 and refuses reads/writes until unlocked again.
+        keys.isLocked = true
+        #expect(locked.retryUnlock() == .keychainLocked)
+        #expect(locked.state == .keychainLocked && locked.items().isEmpty && locked.diagnostics.indexedRows == 0)
+        #expect(throws: ClipboardError.storeLocked) { try locked.insertText("after runtime lock", source: Self.source) }
+        #expect(throws: ClipboardError.storeLocked) { try locked.useContent(id: saved.id) }
+        keys.isLocked = false
+        #expect(locked.retryUnlock() == .ready)
+        #expect(locked.items(query: "lock").map(\.id) == [saved.id])
         locked.close()
     }
 
@@ -369,6 +380,31 @@ import Testing
         let reopened = try ClipboardStore(directory: dir.store, keyStore: InMemoryClipboardKeyStore(), now: t0 + 400 * 86_400)
         #expect(reopened.itemCount == 0)
         reopened.close()
+    }
+
+    /// Codex PR #23 round 2: an expired unpinned row cannot be read, pasted, marked used, or
+    /// pinned even before periodic `purgeExpired` runs.
+    @Test func expiredEntryCannotBeReadOrRevivedBeforePurge() throws {
+        let dir = try TemporaryDirectory()
+        defer { dir.cleanup() }
+        let store = try Self.open(dir, keys: InMemoryClipboardKeyStore())
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiredAt = t0 + 16 * 60
+        let tokenA = "token " + "sk" + "-" + String(repeating: "m", count: 20)
+        let tokenB = "token " + "sk" + "-" + String(repeating: "n", count: 20)
+        let tokenC = "token " + "sk" + "-" + String(repeating: "p", count: 20)
+        let tokenD = "token " + "sk" + "-" + String(repeating: "q", count: 20)
+        let a = try store.insertText(tokenA, source: nil, now: t0)
+        let b = try store.insertText(tokenB, source: nil, now: t0)
+        let c = try store.insertText(tokenC, source: nil, now: t0)
+        let d = try store.insertText(tokenD, source: nil, now: t0)
+
+        #expect(throws: ClipboardError.notFound(a.id)) { _ = try store.content(id: a.id, now: expiredAt) }
+        #expect(throws: ClipboardError.notFound(b.id)) { try store.markUsed(id: b.id, now: expiredAt) }
+        #expect(throws: ClipboardError.notFound(c.id)) { try store.setPinned(id: c.id, pinned: true, now: expiredAt) }
+        #expect(throws: ClipboardError.notFound(d.id)) { _ = try store.useContent(id: d.id, now: expiredAt) }
+        #expect(store.itemCount == 0, "rejected expired rows are deleted rather than left revivable")
+        store.close()
     }
 
     // MARK: Files

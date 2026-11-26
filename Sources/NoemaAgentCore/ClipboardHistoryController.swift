@@ -166,6 +166,13 @@ public final class ClipboardHistoryController {
         guard let store else { return }
         let log = log
         ingestQueue.async { [weak self] in
+            // Re-verify keychain availability before persisting: if the user locked the
+            // login keychain while running, transition immediately to `.keychainLocked`
+            // without writing and let `refreshStatus()` pause monitoring.
+            guard store.retryUnlock() == .ready else {
+                Task { @MainActor [weak self] in self?.refreshStatus() }
+                return
+            }
             do {
                 switch capture.payload {
                 case .text(let text):
@@ -197,14 +204,15 @@ public final class ClipboardHistoryController {
     }
 
     /// Writes entry `id` to the pasteboard (as Noema's own paste-back), then pastes it into
-    /// or reactivates `target`. A paste that falls back to copying shows a toast.
-    public func use(id: String, mode: PasteMode, target: ClipboardSourceApp?) async -> ClipboardPasteOutcome? {
-        guard let store, let content = try? store.content(id: id) else {
-            onToast("无法读取这条记录")
+    /// or reactivates `target`. Atomically rejects expired unpinned entries and locked-keychain
+    /// reads without touching the pasteboard or reviving their TTL.
+    public func use(id: String, mode: PasteMode, target: ClipboardSourceApp?, now: Date = Date()) async -> ClipboardPasteOutcome? {
+        guard let store, store.retryUnlock() == .ready, let content = try? store.useContent(id: id, now: now) else {
+            refreshStatus()
+            onToast("这条记录已过期或无法读取")
             return nil
         }
         monitor.writeSelfPaste(content)
-        try? store.markUsed(id: id)
         refreshStatus()
         let outcome: ClipboardPasteOutcome
         switch mode {
@@ -284,8 +292,12 @@ public final class ClipboardHistoryController {
             $0.monitor.setPaused(.screenLocked, false)
             $0.retryUnlock()
         }
+        observe(distributed, Notification.Name("com.apple.security.keychain.lock")) { $0.retryUnlock() }
         observe(workspace, NSWorkspace.willSleepNotification) { $0.monitor.setPaused(.sleeping, true) }
-        observe(workspace, NSWorkspace.didWakeNotification) { $0.monitor.setPaused(.sleeping, false) }
+        observe(workspace, NSWorkspace.didWakeNotification) {
+            $0.monitor.setPaused(.sleeping, false)
+            $0.retryUnlock()
+        }
         observe(workspace, NSWorkspace.didActivateApplicationNotification) { $0.isAccessibilityTrusted = $0.pasteService.isTrusted }
     }
 }

@@ -135,12 +135,25 @@ public final class ClipboardStore: @unchecked Sendable {
         return diagnosticsValue
     }
 
-    /// Asks the key store again; on success rebuilds the index.
+    /// Re-verifies master-key availability against the key store: unlocks and rebuilds the
+    /// `:memory:` search index when locked and now accessible; transitions to `.keychainLocked`
+    /// and wipes the derived cipher, previews, and `:memory:` index if the keychain was locked
+    /// while the store was running.
     @discardableResult
     public func retryUnlock() -> ClipboardStoreState {
         lock.lock()
         defer { lock.unlock() }
-        if cipher == nil, db != nil { unlockLocked() }
+        guard db != nil else { return .keychainLocked }
+        if cipher == nil {
+            unlockLocked()
+        } else {
+            do {
+                try keyStore.verifyMasterKeyAccess()
+            } catch {
+                lockLocked()
+                log.error("clipboard master key became unavailable: \(String(describing: error), privacy: .public)")
+            }
+        }
         return cipher == nil ? .keychainLocked : .ready
     }
 
@@ -164,11 +177,21 @@ public final class ClipboardStore: @unchecked Sendable {
         do {
             cipher = ClipboardCipher(masterKey: try keyStore.loadOrCreateMasterKey())
         } catch {
-            cipher = nil
+            lockLocked()
             log.error("clipboard master key unavailable: \(String(describing: error), privacy: .public)")
             return
         }
         hydrateLocked()
+    }
+
+    /// Drops all in-memory key material, decrypted previews, and `:memory:` FTS5 tokens when
+    /// the keychain locks at runtime.
+    private func lockLocked() {
+        cipher = nil
+        previews = [:]
+        unreadable = []
+        if let index { _ = try? Self.exec(index, "DELETE FROM clip_fts") }
+        diagnosticsValue.indexedRows = 0
     }
 
     // MARK: Writing
@@ -270,31 +293,38 @@ public final class ClipboardStore: @unchecked Sendable {
     }
 
     /// Marks an entry used (pasted or copied back): newest in the list, TTL restarted.
+    /// Rejects (and deletes) unpinned entries that have already expired as of `now`.
     public func markUsed(id: String, now: Date = Date()) throws(ClipboardError) {
         lock.lock()
         defer { lock.unlock() }
-        let (db, _, _) = try ready()
-        let statement = try Self.prepare(db, """
-            UPDATE clipboard_items SET last_used_at = ?2,
-              expires_at = CASE WHEN pinned = 1 THEN NULL
-                WHEN sensitivity = 'sensitive' THEN ?2 + ?3 ELSE ?2 + ?4 END
-            WHERE id = ?1
-            """)
-        defer { sqlite3_finalize(statement) }
-        bindTimes(statement, id: id, now: now)
-        try Self.stepDone(db, statement)
-        guard sqlite3_changes(db) > 0 else { throw .notFound(id) }
+        let (db, index, _) = try ready()
+        try rejectIfExpiredLocked(db, index, id: id, now: now)
+        try markUsedLocked(db, id: id, now: now)
+    }
+
+    /// Atomically verifies `id` has not expired as of `now`, decrypts its payload, and
+    /// updates `last_used_at`/`expires_at` under one lock acquisition so an expired entry
+    /// can never be pasted back or revived between a read and a mark-used call.
+    public func useContent(id: String, now: Date = Date()) throws(ClipboardError) -> ClipboardEntryContent {
+        lock.lock()
+        defer { lock.unlock() }
+        let (db, index, cipher) = try ready()
+        try rejectIfExpiredLocked(db, index, id: id, now: now)
+        let content = try contentLocked(db, cipher, id: id)
+        try markUsedLocked(db, id: id, now: now)
+        return content
     }
 
     public func setPinned(id: String, pinned: Bool, now: Date = Date()) throws(ClipboardError) {
         lock.lock()
         defer { lock.unlock() }
-        let (db, _, _) = try ready()
+        let (db, index, _) = try ready()
+        try rejectIfExpiredLocked(db, index, id: id, now: now)
         let statement = try Self.prepare(db, """
             UPDATE clipboard_items SET pinned = ?5,
               expires_at = CASE WHEN ?5 = 1 THEN NULL
                 WHEN sensitivity = 'sensitive' THEN ?2 + ?3 ELSE ?2 + ?4 END
-            WHERE id = ?1
+            WHERE id = ?1 AND (pinned = 1 OR expires_at IS NULL OR expires_at > ?2)
             """)
         defer { sqlite3_finalize(statement) }
         bindTimes(statement, id: id, now: now)
@@ -387,37 +417,21 @@ public final class ClipboardStore: @unchecked Sendable {
         return try metadataLocked(db, id: id)
     }
 
-    /// The decrypted payload of `id`.
-    public func content(id: String) throws(ClipboardError) -> ClipboardEntryContent {
+    /// The decrypted payload of `id`; rejects (and deletes) unpinned entries expired as of `now`.
+    public func content(id: String, now: Date = Date()) throws(ClipboardError) -> ClipboardEntryContent {
         lock.lock()
         defer { lock.unlock() }
-        let (db, _, cipher) = try ready()
-        let statement = try Self.prepare(db, """
-            SELECT i.kind, i.dedup_hmac, i.encrypted_payload, i.blob_sha256, b.width, b.height
-            FROM clipboard_items i LEFT JOIN image_blobs b ON b.sha256 = i.blob_sha256 WHERE i.id = ?1
-            """)
-        defer { sqlite3_finalize(statement) }
-        Self.bind(statement, 1, id)
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw .notFound(id) }
-        let dedup = Self.columnString(statement, 1) ?? ""
-        if Self.columnString(statement, 0) == ClipboardItemKind.text.rawValue {
-            guard let sealed = Self.columnData(statement, 2) else { throw .decryptionFailed }
-            return .text(try cipher.openText(sealed, id: id, dedupHMAC: dedup))
-        }
-        guard let digest = Self.columnString(statement, 3), digest == dedup else { throw .decryptionFailed }
-        let png = try cipher.openBlob(try blobs.read(digest: digest, thumbnail: false), digest: digest, thumbnail: false)
-        guard cipher.dedupHMAC(kind: .image, payload: png) == digest else { throw .decryptionFailed }
-        let thumbnail = try cipher.openBlob(try blobs.read(digest: digest, thumbnail: true), digest: digest, thumbnail: true)
-        return .image(
-            pngData: png, thumbnailData: thumbnail, width: Int(sqlite3_column_int64(statement, 4)),
-            height: Int(sqlite3_column_int64(statement, 5)))
+        let (db, index, cipher) = try ready()
+        try rejectIfExpiredLocked(db, index, id: id, now: now)
+        return try contentLocked(db, cipher, id: id)
     }
 
-    /// The decrypted PNG thumbnail of image entry `id`.
-    public func thumbnail(id: String) throws(ClipboardError) -> Data {
+    /// The decrypted PNG thumbnail of image entry `id`; rejects expired unpinned entries.
+    public func thumbnail(id: String, now: Date = Date()) throws(ClipboardError) -> Data {
         lock.lock()
         defer { lock.unlock() }
-        let (db, _, cipher) = try ready()
+        let (db, index, cipher) = try ready()
+        try rejectIfExpiredLocked(db, index, id: id, now: now)
         let digests = try Self.strings(db, "SELECT blob_sha256 FROM clipboard_items WHERE id = ?1 AND blob_sha256 IS NOT NULL", id)
         guard let digest = digests.first else { throw .notFound(id) }
         return try cipher.openBlob(try blobs.read(digest: digest, thumbnail: true), digest: digest, thumbnail: true)
@@ -444,6 +458,60 @@ public final class ClipboardStore: @unchecked Sendable {
         guard let db, let index else { throw .closed }
         guard let cipher else { throw .storeLocked }
         return (db, index, cipher)
+    }
+
+    /// Verifies `id` exists and, if unpinned, has not expired as of `now`. If an unpinned
+    /// row's TTL has already elapsed, deletes it immediately and throws `.notFound(id)`.
+    private func rejectIfExpiredLocked(
+        _ db: OpaquePointer, _ index: OpaquePointer, id: String, now: Date
+    ) throws(ClipboardError) {
+        let statement = try Self.prepare(db, "SELECT pinned, expires_at FROM clipboard_items WHERE id = ?1")
+        defer { sqlite3_finalize(statement) }
+        Self.bind(statement, 1, id)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw .notFound(id) }
+        let pinned = sqlite3_column_int64(statement, 0) != 0
+        if !pinned, sqlite3_column_type(statement, 1) != SQLITE_NULL {
+            let expiresAt = sqlite3_column_double(statement, 1)
+            if expiresAt <= now.timeIntervalSince1970 {
+                try deleteRowsLocked(db, index, ids: [id])
+                throw .notFound(id)
+            }
+        }
+    }
+
+    private func markUsedLocked(_ db: OpaquePointer, id: String, now: Date) throws(ClipboardError) {
+        let statement = try Self.prepare(db, """
+            UPDATE clipboard_items SET last_used_at = ?2,
+              expires_at = CASE WHEN pinned = 1 THEN NULL
+                WHEN sensitivity = 'sensitive' THEN ?2 + ?3 ELSE ?2 + ?4 END
+            WHERE id = ?1 AND (pinned = 1 OR expires_at IS NULL OR expires_at > ?2)
+            """)
+        defer { sqlite3_finalize(statement) }
+        bindTimes(statement, id: id, now: now)
+        try Self.stepDone(db, statement)
+        guard sqlite3_changes(db) > 0 else { throw .notFound(id) }
+    }
+
+    private func contentLocked(_ db: OpaquePointer, _ cipher: ClipboardCipher, id: String) throws(ClipboardError) -> ClipboardEntryContent {
+        let statement = try Self.prepare(db, """
+            SELECT i.kind, i.dedup_hmac, i.encrypted_payload, i.blob_sha256, b.width, b.height
+            FROM clipboard_items i LEFT JOIN image_blobs b ON b.sha256 = i.blob_sha256 WHERE i.id = ?1
+            """)
+        defer { sqlite3_finalize(statement) }
+        Self.bind(statement, 1, id)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw .notFound(id) }
+        let dedup = Self.columnString(statement, 1) ?? ""
+        if Self.columnString(statement, 0) == ClipboardItemKind.text.rawValue {
+            guard let sealed = Self.columnData(statement, 2) else { throw .decryptionFailed }
+            return .text(try cipher.openText(sealed, id: id, dedupHMAC: dedup))
+        }
+        guard let digest = Self.columnString(statement, 3), digest == dedup else { throw .decryptionFailed }
+        let png = try cipher.openBlob(try blobs.read(digest: digest, thumbnail: false), digest: digest, thumbnail: false)
+        guard cipher.dedupHMAC(kind: .image, payload: png) == digest else { throw .decryptionFailed }
+        let thumbnail = try cipher.openBlob(try blobs.read(digest: digest, thumbnail: true), digest: digest, thumbnail: true)
+        return .image(
+            pngData: png, thumbnailData: thumbnail, width: Int(sqlite3_column_int64(statement, 4)),
+            height: Int(sqlite3_column_int64(statement, 5)))
     }
 
     private func configure(_ db: OpaquePointer) throws(ClipboardError) {

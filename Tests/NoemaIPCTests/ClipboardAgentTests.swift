@@ -472,6 +472,93 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         history.shutdown()
     }
 
+    /// Codex PR #23 round 2 (Finding #1): locking the keychain while running transitions the
+    /// ready store to `.keychainLocked`, pauses monitoring, drops open-panel caches, and
+    /// refuses new captures until unlocked again.
+    @Test func runtimeKeychainLockPausesCaptureAndClearsOpenPanel() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "noema-clip-lock-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let keys = InMemoryClipboardKeyStore(isLocked: false)
+        let store = try ClipboardStore(directory: root.appending(path: "clipboard", directoryHint: .isDirectory), keyStore: keys)
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        _ = try store.insertText("captured while unlocked", source: nil)
+        let controller = ClipboardPanelController(history: history, frontmost: { nil })
+        controller.shouldOrderFront = false
+        controller.show()
+        #expect(controller.model.items.count == 1)
+
+        // Keychain locks at runtime; re-verification drops cipher/index and pauses monitoring.
+        keys.isLocked = true
+        history.retryUnlock()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(store.state == .keychainLocked && history.storeState == .keychainLocked)
+        #expect(history.monitor.pauseReasons.contains(.keychainLocked))
+        #expect(controller.model.items.isEmpty)
+
+        pasteboard.copy("copied while keychain locked")
+        history.monitor.poll()
+        history.waitForIngest()
+        #expect(pasteboard.payloadReads == 0 && store.itemCount == 1)
+
+        // Unlocking recovers history and unpauses monitoring.
+        keys.isLocked = false
+        history.retryUnlock()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(store.state == .ready && !history.monitor.pauseReasons.contains(.keychainLocked))
+        #expect(controller.model.items.count == 1)
+
+        // Even without an explicit `retryUnlock()` call, locking before a capture prevents persistence.
+        keys.isLocked = true
+        pasteboard.copy("copied after silent keychain lock")
+        history.monitor.poll()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(store.state == .keychainLocked && store.itemCount == 1 && history.monitor.pauseReasons.contains(.keychainLocked))
+
+        controller.hide(restoreFocus: false)
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 2 (Finding #2): an entry whose short sensitive TTL elapses before
+    /// periodic purge runs cannot be pasted or revived from a still-open panel.
+    @Test func expiredEntryInOpenPanelCannotBeUsedOrRevivedBeforePurge() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "noema-clip-ttl-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let quota = ClipboardStorageQuota(sensitiveTTLSeconds: 0.1)
+        let store = try ClipboardStore(
+            directory: root.appending(path: "clipboard", directoryHint: .isDirectory),
+            keyStore: InMemoryClipboardKeyStore(), quota: quota)
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        let shortToken = "token " + "sk" + "-" + String(repeating: "e", count: 22)
+        let entry = try store.insertText(shortToken, source: nil)
+        let controller = ClipboardPanelController(history: history, frontmost: { nil })
+        controller.shouldOrderFront = false
+        controller.show()
+        #expect(controller.model.selected?.id == entry.id)
+
+        // Wait past the 100 ms sensitive TTL without calling `purgeExpired`.
+        try await Task.sleep(for: .milliseconds(220))
+        let outcome = await history.use(id: entry.id, mode: .copyOnly, target: nil)
+        #expect(outcome == nil, "expired entry must not be pasted or copied")
+        #expect(pasteboard.writes.isEmpty, "expired content must never reach the pasteboard")
+        #expect(store.itemCount == 0, "expired entry must not be revived")
+        #expect(controller.model.items.isEmpty)
+
+        controller.hide(restoreFocus: false)
+        history.shutdown()
+    }
+
     @Test func sectionsFollowTheCalendar() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         var calendar = Calendar(identifier: .gregorian)

@@ -224,6 +224,7 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
 
     private let panel: ClipboardPanel
     private let frontmost: @MainActor () -> ClipboardSourceApp?
+    private var expiryTask: Task<Void, Never>?
 
     init(history: ClipboardHistoryController?, frontmost: @escaping @MainActor () -> ClipboardSourceApp? = ClipboardPanelController.currentFrontmost) {
         model = ClipboardPanelModel(history: history)
@@ -294,6 +295,7 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
         model.reload()
         model.openGeneration &+= 1
         isVisible = true
+        scheduleNextExpiryRefresh()
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         if let visible = screen?.visibleFrame {
             let size = Self.panelSize
@@ -309,6 +311,8 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
     public func hide(restoreFocus: Bool) {
         guard isVisible else { return }
         isVisible = false
+        expiryTask?.cancel()
+        expiryTask = nil
         panel.orderOut(nil)
         model.clearCaches()
         model.showsActions = false
@@ -325,8 +329,29 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
     private func handleHistoryChange() {
         if isVisible {
             model.reload()
+            scheduleNextExpiryRefresh()
         } else {
             model.clearCaches()
+        }
+    }
+
+    /// Wakes once when the earliest visible unpinned entry reaches its TTL so an open panel
+    /// drops expired entries and their cached previews immediately without waiting for the
+    /// 5-minute background purge.
+    private func scheduleNextExpiryRefresh() {
+        expiryTask?.cancel()
+        expiryTask = nil
+        guard isVisible else { return }
+        let now = Date()
+        guard let earliest = model.items.compactMap(\.expiresAt).min() else { return }
+        let delay = max(0.05, earliest.timeIntervalSince(now) + 0.05)
+        // Cap single sleep at 1 hour so distant 30-day TTLs don't overflow Duration.
+        let clamped = min(delay, 3600)
+        expiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(clamped))
+            guard !Task.isCancelled, let self, self.isVisible else { return }
+            self.model.reload()
+            self.scheduleNextExpiryRefresh()
         }
     }
 

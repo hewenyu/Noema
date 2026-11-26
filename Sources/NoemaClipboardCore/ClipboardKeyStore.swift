@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import os
 import Security
 
@@ -8,6 +9,16 @@ public protocol ClipboardKeyStore: Sendable {
     /// The existing key, or a new one when none exists. Throws `.keychainLocked` when the
     /// keychain refuses access; an implementation never replaces an existing key then.
     func loadOrCreateMasterKey() throws(ClipboardError) -> SymmetricKey
+
+    /// Non-interactively verifies that the master key is still readable (e.g. after a
+    /// runtime keychain lock). Implementations must never create or replace a key here.
+    func verifyMasterKeyAccess() throws(ClipboardError)
+}
+
+public extension ClipboardKeyStore {
+    func verifyMasterKeyAccess() throws(ClipboardError) {
+        _ = try loadOrCreateMasterKey()
+    }
 }
 
 /// The `SecItem` calls `KeychainClipboardKeyStore` makes; tests substitute a fake so they
@@ -75,11 +86,22 @@ public struct KeychainClipboardKeyStore: ClipboardKeyStore {
         }
     }
 
+    public func verifyMasterKeyAccess() throws(ClipboardError) {
+        guard (try read(allowUI: false)) != nil else { throw .keychainFailure(errSecItemNotFound) }
+    }
+
     /// The stored key, nil only for `errSecItemNotFound`.
-    private func read() throws(ClipboardError) -> SymmetricKey? {
+    private func read(allowUI: Bool = true) throws(ClipboardError) -> SymmetricKey? {
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        if !allowUI {
+            // Non-interactive runtime probe: fail with `errSecInteractionNotAllowed` when
+            // locked instead of presenting a modal unlock sheet in the background.
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
+        }
         let (status, data) = backend.copyMatching(query)
         switch status {
         case errSecSuccess:
