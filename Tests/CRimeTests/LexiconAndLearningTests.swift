@@ -589,6 +589,43 @@ extension LibrimeSerializedTests {
             #expect(!candidates(engine, "shi").contains("椒"))
         }
 
+        /// `noema_learned.lua` only serves the primary pinyin segment (`abc`, including schemas
+        /// that attach `abc_segmentor/extra_tags`), never reverse-lookup or recognizer segments
+        /// in the same full-pinyin schema (Codex #4711133526). Switching without `learningStore`
+        /// and then exporting TSV-only phrases verifies the pure Lua path (userdb stays empty).
+        @Test func learnedTranslatorDoesNotPolluteReverseLookupSegments() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addReverseLookupSchema(in: .mint)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let report = try await engine.switchSchemaSet(
+                to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: "mint_reverse",
+                learningStore: nil, luaFile: LexiconWorkspace.lua)
+            #expect(engine.currentState.schemaID == "mint_reverse" && report.isMandarinPinyinSchema)
+            // Positive-control baseline: none of these out-of-dict phrases exist before TSV export.
+            #expect(!candidates(engine, "shi").contains("弑"))
+            #expect(!candidates(engine, "nihao").contains("霓昊"))
+
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([
+                LearningCommitEvent(rawInput: "shi", preedit: "shi", text: "弑"),
+                LearningCommitEvent(rawInput: "wo", preedit: "wo", text: "斡"),
+                LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊"),
+            ]) == 3)
+            #expect(engine.refreshLearnedPhrases(from: store) == 3)
+            engine.resetSession()
+
+            let uwshi = candidates(engine, "Uwshi")
+            #expect(uwshi.contains("椒") && !uwshi.contains("弑"), "noema_learned.lua polluted Uwshi: \(uwshi)")
+            let uwwo = candidates(engine, "Uwwo")
+            #expect(uwwo.contains("伙") && !uwwo.contains("斡"), "noema_learned.lua polluted Uwwo: \(uwwo)")
+            let backtickWo = candidates(engine, "`wo")
+            #expect(backtickWo.contains("伙") && !backtickWo.contains("斡"), "noema_learned.lua polluted `wo: \(backtickWo)")
+            #expect(candidates(engine, "shi").contains("弑"), "noema_learned.lua missed primary shi")
+            #expect(candidates(engine, "nihao").contains("霓昊"), "noema_learned.lua missed primary nihao")
+        }
+
         /// A `translator/dictionary` with a dot and no `translator/user_dict` names the userdb
         /// by its language component, as librime does (Codex #4710447107): `dotted_dict` over
         /// `noema_pinyin.extra` opens `noema_pinyin.userdb`, which the guardian fills, checks,
@@ -1519,6 +1556,7 @@ final class LexiconWorkspace {
               patterns:
                 wubi98_mint: "Uw[a-z]*'?$"
                 backtick_lookup: "^`[a-z]*'?$"
+                wubi98_mint_extra: "^__never__$"
                 uppercase: ""
 
             wubi98_mint:
@@ -1534,6 +1572,10 @@ final class LexiconWorkspace {
               enable_user_dict: false
               prefix: "`"
               tips: 〔反查〕
+
+            abc_segmentor:
+              extra_tags:
+                - wubi98_mint_extra
 
             """)
     }

@@ -253,12 +253,76 @@ local function is_full_pinyin_schema(env)
   return ok and result == true
 end
 
+-- Primary tag of the main `script_translator` (default `"abc"`). Only segments carrying
+-- this tag and none of the schema's secondary tags (reverse lookup, recognizer, punct)
+-- receive learned full-pinyin candidates.
+local function primary_tag(env)
+  local config = env.engine and env.engine.schema and env.engine.schema.config
+  local tag = config and config:get_string("translator/tag") or nil
+  if not tag or tag == "" then return "abc" end
+  return tag
+end
+
+local function secondary_tags(env, primary)
+  local tags = {}
+  local seen = { [primary] = true, paging = true }
+  local function add(tag)
+    if tag and tag ~= "" and not seen[tag] then
+      seen[tag] = true
+      tags[#tags + 1] = tag
+    end
+  end
+  local config = env.engine and env.engine.schema and env.engine.schema.config
+  if config then
+    -- Tags attached to primary `abc` segments via `abc_segmentor/extra_tags` (such as
+    -- `melt_eng` or `custom_phrase` in rime-ice/mint) legitimately coexist with `abc`.
+    pcall(function()
+      local extra = config:get_list("abc_segmentor/extra_tags")
+      if extra then
+        for index = 0, extra.size - 1 do
+          local item = extra:get_value_at(index)
+          local tag = item and item.value or ""
+          if tag ~= "" then seen[tag] = true end
+        end
+      end
+    end)
+  end
+  add("punct")
+  add("reverse_lookup")
+  if not config then return tags end
+  pcall(function()
+    add(config:get_string("reverse_lookup/tag"))
+    for _, list_key in ipairs({ "engine/translators", "engine/segmentors" }) do
+      local list = config:get_list(list_key)
+      if list then
+        for index = 0, list.size - 1 do
+          local item = list:get_value_at(index)
+          local name = item and item.value or ""
+          local ns = name:match("@([^@]+)$")
+          if ns then ns = ns:gsub("^%*", "") end
+          if ns and ns ~= "" and ns ~= "noema_learned" then
+            add(ns)
+            add(config:get_string(ns .. "/tag"))
+          end
+        end
+      end
+    end
+    local patterns = config:get_map("recognizer/patterns")
+    if patterns and patterns.keys then
+      for _, key in ipairs(patterns:keys()) do add(key) end
+    end
+  end)
+  return tags
+end
+
 local translator = {}
 
 function translator.init(env)
   env.map = {}
   env.enabled = is_full_pinyin_schema(env)
   if not env.enabled then return end
+  env.primary_tag = primary_tag(env)
+  env.secondary_tags = secondary_tags(env, env.primary_tag)
   env.delimiters = delimiter_set(env)
   env.path = tsv_path()
   env.size = nil
@@ -268,6 +332,10 @@ end
 
 function translator.func(input, seg, env)
   if not env.enabled then return end
+  if not seg or not seg.has_tag or not seg:has_tag(env.primary_tag) then return end
+  for _, tag in ipairs(env.secondary_tags) do
+    if seg:has_tag(tag) then return end
+  end
   refresh(env, false)
   local key = lookup_key(input, env.delimiters)
   if key == "" then return end
