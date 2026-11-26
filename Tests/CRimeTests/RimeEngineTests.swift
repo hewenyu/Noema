@@ -913,7 +913,9 @@ extension RimeEngine {
 /// A throwaway user/log directory pair over the shipped `Resources/rime-default`
 /// (or a copy holding only `sharedFiles`). Removed on deinit.
 final class EngineWorkspace {
-    static let shippedFiles = ["default.yaml", "noema_pinyin.schema.yaml", "noema_pinyin.dict.yaml"]
+    static let shippedFiles = [
+        "default.yaml", "noema_pinyin.schema.yaml", "noema_pinyin.dict.yaml", "opencc/noema_emoji.json", "opencc/noema_emoji.txt",
+    ]
     static let shippedSharedData = URL(filePath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         .appending(path: "Resources/rime-default")
@@ -932,7 +934,9 @@ final class EngineWorkspace {
             shared = root.appending(path: "shared")
             try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
             for name in sharedFiles {
-                try FileManager.default.copyItem(at: Self.shippedSharedData.appending(path: name), to: shared.appending(path: name))
+                let target = shared.appending(path: name)
+                try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.copyItem(at: Self.shippedSharedData.appending(path: name), to: target)
             }
         } else {
             shared = Self.shippedSharedData

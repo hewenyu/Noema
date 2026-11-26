@@ -1774,6 +1774,8 @@ final class LexiconWorkspace {
             try write(defaults.replacingOccurrences(of: "  - schema: noema_pinyin", with: "  - schema: \(fixture.schemaID)"), "default.yaml", in: fixture.set)
             var schema = try String(contentsOf: Self.builtin.appending(path: "noema_pinyin.schema.yaml"), encoding: .utf8)
             schema = schema.replacingOccurrences(of: "schema_id: noema_pinyin", with: "schema_id: \(fixture.schemaID)")
+            // Third-party sets ship no `noema_emoji` OpenCC data: no emoji filter.
+            schema = schema.replacingOccurrences(of: "    - simplifier@emoji_suggestion\n", with: "")
             var translator = "  dictionary: \(fixture.schemaID)"
             if let prism = fixture.prism { translator += "\n  prism: \(prism)" }
             schema = schema.replacingOccurrences(of: "  dictionary: noema_pinyin", with: translator)
@@ -2124,8 +2126,7 @@ final class LexiconWorkspace {
             try (text + "汉语\than yu\t100000\n").write(to: dictionaryURL, atomically: true, encoding: .utf8)
         }
         // The shipped schema already lists `uniquifier`; `simplifier@cc` runs before it.
-        try replace(in: set, "\(schemaID).schema.yaml", "  filters:\n    - uniquifier\n", with: """
-              filters:
+        try replace(in: set, "\(schemaID).schema.yaml", "    - uniquifier\n", with: """
                 - simplifier@cc
                 - uniquifier
 

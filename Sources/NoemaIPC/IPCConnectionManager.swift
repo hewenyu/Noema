@@ -908,6 +908,8 @@ extension IMEToAgent {
             return .engineModeChanged(sessionEpoch: epoch, engineMode: mode)
         case .schemaSwitchStatus(_, let status):
             return .schemaSwitchStatus(sessionEpoch: epoch, status: status)
+        case .quickActionRequested(_, let action):
+            return .quickActionRequested(sessionEpoch: epoch, action: action)
         }
     }
 
@@ -916,7 +918,8 @@ extension IMEToAgent {
         switch self {
         case .compositionStateChanged, .engineModeChanged: true
         // Every phase of a switch reaches the agent, in order.
-        case .hello, .heartbeat, .openSettingsRequested, .schemaSwitchStatus: false
+        // Every quick action the user picked reaches the agent.
+        case .hello, .heartbeat, .openSettingsRequested, .schemaSwitchStatus, .quickActionRequested: false
         }
     }
 }

@@ -620,6 +620,11 @@ use_preset_vocabulary: false
 史	li	10
 束	shu	10
 纪	ji	10
+哈	ha	100
+咖	ka	100
+咪	mi	100
+赞	zan	100
+足	zu	100
 你好	ni hao	1000
 你们	ni men	600
 我们	wo men	800
@@ -707,3 +712,31 @@ use_preset_vocabulary: false
 晚上	wan shang	600
 下午	xia wu	500
 上午	shang wu	500
+开心	kai xin	600
+哈哈	ha ha	600
+加油	jia you	600
+再见	zai jian	600
+点赞	dian zan	500
+咖啡	ka fei	500
+蛋糕	dan gao	500
+火箭	huo jian	400
+晚安	wan an	500
+早安	zao an	500
+生日	sheng ri	600
+礼物	li wu	500
+音乐	yin yue	600
+电影	dian ying	600
+爱心	ai xin	400
+太阳	tai yang	500
+月亮	yue liang	500
+星星	xing xing	400
+下雨	xia yu	500
+猫咪	mao mi	400
+小狗	xiao gou	400
+啤酒	pi jiu	400
+足球	zu qiu	400
+恭喜	gong xi	500
+庆祝	qing zhu	400
+生气	sheng qi	500
+拥抱	yong bao	400
+飞机	fei ji	500

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Verify assembled Noema bundles.
 #
-#   NoemaIME.app: layout (rime-default, rime-lua/noema_learned.lua), IMKit Info.plist
+#   NoemaIME.app: layout (rime-default with opencc/noema_emoji.{json,txt} byte for byte,
+#     rime-lua/noema_learned.lua), IMKit Info.plist
 #     keys, Mach-O linkage of MacOS/NoemaIME (system SQLite included),
 #     MacOS/noema-rime-deployer, and Frameworks/librime.1.dylib, code signatures (signing
 #     Identifier dev.noema.inputmethod.NoemaIME) and empty signed entitlements, and real launches that report the packaged version, load
@@ -164,6 +165,15 @@ verify_ime() {
   for file in default.yaml noema_pinyin.schema.yaml noema_pinyin.dict.yaml; do
     [[ -f "${CONTENTS}/Resources/rime-default/${file}" && ! -L "${CONTENTS}/Resources/rime-default/${file}" ]] \
       || bad "missing regular file: Contents/Resources/rime-default/${file}"
+  done
+  # The built-in schema's OpenCC emoji filter, byte for byte the checked-in files.
+  for file in opencc/noema_emoji.json opencc/noema_emoji.txt; do
+    if [[ -f "${CONTENTS}/Resources/rime-default/${file}" && ! -L "${CONTENTS}/Resources/rime-default/${file}" ]]; then
+      cmp -s "${CONTENTS}/Resources/rime-default/${file}" "${REPO_ROOT}/Resources/rime-default/${file}" \
+        || bad "Contents/Resources/rime-default/${file} differs from Resources/rime-default/${file}"
+    else
+      bad "missing regular file: Contents/Resources/rime-default/${file}"
+    fi
   done
   # The learned-phrase translator, byte for byte the checked-in one.
   local lua="${CONTENTS}/Resources/rime-lua/noema_learned.lua"

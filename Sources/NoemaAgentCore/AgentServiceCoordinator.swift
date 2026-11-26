@@ -35,6 +35,10 @@ public struct AgentServiceSnapshot: Sendable, Hashable {
     /// The switch `requestSchemaSetSwitch` sent last, and how many peers it reached.
     public var lastSchemaSwitchRequest: SchemaSetSwitchRequest?
     public var lastSchemaSwitchRecipients = 0
+    /// The latest v-mode quick action an IME asked for, on its current epoch.
+    public var lastQuickAction: QuickActionID?
+    /// Quick actions received on a current epoch.
+    public var quickActionCount = 0
 
     public init() {}
 }
@@ -42,7 +46,8 @@ public struct AgentServiceSnapshot: Sendable, Hashable {
 /// The agent side of the IME connection. Owns an `IPCServerTransport`, answers `hello`
 /// with `helloAck` and `heartbeat` with `heartbeatAck` (echoing the IME's epoch and
 /// generation), records composition metadata and schema-switch progress, forwards
-/// `openSettingsRequested`, and pushes settings, suggestions, and schema-set switches.
+/// `openSettingsRequested` and `quickActionRequested` (the latter only on the peer's
+/// current epoch), and pushes settings, suggestions, and schema-set switches.
 public final class AgentServiceCoordinator: @unchecked Sendable {
     private struct Peer {
         var epoch: UUID?
@@ -60,6 +65,7 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
     public let agentVersion: String
     private let transport: any IPCServerTransport
     private let onOpenSettings: @Sendable (SettingsSectionID?) -> Void
+    private let onQuickAction: @Sendable (QuickActionID) -> Void
     private let onChange: @Sendable (AgentServiceSnapshot) -> Void
     private let state: OSAllocatedUnfairLock<State>
     private let log = NoemaLog.agent("service")
@@ -69,11 +75,13 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
         agentVersion: String,
         settings: AgentSettingsSnapshot = .defaults,
         onOpenSettings: @escaping @Sendable (SettingsSectionID?) -> Void = { _ in },
+        onQuickAction: @escaping @Sendable (QuickActionID) -> Void = { _ in },
         onChange: @escaping @Sendable (AgentServiceSnapshot) -> Void = { _ in }
     ) {
         self.transport = transport
         self.agentVersion = agentVersion
         self.onOpenSettings = onOpenSettings
+        self.onQuickAction = onQuickAction
         self.onChange = onChange
         var initial = State()
         initial.snapshot.settings = settings
@@ -185,6 +193,7 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
             return nil
         }
         var openSection: SettingsSectionID??
+        var quickAction: QuickActionID?
         let reply = update { state -> AgentToIME? in
             state.snapshot.framesHandled += 1
             if let identity { state.snapshot.lastPeerIdentity = identity }
@@ -223,9 +232,16 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
                 guard epoch == info.epoch else { return nil }
                 state.snapshot.lastSchemaSwitchStatus = status
                 return nil
+            case .quickActionRequested(let epoch, let action):
+                guard epoch == info.epoch else { return nil }
+                state.snapshot.lastQuickAction = action
+                state.snapshot.quickActionCount += 1
+                quickAction = action
+                return nil
             }
         }
         if let section = openSection { onOpenSettings(section) }
+        if let quickAction { onQuickAction(quickAction) }
         guard let reply else { return nil }
         let sequence = update { state -> UInt64 in
             state.sequence += 1
@@ -270,6 +286,9 @@ public final class AgentStatusModel {
     public var lastLaunchAgentError: String?
     /// The "词库" section's model; the agent sets it once its IPC service exists.
     public var lexicon: LexiconController?
+    /// Pushes changed settings to every IME (`AgentServiceCoordinator.updateSettings`); the
+    /// agent sets it once its IPC service exists.
+    @ObservationIgnored public var settingsUpdater: (@MainActor (AgentSettingsSnapshot) -> Void)?
     public let agentVersion: String
     @ObservationIgnored private let launchAgent: any LaunchAgentControlling
 
@@ -281,6 +300,15 @@ public final class AgentStatusModel {
 
     public func apply(_ snapshot: AgentServiceSnapshot) {
         if service != snapshot { service = snapshot }
+    }
+
+    /// Turns emoji candidates on or off in every IME and in `service.settings` at once.
+    public func setEmojiCandidatesEnabled(_ enabled: Bool) {
+        var settings = service.settings
+        guard settings.emojiCandidatesEnabled != enabled else { return }
+        settings.emojiCandidatesEnabled = enabled
+        service.settings = settings
+        settingsUpdater?(settings)
     }
 
     public func refreshLaunchAgentStatus() {

@@ -230,6 +230,27 @@ import Testing
         #expect(DeployManifest.isSafeName(name) == safe)
     }
 
+    /// `schemaPatches` is appended to version 1: a build from before v-mode (no key) still
+    /// decodes and validates, but does not carry the required patches, so `RimeEngine`
+    /// redeploys it.
+    @Test func schemaPatchesAreAppendOnlyAndRequired() throws {
+        defer { cleanUp() }
+        try writeManifest()
+        let data = try Data(contentsOf: build.appending(path: DeployManifest.fileName))
+        #expect(!String(decoding: data, as: UTF8.self).contains("schemaPatches"), "nil is omitted from the wire")
+        let old = try #require(DeployManifest.validated(buildDir: build, schemaID: "s"))
+        #expect(old.version == 1 && old.schemaPatches == nil && !old.carriesRequiredSchemaPatches)
+
+        try writeManifest { $0.schemaPatches = [] }
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s")?.carriesRequiredSchemaPatches == false)
+        try writeManifest { $0.schemaPatches = ["noema.something-else.v1"] }
+        #expect(DeployManifest.validated(buildDir: build, schemaID: "s")?.carriesRequiredSchemaPatches == false)
+        try writeManifest { $0.schemaPatches = SchemaPatch.requiredPatchIDs + ["noema.future.v9"] }
+        let current = try #require(DeployManifest.validated(buildDir: build, schemaID: "s"))
+        #expect(current.version == 1 && current.carriesRequiredSchemaPatches)
+        #expect(SchemaPatch.requiredPatchIDs == ["noema.recognizer-v-disabled.v1"], "released IDs never change")
+    }
+
     @Test func wrongVersionOrCorruptManifestFailsValidation() throws {
         defer { cleanUp() }
         try writeManifest { $0.version = 2 }

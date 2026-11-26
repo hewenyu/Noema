@@ -7,7 +7,8 @@
 #      learning libraries it links) import no networking, audio/speech, AX, event-tap,
 #      pasteboard, or screen-capture frameworks and call none of those APIs (thin shell,
 #      zero TCC), nor ServiceManagement, NoemaAgentCore, or NoemaLexiconAdmin (the agent's
-#      side of the boundary: downloads and archive extraction). Each directory must exist
+#      side of the boundary: downloads and archive extraction), nor NSExpression (it raises
+#      Objective-C exceptions on malformed input, which would crash the input method). Each directory must exist
 #      and hold source files. Carbon/HIToolbox and InputMethodKit stay allowed:
 #      IsSecureEventInputEnabled() lives in Carbon.
 #   2. No .xcassets/.xib/.storyboard/.xcodeproj/.xcworkspace anywhere, no `import XCTest`,
@@ -48,7 +49,7 @@ const fs = require('fs');
 const path = require('path');
 
 const BANNED_MODULES = 'AVFoundation|AVFAudio|Speech|SoundAnalysis|CoreAudio|AudioToolbox|Network|CFNetwork|WebKit|ApplicationServices|HIServices|ScreenCaptureKit|Contacts|CoreLocation|EventKit|Photos|ServiceManagement|NoemaAgentCore|NoemaLexiconAdmin';
-const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|NSPasteboard[A-Za-z]*';
+const BANNED_SYMBOLS = '(?:NS)?URLSession|NSURLConnection|AXUIElement[A-Za-z]*|CGEvent\\.tapCreate|CGEventTap[A-Za-z]*|NSPasteboard[A-Za-z]*|NSExpression';
 const ATTR = '@[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?\\s*';
 const ACCESS = '(?:public|package|internal|fileprivate|private)\\s+';
 const KIND = '(?:(?:typealias|struct|class|actor|enum|protocol|let|var|func)\\s+)?';
@@ -310,7 +311,7 @@ for dir in "${IME_SOURCE_DIRS[@]}"; do
   elif [[ -z "$(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print -quit)" ]]; then
     bad "${dir} has no source files to scan"
   else
-    report_hits "${dir} must not use networking/audio/AX/pasteboard/LaunchAgent APIs, NoemaAgentCore, or NoemaLexiconAdmin (AGENTS.md rule 1)" \
+    report_hits "${dir} must not use networking/audio/AX/pasteboard/LaunchAgent APIs, NSExpression, NoemaAgentCore, or NoemaLexiconAdmin (AGENTS.md rule 1)" \
       node -e "${LEXER}" -- ime < <(find "${dir}" -type f \( -name '*.swift' -o -name '*.h' -o -name '*.c' -o -name '*.m' -o -name '*.mm' \) -print0)
   fi
 done

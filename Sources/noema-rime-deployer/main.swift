@@ -13,22 +13,24 @@
 //   1. copies only the top-level `*.custom.yaml` of `--user-dir` (never its userdbs, lock
 //      files, or `build/`), each of which must be a regular file, never a symlink, and
 //      checks each copy against the input snapshot;
-//   2. with `--lua-file`, copies it to `staging/lua/noema_learned.lua` and appends
-//      `lua_translator@*noema_learned` to the schema's translators (`SchemaPatch`): a fresh
-//      `<schema>.custom.yaml` when the user has none; otherwise the user's file, parsed by
-//      librime only to list its `patch` keys, moves unchanged to
-//      `<schema>.noema-user-custom.yaml` and a wrapper `<schema>.custom.yaml` includes its
-//      `patch` and appends the translator; `rime.lua` is never written;
-//   3. points librime at `--shared-dir` and the staging directory and deploys; with
-//      `--lua-file`, the compiled `engine/translators` must list
-//      `lua_translator@*noema_learned`;
+//   2. stages the schema's patch (`SchemaPatch`), always: it sets the `v` recognizer
+//      patterns (`recognizer/patterns/v`, `recognizer/patterns/v_mode`) to null, since
+//      NoemaIME owns a leading `v` (v-mode), and with `--lua-file` copies the file to
+//      `staging/lua/noema_learned.lua` and appends `lua_translator@*noema_learned` to the
+//      schema's translators. A fresh `<schema>.custom.yaml` when the user has none;
+//      otherwise the user's file, parsed by librime only to list its `patch` keys, moves
+//      unchanged to `<schema>.noema-user-custom.yaml` and a wrapper `<schema>.custom.yaml`
+//      includes its `patch` and adds Noema's keys; `rime.lua` is never written;
+//   3. points librime at `--shared-dir` and the staging directory and deploys; the compiled
+//      schema must have no `v` or `v_mode` recognizer pattern and, with `--lua-file`, its
+//      `engine/translators` must list `lua_translator@*noema_learned`;
 //   4. requires `staging/build/default.yaml`, `<schema>.schema.yaml`, the `.table.bin` of
 //      every dictionary and the `.prism.bin` of every prism the schema names (for
 //      `translator`, `reverse_lookup`, and each `script_translator@<tag>`/
 //      `table_translator@<tag>`: `<ns>/dictionary`, and `<ns>/prism` or else that
 //      dictionary), all non-empty, and loads the schema in a real session;
 //   5. writes `staging/build/.noema-deploy-manifest.json` (`DeployManifest`, with
-//      `requiredPrisms` and, with `--schema-set`, `schemaSetID`).
+//      `requiredPrisms`, `schemaPatches`, and, with `--schema-set`, `schemaSetID`).
 // Exit 0 only when every step succeeds and the inputs did not change while deploying;
 // 1 on any failure (reason on stderr), 64 on usage errors.
 import CRime
@@ -139,12 +141,36 @@ func copyCustomPatches(_ options: Options, expected inputs: [DeployManifest.Mani
     }
 }
 
-/// Copies `--lua-file` to `staging/lua/noema_learned.lua`, checked against the input
-/// snapshot, and stages a `<schema>.custom.yaml` that appends the translator (`SchemaPatch`).
-func installLearnedTranslator(
+/// Stages `<schema>.custom.yaml` (`SchemaPatch`): the disabled `v` recognizers always, and
+/// with `--lua-file` the learned-phrase translator, whose file is copied to
+/// `staging/lua/noema_learned.lua` and checked against the input snapshot.
+func stageSchemaPatch(
     _ options: Options, api: UnsafeMutablePointer<RimeApi>, expected inputs: [DeployManifest.ManifestEntry]
 ) {
-    guard let luaFile = options.luaFile else { return }
+    if let luaFile = options.luaFile { installLearnedLua(luaFile, options, expected: inputs) }
+    let component = options.luaFile == nil ? nil : learnedTranslator
+    let patchURL = options.staging.appending(path: "\(options.schemaID).custom.yaml")
+    guard FileManager.default.fileExists(atPath: patchURL.path) else {
+        let fresh = SchemaPatch.freshPatch(appending: component)
+        requireNoThrow("writing \(patchURL.path)") { try Data(fresh.utf8).write(to: patchURL, options: .withoutOverwriting) }
+        return
+    }
+    let bytes = requireNoThrow("reading \(patchURL.path)") { try DeployManifest.readRegularFile(patchURL) }
+    guard let text = String(data: bytes, encoding: .utf8) else { fail("\(patchURL.path) is not UTF-8") }
+    // A user patch that already names the translator keeps it; the wrapper adds none.
+    let appending = component.flatMap { SchemaPatch.names($0, in: text) ? nil : $0 }
+    let configID = SchemaPatch.userPatchConfigID(schemaID: options.schemaID)
+    let keys = userPatchKeys(api: api, yaml: text, path: patchURL.path, options: options)
+    guard let wrapper = SchemaPatch.wrapper(appending: appending, userConfigID: configID, userPatchKeys: keys) else {
+        fail("\(patchURL.path) already uses every key that could append \(learnedTranslator): \(SchemaPatch.wrapperAppendKeys)")
+    }
+    let moved = options.staging.appending(path: "\(configID).yaml")
+    requireNoThrow("writing \(moved.path)") { try bytes.write(to: moved, options: .withoutOverwriting) }
+    requireNoThrow("writing \(patchURL.path)") { try Data(wrapper.utf8).write(to: patchURL, options: .atomic) }
+}
+
+/// Copies `luaFile` to `staging/lua/noema_learned.lua`, checked against the input snapshot.
+func installLearnedLua(_ luaFile: URL, _ options: Options, expected inputs: [DeployManifest.ManifestEntry]) {
     let data = requireNoThrow("reading \(luaFile.path)") { try DeployManifest.readRegularFile(luaFile) }
     let entry = requireNoThrow("hashing \(luaFile.path)") { try DeployManifest.extraInputs(luaFile: luaFile) }
     guard entry.allSatisfy(inputs.contains) else { fail("\(luaFile.path) changed while deploying") }
@@ -157,24 +183,6 @@ func installLearnedTranslator(
     guard DeployManifest.sha256(of: try? DeployManifest.readRegularFile(target)) == DeployManifest.sha256(of: data) else {
         fail("\(target.path) does not match \(luaFile.path)")
     }
-
-    let patchURL = options.staging.appending(path: "\(options.schemaID).custom.yaml")
-    guard FileManager.default.fileExists(atPath: patchURL.path) else {
-        let fresh = SchemaPatch.freshPatch(appending: learnedTranslator)
-        requireNoThrow("writing \(patchURL.path)") { try Data(fresh.utf8).write(to: patchURL, options: .withoutOverwriting) }
-        return
-    }
-    let bytes = requireNoThrow("reading \(patchURL.path)") { try DeployManifest.readRegularFile(patchURL) }
-    guard let text = String(data: bytes, encoding: .utf8) else { fail("\(patchURL.path) is not UTF-8") }
-    if SchemaPatch.names(learnedTranslator, in: text) { return }
-    let configID = SchemaPatch.userPatchConfigID(schemaID: options.schemaID)
-    let keys = userPatchKeys(api: api, yaml: text, path: patchURL.path, options: options)
-    guard let wrapper = SchemaPatch.wrapper(appending: learnedTranslator, userConfigID: configID, userPatchKeys: keys) else {
-        fail("\(patchURL.path) already uses every key that could append \(learnedTranslator): \(SchemaPatch.wrapperAppendKeys)")
-    }
-    let moved = options.staging.appending(path: "\(configID).yaml")
-    requireNoThrow("writing \(moved.path)") { try bytes.write(to: moved, options: .withoutOverwriting) }
-    requireNoThrow("writing \(patchURL.path)") { try Data(wrapper.utf8).write(to: patchURL, options: .atomic) }
 }
 
 /// The effective top-level keys of the `patch` mapping of `yaml`, read with librime's own
@@ -382,7 +390,8 @@ func withTraits<T>(_ options: Options, _ body: (inout RimeTraits) -> T) -> T {
 /// `translator`, `reverse_lookup`, and the tag of each `script_translator@<tag>` or
 /// `table_translator@<tag>` in `engine/translators`, `<ns>/dictionary` and `<ns>/prism`
 /// (else that dictionary). Each must be a plain name. With `required`, `engine/translators`
-/// must list it, else the deploy fails.
+/// must list it, and no `SchemaPatch.disabledRecognizerKeys` pattern may remain, else the
+/// deploy fails.
 func requiredDictionaries(
     api: UnsafeMutablePointer<RimeApi>, schemaID: String, requiringTranslator required: String?
 ) -> (dictionaries: [String], prisms: [String]) {
@@ -398,6 +407,12 @@ func requiredDictionaries(
     // A patch librime merged without the learned translator must never pass as a deploy.
     if let required, !components.contains(required) {
         fail("compiled build/\(schemaID).schema.yaml engine/translators lacks \(required): \(components)")
+    }
+    // Nor one that left a `v` recognizer able to claim v-mode's input.
+    for key in SchemaPatch.disabledRecognizerKeys {
+        if let pattern = string(key), !pattern.isEmpty {
+            fail("compiled build/\(schemaID).schema.yaml still has \(key): \(pattern)")
+        }
     }
     for component in components {
         for prefix in ["script_translator@", "table_translator@"] where component.hasPrefix(prefix) {
@@ -458,7 +473,7 @@ func deploy(_ options: Options) {
         try DeployManifest.inputs(sharedDataDir: options.shared, userDataDir: options.user, luaFile: options.luaFile)
     }
     copyCustomPatches(options, expected: inputs)
-    installLearnedTranslator(options, api: api, expected: inputs)
+    stageSchemaPatch(options, api: api, expected: inputs)
 
     let build = options.staging.appending(path: "build")
     let (dictionaries, prisms) = withTraits(options) { traits -> ([String], [String]) in
@@ -485,7 +500,7 @@ func deploy(_ options: Options) {
 
     let manifest = DeployManifest(
         schemaID: options.schemaID, inputs: inputs, outputs: outputs, requiredDictionaries: dictionaries,
-        requiredPrisms: prisms, schemaSetID: options.schemaSet?.rawValue)
+        requiredPrisms: prisms, schemaSetID: options.schemaSet?.rawValue, schemaPatches: SchemaPatch.requiredPatchIDs)
     let data = requireNoThrow("encoding the manifest") { try manifest.encoded() }
     requireNoThrow("writing the manifest") { try data.write(to: build.appending(path: DeployManifest.fileName), options: .atomic) }
     guard DeployManifest.validated(buildDir: build, schemaID: options.schemaID) == manifest else {

@@ -30,6 +30,11 @@ public enum NoemaPaths {
         homeDirectory.appending(path: "Library/Application Support/Noema/rime", directoryHint: .isDirectory)
     }
 
+    /// `~/Library/Application Support/Noema/snippets.json`: the user's `v3` snippets.
+    public static func snippetsURL(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        homeDirectory.appending(path: "Library/Application Support/Noema/snippets.json")
+    }
+
     /// `~/Library/Logs/Noema`.
     public static func logDir(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         homeDirectory.appending(path: "Library/Logs/Noema", directoryHint: .isDirectory)
