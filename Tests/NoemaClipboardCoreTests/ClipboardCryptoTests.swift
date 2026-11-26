@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 @testable import NoemaClipboardCore
 import os
 import Security
@@ -65,6 +66,7 @@ import Testing
             var addStatus: OSStatus = errSecSuccess
             var adds: [[String: String]] = []
             var queries: [[String: String]] = []
+            var nonInteractiveFlags: [Bool?] = []
         }
 
         let state = OSAllocatedUnfairLock(initialState: State())
@@ -72,6 +74,8 @@ import Testing
         func copyMatching(_ query: [String: Any]) -> (OSStatus, Data?) {
             state.withLockUnchecked { state in
                 state.queries.append(query.mapValues { "\($0)" })
+                let context = query[kSecUseAuthenticationContext as String] as? LAContext
+                state.nonInteractiveFlags.append(context?.interactionNotAllowed)
                 return (state.copyStatus, state.copyStatus == errSecSuccess ? state.stored : nil)
             }
         }
@@ -127,6 +131,28 @@ import Testing
         fake.state.withLockUnchecked { $0.copyStatus = errSecDecode }
         #expect(throws: ClipboardError.keychainFailure(errSecDecode)) { try KeychainClipboardKeyStore(backend: fake).loadOrCreateMasterKey() }
         #expect(fake.state.withLockUnchecked { $0.adds.isEmpty })
+    }
+
+    @Test func verifyMasterKeyAccessIsNonInteractiveAndNeverCreatesKeys() throws {
+        let fake = FakeKeychain()
+        let keyStore = KeychainClipboardKeyStore(backend: fake)
+
+        // Missing item: throws keychainFailure(errSecItemNotFound), never adds a key, passes non-interactive LAContext.
+        #expect(throws: ClipboardError.keychainFailure(errSecItemNotFound)) { try keyStore.verifyMasterKeyAccess() }
+        #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true] })
+
+        // Locked keychain: maps to .keychainLocked without creating/replacing a key.
+        fake.state.withLockUnchecked {
+            $0.stored = Data(repeating: 9, count: 32)
+            $0.copyStatus = errSecInteractionNotAllowed
+        }
+        #expect(throws: ClipboardError.keychainLocked) { try keyStore.verifyMasterKeyAccess() }
+        #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true, true] })
+
+        // Unlocked keychain with valid 32-byte key: succeeds non-interactively.
+        fake.state.withLockUnchecked { $0.copyStatus = errSecSuccess }
+        try keyStore.verifyMasterKeyAccess()
+        #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true, true, true] })
     }
 
     @Test func inMemoryKeyStoreSimulatesALock() throws {

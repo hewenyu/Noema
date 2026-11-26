@@ -135,6 +135,24 @@ public final class ClipboardStore: @unchecked Sendable {
         return diagnosticsValue
     }
 
+    /// Non-interactively verifies that the master key is still readable when the store is
+    /// `.ready`; transitions to `.keychainLocked` and wipes in-memory key material, previews,
+    /// and `:memory:` FTS5 tokens if access is refused. Never prompts interactively and never
+    /// creates a key when already `.keychainLocked`.
+    @discardableResult
+    public func verifyKeychainAccess() -> ClipboardStoreState {
+        lock.lock()
+        defer { lock.unlock() }
+        guard db != nil, cipher != nil else { return .keychainLocked }
+        do {
+            try keyStore.verifyMasterKeyAccess()
+        } catch {
+            lockLocked()
+            log.error("clipboard master key became unavailable: \(String(describing: error), privacy: .public)")
+        }
+        return cipher == nil ? .keychainLocked : .ready
+    }
+
     /// Re-verifies master-key availability against the key store: unlocks and rebuilds the
     /// `:memory:` search index when locked and now accessible; transitions to `.keychainLocked`
     /// and wipes the derived cipher, previews, and `:memory:` index if the keychain was locked
@@ -465,17 +483,18 @@ public final class ClipboardStore: @unchecked Sendable {
     private func rejectIfExpiredLocked(
         _ db: OpaquePointer, _ index: OpaquePointer, id: String, now: Date
     ) throws(ClipboardError) {
-        let statement = try Self.prepare(db, "SELECT pinned, expires_at FROM clipboard_items WHERE id = ?1")
-        defer { sqlite3_finalize(statement) }
-        Self.bind(statement, 1, id)
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw .notFound(id) }
-        let pinned = sqlite3_column_int64(statement, 0) != 0
-        if !pinned, sqlite3_column_type(statement, 1) != SQLITE_NULL {
-            let expiresAt = sqlite3_column_double(statement, 1)
-            if expiresAt <= now.timeIntervalSince1970 {
-                try deleteRowsLocked(db, index, ids: [id])
-                throw .notFound(id)
-            }
+        let isExpired: Bool = try { () throws(ClipboardError) -> Bool in
+            let statement = try Self.prepare(db, "SELECT pinned, expires_at FROM clipboard_items WHERE id = ?1")
+            defer { sqlite3_finalize(statement) }
+            Self.bind(statement, 1, id)
+            guard sqlite3_step(statement) == SQLITE_ROW else { throw .notFound(id) }
+            let pinned = sqlite3_column_int64(statement, 0) != 0
+            guard !pinned, sqlite3_column_type(statement, 1) != SQLITE_NULL else { return false }
+            return sqlite3_column_double(statement, 1) <= now.timeIntervalSince1970
+        }()
+        if isExpired {
+            try deleteRowsLocked(db, index, ids: [id])
+            throw .notFound(id)
         }
     }
 

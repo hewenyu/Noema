@@ -160,16 +160,27 @@ public final class ClipboardHistoryController {
         }
     }
 
+    /// Non-interactively verifies keychain access when the store is currently `.ready` (e.g.
+    /// on `com.apple.security.keychain.lock`), transitioning to `.keychainLocked` without ever
+    /// prompting interactively or creating a key.
+    public func verifyKeychainAccess() {
+        guard let store else { return }
+        ingestQueue.async { [weak self] in
+            _ = store.verifyKeychainAccess()
+            Task { @MainActor [weak self] in self?.refreshStatus() }
+        }
+    }
+
     // MARK: Capture
 
     private func ingest(_ capture: ClipboardCapture) {
         guard let store else { return }
         let log = log
         ingestQueue.async { [weak self] in
-            // Re-verify keychain availability before persisting: if the user locked the
-            // login keychain while running, transition immediately to `.keychainLocked`
-            // without writing and let `refreshStatus()` pause monitoring.
-            guard store.retryUnlock() == .ready else {
+            // Non-interactively verify keychain availability before persisting: if the user
+            // locked the login keychain while running, transition immediately to
+            // `.keychainLocked` without writing and let `refreshStatus()` pause monitoring.
+            guard store.verifyKeychainAccess() == .ready else {
                 Task { @MainActor [weak self] in self?.refreshStatus() }
                 return
             }
@@ -207,7 +218,7 @@ public final class ClipboardHistoryController {
     /// or reactivates `target`. Atomically rejects expired unpinned entries and locked-keychain
     /// reads without touching the pasteboard or reviving their TTL.
     public func use(id: String, mode: PasteMode, target: ClipboardSourceApp?, now: Date = Date()) async -> ClipboardPasteOutcome? {
-        guard let store, store.retryUnlock() == .ready, let content = try? store.useContent(id: id, now: now) else {
+        guard let store, store.verifyKeychainAccess() == .ready, let content = try? store.useContent(id: id, now: now) else {
             refreshStatus()
             onToast("这条记录已过期或无法读取")
             return nil
@@ -292,7 +303,7 @@ public final class ClipboardHistoryController {
             $0.monitor.setPaused(.screenLocked, false)
             $0.retryUnlock()
         }
-        observe(distributed, Notification.Name("com.apple.security.keychain.lock")) { $0.retryUnlock() }
+        observe(distributed, Notification.Name("com.apple.security.keychain.lock")) { $0.verifyKeychainAccess() }
         observe(workspace, NSWorkspace.willSleepNotification) { $0.monitor.setPaused(.sleeping, true) }
         observe(workspace, NSWorkspace.didWakeNotification) {
             $0.monitor.setPaused(.sleeping, false)
