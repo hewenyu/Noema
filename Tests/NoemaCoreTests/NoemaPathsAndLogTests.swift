@@ -18,6 +18,26 @@ import Testing
         #expect(modes.keys.contains(NoemaPaths.zhHansInputModeID))
     }
 
+    /// The agent identifiers must match the agent Info.plist and LaunchAgent plist.
+    @Test func agentIdentifiersMatchTheAgentPlists() throws {
+        let info = try Self.plist("Resources/Agent/Info.plist.in")
+        #expect(info["CFBundleIdentifier"] as? String == NoemaPaths.agentBundleID)
+        #expect(info["CFBundleExecutable"] as? String == NoemaPaths.agentExecutableName)
+        #expect(info["LSUIElement"] as? Bool == true)
+        let agent = try Self.plist("Resources/Agent/\(NoemaPaths.agentLaunchAgentPlistName)")
+        #expect(agent["Label"] as? String == NoemaPaths.agentBundleID)
+        #expect(agent["BundleProgram"] as? String == "Contents/MacOS/\(NoemaPaths.agentExecutableName)")
+        #expect((agent["MachServices"] as? [String: Bool])?[NoemaPaths.agentMachServiceName] == true)
+        #expect(agent["AssociatedBundleIdentifiers"] as? [String] == [NoemaPaths.agentBundleID])
+        #expect(NoemaPaths.agentBundleName == "Noema.app")
+        #expect(NoemaPaths.agentReadyNotificationName.hasPrefix("dev.noema."))
+    }
+
+    static func plist(_ relativePath: String) throws -> [String: Any] {
+        let data = try Data(contentsOf: repository.appending(path: relativePath))
+        return try #require(try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+    }
+
     @Test func standardPathsHangOffTheHomeDirectory() {
         let home = URL(filePath: "/Users/someone", directoryHint: .isDirectory)
         #expect(NoemaPaths.rimeUserDataDir(homeDirectory: home).path == "/Users/someone/Library/Application Support/Noema/rime")
@@ -68,8 +88,11 @@ import Testing
     }
 
     @Test func logSubsystemsArePerComponent() {
-        #expect(NoemaLog.Subsystem.allCases.map(\.rawValue) == ["dev.noema.ime", "dev.noema.engine", "dev.noema.cli", "dev.noema.deployer"])
+        #expect(NoemaLog.Subsystem.allCases.map(\.rawValue) == [
+            "dev.noema.ime", "dev.noema.engine", "dev.noema.cli", "dev.noema.deployer", "dev.noema.agent", "dev.noema.ipc",
+        ])
         // Creating loggers has no side effects beyond os_log handles.
         _ = NoemaLog.ime("test"); _ = NoemaLog.engine("test"); _ = NoemaLog.cli("test"); _ = NoemaLog.deployer("test")
+        _ = NoemaLog.agent("test"); _ = NoemaLog.ipc("test")
     }
 }

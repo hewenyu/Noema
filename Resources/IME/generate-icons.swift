@@ -1,9 +1,10 @@
-// Generates the NoemaIME icons in code, so the repository carries no binary art
-// and no .xcassets. Uses only CoreGraphics, ImageIO, and UniformTypeIdentifiers.
+// Generates the NoemaIME.app and Noema.app icons in code, so the repository carries no
+// binary art and no .xcassets. Uses only CoreGraphics, ImageIO, and UniformTypeIdentifiers.
 //
 // Usage: swift Resources/IME/generate-icons.swift <output-dir>
-// Writes <output-dir>/NoemaIME.iconset/ (the ten standard PNG sizes, for
-// `iconutil -c icns`) and <output-dir>/menu-icon.pdf (an 18x18 pt template image).
+// Writes <output-dir>/NoemaIME.iconset/ and <output-dir>/Noema.iconset/ (the ten standard
+// PNG sizes each, for `iconutil -c icns`) and <output-dir>/menu-icon.pdf (an 18x18 pt
+// template image, shared by the input menu and the agent's status item).
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -27,8 +28,19 @@ func markPath(in rect: CGRect) -> CGPath {
     return path
 }
 
+/// The two ends of an icon's background gradient, sRGB components.
+struct Palette {
+    let start: [CGFloat]
+    let end: [CGFloat]
+
+    /// NoemaIME.app: indigo.
+    static let inputMethod = Palette(start: [0.16, 0.20, 0.38, 1], end: [0.30, 0.42, 0.78, 1])
+    /// Noema.app, the companion agent: teal.
+    static let agent = Palette(start: [0.05, 0.27, 0.30, 1], end: [0.16, 0.62, 0.60, 1])
+}
+
 /// Full-colour application icon at `pixels` x `pixels`.
-func drawAppIcon(_ context: CGContext, pixels: CGFloat) {
+func drawAppIcon(_ context: CGContext, pixels: CGFloat, palette: Palette) {
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     let inset = pixels * 0.08
     let tile = CGRect(x: inset, y: inset, width: pixels - 2 * inset, height: pixels - 2 * inset)
@@ -39,8 +51,8 @@ func drawAppIcon(_ context: CGContext, pixels: CGFloat) {
     context.addPath(background)
     context.clip()
     let colors = [
-        CGColor(colorSpace: colorSpace, components: [0.16, 0.20, 0.38, 1])!,
-        CGColor(colorSpace: colorSpace, components: [0.30, 0.42, 0.78, 1])!,
+        CGColor(colorSpace: colorSpace, components: palette.start)!,
+        CGColor(colorSpace: colorSpace, components: palette.end)!,
     ] as CFArray
     let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0, 1])!
     context.drawLinearGradient(
@@ -55,12 +67,12 @@ func drawAppIcon(_ context: CGContext, pixels: CGFloat) {
     context.strokePath()
 }
 
-func writePNG(pixels: Int, to url: URL) {
+func writePNG(pixels: Int, palette: Palette, to url: URL) {
     guard let context = CGContext(
         data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
         space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
     else { fail("cannot create a \(pixels)px bitmap context") }
-    drawAppIcon(context, pixels: CGFloat(pixels))
+    drawAppIcon(context, pixels: CGFloat(pixels), palette: palette)
     guard let image = context.makeImage(),
           let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
     else { fail("cannot encode \(url.path)") }
@@ -93,14 +105,16 @@ guard arguments.count == 1, let outputPath = arguments.first, !outputPath.isEmpt
     fail("usage: swift generate-icons.swift <output-dir>")
 }
 let output = URL(fileURLWithPath: outputPath, isDirectory: true)
-let iconset = output.appendingPathComponent("NoemaIME.iconset", isDirectory: true)
-do {
-    try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
-} catch {
-    fail("cannot create \(iconset.path): \(error)")
-}
-for points in [16, 32, 128, 256, 512] {
-    writePNG(pixels: points, to: iconset.appendingPathComponent("icon_\(points)x\(points).png"))
-    writePNG(pixels: points * 2, to: iconset.appendingPathComponent("icon_\(points)x\(points)@2x.png"))
+for (name, palette) in [("NoemaIME", Palette.inputMethod), ("Noema", Palette.agent)] {
+    let iconset = output.appendingPathComponent("\(name).iconset", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
+    } catch {
+        fail("cannot create \(iconset.path): \(error)")
+    }
+    for points in [16, 32, 128, 256, 512] {
+        writePNG(pixels: points, palette: palette, to: iconset.appendingPathComponent("icon_\(points)x\(points).png"))
+        writePNG(pixels: points * 2, palette: palette, to: iconset.appendingPathComponent("icon_\(points)x\(points)@2x.png"))
+    }
 }
 writeMenuIconPDF(to: output.appendingPathComponent("menu-icon.pdf"))

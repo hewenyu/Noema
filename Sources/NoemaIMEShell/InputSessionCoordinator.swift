@@ -36,6 +36,13 @@ public final class InputSessionCoordinator {
     /// True while `activeClient` shows marked text the shell put there.
     public private(set) var hasMarkedText = false
 
+    /// Called with the engine's state after every composition or mode change the shell
+    /// makes: keys, panel clicks, `commitComposition`, a switch to ASCII mode, and every
+    /// dropped composition (focus loss, controller close, ownership transfer, secure
+    /// input). `EngineHost` hands it to `CompositionIPCReporter`, which updates the local
+    /// generation gate on every call but sends nothing while secure input is on.
+    public var onCompositionChange: (@MainActor (CompositionState) -> Void)?
+
     public init(
         engineProvider: @escaping @MainActor () -> (any TypingEngine)?,
         candidatePresenter: any CandidatePresenting = NoOpCandidatePresenter(),
@@ -97,6 +104,7 @@ public final class InputSessionCoordinator {
         if hasMarkedText && !didInsert { client.clearMarkedText() }
         hasMarkedText = false
         candidatePresenter.hide()
+        onCompositionChange?(engine.currentState)
     }
 
     /// IMKit hides the input method's windows (`hidePalettes`); the composition stays.
@@ -118,7 +126,10 @@ public final class InputSessionCoordinator {
         } else {
             commitComposition(token: token, client: client)
         }
-        engineProvider()?.setASCIIMode(true)
+        guard let engine = engineProvider() else { return }
+        // Never inline into `onCompositionChange?(…)`: a nil handler would skip the call.
+        let state = engine.setASCIIMode(true)
+        onCompositionChange?(state)
     }
 
     // MARK: - Keys
@@ -217,6 +228,7 @@ public final class InputSessionCoordinator {
     /// composition (marked text or panel preedit) or nothing.
     private func applyResult(_ result: KeyHandlingResult, to client: any TextInputClient) {
         let state = result.state
+        defer { onCompositionChange?(state) }
         if let committed = result.committedText, !committed.isEmpty {
             client.insertText(committed)
             // insertText replaced the marked text; no redundant empty setMarkedText.
@@ -276,14 +288,17 @@ public final class InputSessionCoordinator {
     }
 
     /// Clears the owner's marked text (only if the shell put it there) and the engine's
-    /// composition, keeping `ascii_mode`, and hides the menu. Inserts nothing.
+    /// composition, keeping `ascii_mode`, and hides the menu. Inserts nothing. A cleared
+    /// composition is reported, so neither the agent nor the local gate keeps the old one.
     private func dropComposition() {
         if hasMarkedText { activeClient?.clearMarkedText() }
         hasMarkedText = false
+        var clearedState: CompositionState?
         if let engine = engineProvider(), engine.currentState.isComposing {
-            engine.clearComposition()
+            clearedState = engine.clearComposition()
         }
         candidatePresenter.hide()
+        if let clearedState { onCompositionChange?(clearedState) }
     }
 
     /// Drops the owner's composition and leaves no owner.

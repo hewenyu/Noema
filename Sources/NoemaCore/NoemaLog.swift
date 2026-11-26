@@ -13,6 +13,8 @@ public enum NoemaLog {
         case engine = "dev.noema.engine"
         case cli = "dev.noema.cli"
         case deployer = "dev.noema.deployer"
+        case agent = "dev.noema.agent"
+        case ipc = "dev.noema.ipc"
     }
 
     public static func logger(subsystem: Subsystem, category: String) -> Logger {
@@ -27,4 +29,8 @@ public enum NoemaLog {
     public static func cli(_ category: String) -> Logger { logger(subsystem: .cli, category: category) }
     /// `noema-rime-deployer`.
     public static func deployer(_ category: String) -> Logger { logger(subsystem: .deployer, category: category) }
+    /// `NoemaAgent` and `NoemaAgentCore`.
+    public static func agent(_ category: String) -> Logger { logger(subsystem: .agent, category: category) }
+    /// `NoemaIPC`, in either process.
+    public static func ipc(_ category: String) -> Logger { logger(subsystem: .ipc, category: category) }
 }

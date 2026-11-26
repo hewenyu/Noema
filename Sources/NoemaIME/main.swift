@@ -65,6 +65,8 @@ func checkRime() -> Int32 {
 final class InputMethodAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         EngineHost.shared.boot()
+        // Off the hot path: connects on its own queue; typing never waits for the agent.
+        EngineHost.shared.startAgentConnection()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
