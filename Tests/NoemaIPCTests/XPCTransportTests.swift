@@ -116,6 +116,23 @@ final class XPCRig {
         #expect(rig.manager.state == .healthy)
     }
 
+    /// Real libxpc, the launch race: the IME says hello while Rime is still booting, then
+    /// Rime finishes. The agent sees the live mode on the same connection, no reconnect.
+    @Test func engineModeChangeAfterHandshakeReachesTheAgent() throws {
+        let rig = try XPCRig()
+        defer { rig.shutdown() }
+        rig.manager.setEngineMode("booting")
+        rig.manager.start()
+        #expect(waitUntil { rig.manager.state == .healthy }, "state: \(rig.manager.state)")
+        #expect(rig.agent.snapshot.lastHello?.engineMode == "booting")
+        let epoch = rig.manager.sessionEpoch
+        rig.manager.setEngineMode("rime")
+        #expect(waitUntil { rig.agent.snapshot.lastEngineMode == "rime" }, "reportedMode: \(rig.agent.snapshot.lastEngineMode ?? "nil")")
+        #expect(rig.agent.snapshot.lastHello?.engineMode == "rime")
+        #expect(rig.agent.snapshot.lastHello?.sessionEpoch == epoch && rig.manager.sessionEpoch == epoch)
+        #expect(rig.recorder.shape == ["connecting(1)", "healthy"])
+    }
+
     /// Real libxpc: the agent pushes revision 1 (`visualEffect`) from inside its `hello`
     /// handler, before the `helloAck` reply carrying revision 0 (`glass`). The ack still
     /// makes the connection healthy without rolling the settings back.

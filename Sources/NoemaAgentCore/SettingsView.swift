@@ -91,7 +91,7 @@ struct GeneralSettingsView: View {
                 LabeledContent("已连接的输入法", value: "\(model.service.connectedPeers)")
                 LabeledContent("最近的对端", value: model.service.lastPeerIdentity?.signingIdentifier ?? "—")
                 LabeledContent("输入法版本", value: model.service.lastHello?.clientVersion ?? "—")
-                LabeledContent("引擎状态", value: model.service.lastHello?.engineMode ?? "—")
+                LabeledContent("引擎状态", value: model.service.lastEngineMode ?? model.service.lastHello?.engineMode ?? "—")
             }
             Section("版本") {
                 LabeledContent("Noema Agent", value: model.agentVersion)

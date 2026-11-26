@@ -21,6 +21,8 @@ public struct AgentServiceSnapshot: Sendable, Hashable {
     public var connectedPeers = 0
     public var lastPeerIdentity: PeerIdentity?
     public var lastHello: IMEHello?
+    /// The IME's live engine mode: `hello`'s, then each `engineModeChanged` on that epoch.
+    public var lastEngineMode: String?
     public var lastComposition: CompositionSnapshot?
     public var framesHandled = 0
     public var malformedFrames = 0
@@ -160,6 +162,7 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
                 info.epoch = hello.sessionEpoch
                 info.compositionWatermark = nil
                 state.snapshot.lastHello = hello
+                state.snapshot.lastEngineMode = hello.engineMode
                 return .helloAck(AgentHelloAck(
                     agentVersion: agentVersion, sessionEpoch: hello.sessionEpoch, settings: state.snapshot.settings,
                     settingsRevision: state.settingsRevision))
@@ -177,6 +180,11 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
                 return nil
             case .openSettingsRequested(let section):
                 openSection = .some(section)
+                return nil
+            case .engineModeChanged(let epoch, let mode):
+                guard epoch == info.epoch else { return nil }
+                state.snapshot.lastEngineMode = mode
+                if state.snapshot.lastHello?.sessionEpoch == epoch { state.snapshot.lastHello?.engineMode = mode }
                 return nil
             }
         }

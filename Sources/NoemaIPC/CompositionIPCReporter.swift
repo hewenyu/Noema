@@ -56,7 +56,7 @@ public final class CompositionIPCReporter {
         reportedCount += 1
         // The manager stamps the connection epoch when it sends.
         sink(.compositionStateChanged(CompositionSnapshot(
-            sessionEpoch: Self.unstampedEpoch, generationID: state.generationID, isComposing: state.isComposing,
+            sessionEpoch: IPCConnectionManager.unstampedEpoch, generationID: state.generationID, isComposing: state.isComposing,
             candidateCount: state.candidates.count, isASCIIMode: state.isASCIIMode)))
     }
 
@@ -69,6 +69,4 @@ public final class CompositionIPCReporter {
         reportedCount += 1
         sink(.openSettingsRequested(section: section))
     }
-
-    static let unstampedEpoch = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 }

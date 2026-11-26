@@ -598,6 +598,77 @@ final class SecureInputFlag: Sendable {
         #expect(rig.manager.state == .healthy && rig.receivedKinds.filter { $0 == IMEToAgent.helloKind }.count == 2)
     }
 
+    /// Rime finishes booting after the handshake: every `setEngineMode` on a healthy
+    /// connection reaches the agent at once as `engineModeChanged`, on the same connection;
+    /// repeating the current mode sends nothing.
+    @Test func engineModeChangesWhileHealthyReachTheAgentWithoutReconnecting() throws {
+        let rig = InMemoryRig()
+        rig.manager.setEngineMode("booting")
+        rig.startHealthy()
+        #expect(rig.agent.snapshot.lastEngineMode == "booting" && rig.agent.snapshot.lastHello?.engineMode == "booting")
+        for mode in ["rime", "safeMode", "unavailable"] {
+            rig.manager.setEngineMode(mode)
+            rig.settle()
+            let snapshot = rig.agent.snapshot
+            #expect(snapshot.lastEngineMode == mode, "mode \(mode), kinds: \(rig.receivedKinds)")
+            #expect(snapshot.lastHello?.engineMode == mode)
+            #expect(snapshot.lastHello?.sessionEpoch == rig.manager.sessionEpoch)
+        }
+        rig.manager.setEngineMode("unavailable")
+        rig.settle()
+        #expect(rig.receivedKinds == [IMEToAgent.helloKind] + Array(repeating: IMEToAgent.engineModeChangedKind, count: 3))
+        #expect(rig.transport.connectCalls == 1 && rig.manager.state == .healthy)
+        #expect(rig.recorder.shape == ["connecting(1)", "healthy"])
+    }
+
+    /// `setEngineMode` between `hello("booting")` and its `helloAck`: the new mode leaves
+    /// right when the handshake completes.
+    @Test func engineModeSetMidHandshakeIsSentOnHelloAck() throws {
+        let rig = InMemoryRig()
+        var faults = InMemoryFaults()
+        faults.inboundLatency = .milliseconds(50)
+        rig.transport.faults = faults
+        rig.manager.setEngineMode("booting")
+        rig.manager.start()
+        rig.settle()
+        #expect(rig.manager.state == .connecting(attempt: 1))
+        #expect(rig.agent.snapshot.lastHello?.engineMode == "booting")
+        rig.manager.setEngineMode("rime")
+        rig.settle()
+        #expect(rig.receivedKinds == [IMEToAgent.helloKind], "nothing leaves before helloAck")
+        rig.clock.advance(by: .milliseconds(50))
+        rig.settle()
+        #expect(rig.manager.state == .healthy)
+        #expect(rig.receivedKinds == [IMEToAgent.helloKind, IMEToAgent.engineModeChangedKind])
+        #expect(rig.agent.snapshot.lastEngineMode == "rime" && rig.agent.snapshot.lastHello?.engineMode == "rime")
+    }
+
+    /// Under secure input a mode change sends zero frames; it catches up on the first
+    /// `heartbeatAck` after secure input ends.
+    @Test func engineModeChangeUnderSecureInputIsSilentThenCatchesUp() throws {
+        var policy = InMemoryRig.policy
+        policy.heartbeatInterval = .seconds(1)
+        let rig = InMemoryRig(policy: policy)
+        rig.manager.setEngineMode("booting")
+        rig.startHealthy()
+        let framesBefore = rig.server.receivedFrames.count
+        rig.secure.isOn = true
+        rig.manager.setEngineMode("rime")
+        rig.settle()
+        rig.clock.advance(by: .seconds(1))
+        rig.settle()
+        #expect(rig.server.receivedFrames.count == framesBefore, "kinds: \(rig.receivedKinds)")
+        #expect(rig.agent.snapshot.lastEngineMode == "booting")
+        #expect(rig.manager.state == .healthy)
+
+        rig.secure.isOn = false
+        rig.clock.advance(by: .seconds(1))
+        rig.settle()
+        #expect(rig.receivedKinds.suffix(2) == [IMEToAgent.heartbeatKind, IMEToAgent.engineModeChangedKind], "kinds: \(rig.receivedKinds)")
+        #expect(rig.agent.snapshot.lastEngineMode == "rime" && rig.agent.snapshot.lastHello?.engineMode == "rime")
+        #expect(rig.transport.connectCalls == 1)
+    }
+
     @Test func stopCancelsTimersAndIgnoresLateEvents() {
         let rig = InMemoryRig(startAgent: false)
         rig.manager.start()

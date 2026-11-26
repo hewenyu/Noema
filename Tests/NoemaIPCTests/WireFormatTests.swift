@@ -34,6 +34,7 @@ import XPC
             .compositionStateChanged(CompositionSnapshot(sessionEpoch: epoch, generationID: 9, isComposing: true, candidateCount: 5, isASCIIMode: false)),
             .openSettingsRequested(section: .quickActions),
             .openSettingsRequested(section: nil),
+            .engineModeChanged(sessionEpoch: epoch, engineMode: "safeMode"),
         ]
         for (index, message) in ime.enumerated() {
             let envelope = IPCEnvelope(sequence: UInt64(index), message: message, generationID: UInt64(index))
@@ -50,7 +51,22 @@ import XPC
             let envelope = IPCEnvelope(sequence: UInt64(index), message: message, generationID: 3)
             #expect(try IPCWireCodec.decode(AgentToIME.self, from: IPCWireCodec.encode(envelope)) == envelope)
         }
-        #expect(Set(ime.map(\.kind)).count == 4 && Set(agent.map(\.kind)).count == 4)
+        #expect(Set(ime.map(\.kind)).count == 5 && Set(agent.map(\.kind)).count == 4)
+    }
+
+    /// `ime.engineModeChanged` (appended to v1) carries its epoch and mode on the wire, and
+    /// `stamped(epoch:)` replaces the epoch only.
+    @Test func engineModeChangedRoundTripsAndIsStamped() throws {
+        let epoch = UUID()
+        let message = IMEToAgent.engineModeChanged(sessionEpoch: epoch, engineMode: "rime")
+        #expect(message.kind == "ime.engineModeChanged" && message.sessionEpoch == epoch)
+        let frame = try IPCWireCodec.encode(IPCEnvelope(sequence: 7, message: message, generationID: nil))
+        let json = String(decoding: frame, as: UTF8.self)
+        #expect(json.contains("\"kind\":\"ime.engineModeChanged\"") && json.contains("\"engineMode\":\"rime\""))
+        let decoded = try IPCWireCodec.decode(IMEToAgent.self, from: frame)
+        #expect(decoded.payload == message && decoded.isConsistent)
+        let other = UUID()
+        #expect(message.stamped(epoch: other) == .engineModeChanged(sessionEpoch: other, engineMode: "rime"))
     }
 
     /// `settingsRevision` is append-only: a v1 frame without it decodes as revision 0.

@@ -121,6 +121,7 @@ final class EngineHost {
             }
         case .failure(let error):
             state = .unavailable(String(describing: error))
+            ipc?.setEngineMode("unavailable")
             log.fault("RimeEngine unavailable: \(String(describing: error), privacy: .public)")
         }
     }

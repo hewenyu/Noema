@@ -229,6 +229,9 @@ public final class IPCConnectionManager: @unchecked Sendable {
         var helloGeneration: UInt64 = 0
         var heartbeatGeneration: UInt64 = 0
         var engineMode = "booting"
+        /// The engine mode the agent last heard in this attempt: `hello`'s, then each
+        /// `engineModeChanged` handed to the transport. `nil` while stopped.
+        var announcedEngineMode: String?
         var retryTimer: (any IPCCancellable)?
         var livenessTimer: (any IPCCancellable)?
         var heartbeatTimer: (any IPCCancellable)?
@@ -249,6 +252,9 @@ public final class IPCConnectionManager: @unchecked Sendable {
         var onStateChange: (@Sendable (IPCConnectionState) -> Void)?
         var onMessage: (@Sendable (AgentToIME) -> Void)?
     }
+
+    /// The placeholder epoch of queued messages; `drain()` stamps the connection's own.
+    static let unstampedEpoch = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
     public let queue: DispatchQueue
     public let policy: IPCReconnectPolicy
@@ -319,9 +325,23 @@ public final class IPCConnectionManager: @unchecked Sendable {
         core.withLock { $0.onMessage = handler }
     }
 
-    /// Reported in the next `hello` (`rime`, `safeMode`, `booting`, `unavailable`).
+    /// Reported in the next `hello` (`rime`, `safeMode`, `booting`, `unavailable`) and, on a
+    /// healthy connection, at once in `engineModeChanged`. A mode changed mid-handshake is
+    /// sent when `helloAck` arrives; one withheld under secure input on the next
+    /// `heartbeatAck` or mode change. Never blocks.
     public func setEngineMode(_ mode: String) {
         core.withLock { $0.engineMode = mode }
+        syncEngineMode()
+    }
+
+    /// Queues `engineModeChanged` when healthy and the agent last heard another mode.
+    private func syncEngineMode() {
+        let mode = core.withLock { core -> String? in
+            guard core.state == .healthy, core.engineMode != core.announcedEngineMode else { return nil }
+            return core.engineMode
+        }
+        guard let mode else { return }
+        sendFireAndForget(.engineModeChanged(sessionEpoch: Self.unstampedEpoch, engineMode: mode))
     }
 
     /// Runs `body` on `queue` and waits: for tests and shutdown, never on the hot path.
@@ -355,6 +375,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
                     core.running = false
                     core.currentAttemptID = 0
                     core.outbox.removeAll()
+                    core.announcedEngineMode = nil
                     core.notifyToken = NOTIFY_TOKEN_INVALID
                 }
                 cancelTimers(&core)
@@ -371,8 +392,8 @@ public final class IPCConnectionManager: @unchecked Sendable {
 
     /// Queues `message` for the agent and returns at once; never blocks on XPC. Dropped in
     /// O(1) unless healthy, and with the whole outbox under secure input. A
-    /// `compositionStateChanged` replaces the queued one (latest wins); others are dropped
-    /// when `outboxCapacity` is reached. The message's epoch is stamped when it is sent.
+    /// `compositionStateChanged` or `engineModeChanged` replaces the queued one of its kind
+    /// (latest wins); others are dropped when `outboxCapacity` is reached. The message's epoch is stamped when it is sent.
     public func sendFireAndForget(_ message: IMEToAgent) {
         let capacity = policy.outboxCapacity
         let secure = isSecureInputEnabled()
@@ -389,9 +410,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
                 core.statistics.droppedWhileUnhealthy += 1
                 return false
             }
-            if case .compositionStateChanged = message,
-                let index = core.outbox.lastIndex(where: { if case .compositionStateChanged = $0 { true } else { false } })
-            {
+            if message.isLatestWins, let index = core.outbox.lastIndex(where: { $0.kind == message.kind }) {
                 core.outbox[index] = message
                 core.statistics.coalesced += 1
             } else if core.outbox.count >= capacity {
@@ -465,6 +484,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
             core.gate.reset(sessionEpoch: epoch)
             core.lastAppliedSettingsRevision = nil
             core.helloGeneration += 1
+            core.announcedEngineMode = core.engineMode
             core.statistics.connectAttempts += 1
             return (attemptID, epoch, core.helloGeneration, core.engineMode, core.consecutiveFailures + 1)
         }
@@ -578,6 +598,8 @@ public final class IPCConnectionManager: @unchecked Sendable {
             guard accepted else { return }
             guard setState(.healthy) else { return }
             scheduleHeartbeat()
+            // `setEngineMode` ran after `hello` left (Rime finished booting mid-handshake).
+            syncEngineMode()
         case .heartbeatAck:
             // While `.connecting` only `helloAck` may disarm the handshake timeout.
             let accepted = core.withLock { core -> Bool in
@@ -591,6 +613,8 @@ public final class IPCConnectionManager: @unchecked Sendable {
             }
             guard accepted else { return }
             scheduleHeartbeat()
+            // A mode change withheld under secure input catches up once beats resume.
+            syncEngineMode()
         case .settingsSnapshot(_, let settings, let revision):
             let accepted = core.withLock { Self.applySettings(settings, revision: revision, core: &$0) }
             guard accepted else { return }
@@ -701,7 +725,8 @@ public final class IPCConnectionManager: @unchecked Sendable {
             default: generation = nil
             }
             switch send(stamped, generationID: generation, expectingReply: false) {
-            case .sent: continue
+            case .sent:
+                if case .engineModeChanged(_, let mode) = stamped { core.withLock { $0.announcedEngineMode = mode } }
             case .failed: return
             case .suppressed:
                 // Secure input began mid-drain: the rest of the batch is withheld too.
@@ -873,6 +898,16 @@ extension IMEToAgent {
             return .compositionStateChanged(snapshot)
         case .openSettingsRequested:
             return self
+        case .engineModeChanged(_, let mode):
+            return .engineModeChanged(sessionEpoch: epoch, engineMode: mode)
+        }
+    }
+
+    /// A newer queued message of the same kind replaces the older one in the outbox.
+    var isLatestWins: Bool {
+        switch self {
+        case .compositionStateChanged, .engineModeChanged: true
+        case .hello, .heartbeat, .openSettingsRequested: false
         }
     }
 }

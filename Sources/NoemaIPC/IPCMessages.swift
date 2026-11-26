@@ -118,11 +118,15 @@ public enum IMEToAgent: IPCMessage {
     case heartbeat(sessionEpoch: UUID)
     case compositionStateChanged(CompositionSnapshot)
     case openSettingsRequested(section: SettingsSectionID?)
+    /// The engine mode changed after `hello` (appended to v1): `booting` became `rime`,
+    /// `safeMode`, or `unavailable`. Same vocabulary as `IMEHello.engineMode`.
+    case engineModeChanged(sessionEpoch: UUID, engineMode: String)
 
     public static let helloKind = "ime.hello"
     public static let heartbeatKind = "ime.heartbeat"
     public static let compositionStateChangedKind = "ime.compositionStateChanged"
     public static let openSettingsRequestedKind = "ime.openSettingsRequested"
+    public static let engineModeChangedKind = "ime.engineModeChanged"
 
     public var kind: String {
         switch self {
@@ -130,6 +134,7 @@ public enum IMEToAgent: IPCMessage {
         case .heartbeat: Self.heartbeatKind
         case .compositionStateChanged: Self.compositionStateChangedKind
         case .openSettingsRequested: Self.openSettingsRequestedKind
+        case .engineModeChanged: Self.engineModeChangedKind
         }
     }
 
@@ -140,10 +145,11 @@ public enum IMEToAgent: IPCMessage {
         case .heartbeat(let epoch): epoch
         case .compositionStateChanged(let snapshot): snapshot.sessionEpoch
         case .openSettingsRequested: nil
+        case .engineModeChanged(let epoch, _): epoch
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case kind, hello, sessionEpoch, snapshot, section }
+    private enum CodingKeys: String, CodingKey { case kind, hello, sessionEpoch, snapshot, section, engineMode }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -154,6 +160,10 @@ public enum IMEToAgent: IPCMessage {
             self = .compositionStateChanged(try container.decode(CompositionSnapshot.self, forKey: .snapshot))
         case Self.openSettingsRequestedKind:
             self = .openSettingsRequested(section: try container.decodeIfPresent(SettingsSectionID.self, forKey: .section))
+        case Self.engineModeChangedKind:
+            self = .engineModeChanged(
+                sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
+                engineMode: try container.decode(String.self, forKey: .engineMode))
         default:
             throw IPCError.malformedFrame
         }
@@ -167,6 +177,9 @@ public enum IMEToAgent: IPCMessage {
         case .heartbeat(let epoch): try container.encode(epoch, forKey: .sessionEpoch)
         case .compositionStateChanged(let snapshot): try container.encode(snapshot, forKey: .snapshot)
         case .openSettingsRequested(let section): try container.encodeIfPresent(section, forKey: .section)
+        case .engineModeChanged(let epoch, let mode):
+            try container.encode(epoch, forKey: .sessionEpoch)
+            try container.encode(mode, forKey: .engineMode)
         }
     }
 }
