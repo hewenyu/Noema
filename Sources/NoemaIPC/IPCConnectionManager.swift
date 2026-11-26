@@ -120,6 +120,17 @@ public struct GenerationGate: Sendable, Hashable {
         currentCompositionGenerationID = generationID
     }
 
+    /// The IME shows no composition (focus left, the controller closed, secure input
+    /// dropped it): every AI suggestion is `.notCurrentComposition` until the next one.
+    public mutating func clearComposition() {
+        currentCompositionGenerationID = nil
+    }
+
+    /// `noteComposition(generationID:)` while composing, else `clearComposition()`.
+    public mutating func noteComposition(generationID: UInt64, isComposing: Bool) {
+        if isComposing { noteComposition(generationID: generationID) } else { clearComposition() }
+    }
+
     public mutating func admit(_ envelope: IPCEnvelope<AgentToIME>) -> Decision {
         let decision = decide(envelope)
         if decision == .accept {
@@ -173,7 +184,8 @@ public struct IPCStatistics: Sendable, Hashable {
     public var rateLimitedReadySignals = 0
     /// `helloAck` outside `.connecting` or `heartbeatAck` outside `.healthy`, ignored.
     public var ignoredOutOfStateMessages = 0
-    /// `settingsSnapshot`s older than the applied settings revision, ignored.
+    /// `settingsSnapshot`s, and the settings of a `helloAck`, older than the revision this
+    /// attempt already applied; ignored.
     public var staleSettingsRevisions = 0
     public var gateDrops: [GenerationGate.Decision: Int] = [:]
 
@@ -221,8 +233,10 @@ public final class IPCConnectionManager: @unchecked Sendable {
         /// ready-triggered probe, then waits out its cooldown. Reset on `.healthy` and
         /// when a cooldown elapses.
         var readyProbeUsedInCurrentCircuit = false
-        /// The revision of `settings`; a `settingsSnapshot` below it is ignored.
-        var lastAppliedSettingsRevision: UInt64 = 0
+        /// The revision of `settings` in this attempt; `nil` until the first `helloAck` or
+        /// `settingsSnapshot`. Any settings below it (a `helloAck` overtaken by a push) are
+        /// ignored. Reset by every attempt: a restarted agent counts from 0 again.
+        var lastAppliedSettingsRevision: UInt64?
         var notifyToken: Int32 = NOTIFY_TOKEN_INVALID
         var settings: AgentSettingsSnapshot?
         var statistics = IPCStatistics()
@@ -354,7 +368,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
         let capacity = policy.outboxCapacity
         let schedule = core.withLock { core -> Bool in
             if case .compositionStateChanged(let snapshot) = message {
-                core.gate.noteComposition(generationID: snapshot.generationID)
+                core.gate.noteComposition(generationID: snapshot.generationID, isComposing: snapshot.isComposing)
             }
             guard core.state == .healthy else {
                 core.statistics.droppedWhileUnhealthy += 1
@@ -376,6 +390,13 @@ public final class IPCConnectionManager: @unchecked Sendable {
             return true
         }
         if schedule { queue.async { [self] in drain() } }
+    }
+
+    /// Tells the gate which composition the IME shows, without sending anything: under
+    /// secure input the IME stays silent yet must still drop suggestions for a composition
+    /// it no longer shows. O(1), never blocks; works in every connection state.
+    public func updateLocalComposition(generationID: UInt64, isComposing: Bool) {
+        core.withLock { $0.gate.noteComposition(generationID: generationID, isComposing: isComposing) }
     }
 
     /// The agent announced it is up: retry now instead of waiting out the backoff or
@@ -409,6 +430,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
             core.currentAttemptID = 0
             let epoch = UUID()
             core.gate.reset(sessionEpoch: epoch)
+            core.lastAppliedSettingsRevision = nil
             core.helloGeneration += 1
             core.statistics.connectAttempts += 1
             return (attemptID, epoch, core.helloGeneration, core.engineMode, core.consecutiveFailures + 1)
@@ -483,14 +505,15 @@ public final class IPCConnectionManager: @unchecked Sendable {
         switch envelope.payload {
         case .helloAck(let ack):
             // Only the handshake of the current attempt: a late or repeated ack can neither
-            // reset the failure count nor replace newer settings.
+            // reset the failure count nor replace newer settings. An ack overtaken by a
+            // newer `settingsSnapshot` still completes the handshake but keeps the newer
+            // settings.
             let accepted = core.withLock { core -> Bool in
                 guard case .connecting = core.state else {
                     core.statistics.ignoredOutOfStateMessages += 1
                     return false
                 }
-                core.settings = ack.settings
-                core.lastAppliedSettingsRevision = ack.settingsRevision
+                _ = Self.applySettings(ack.settings, revision: ack.settingsRevision, core: &core)
                 cancelTimers(&core)
                 core.consecutiveFailures = 0
                 core.readyProbeUsedInCurrentCircuit = false
@@ -513,21 +536,26 @@ public final class IPCConnectionManager: @unchecked Sendable {
             guard accepted else { return }
             scheduleHeartbeat()
         case .settingsSnapshot(_, let settings, let revision):
-            let accepted = core.withLock { core -> Bool in
-                guard revision >= core.lastAppliedSettingsRevision else {
-                    core.statistics.staleSettingsRevisions += 1
-                    return false
-                }
-                core.settings = settings
-                core.lastAppliedSettingsRevision = revision
-                return true
-            }
+            let accepted = core.withLock { Self.applySettings(settings, revision: revision, core: &$0) }
             guard accepted else { return }
         case .aiSuggestion:
             break
         }
         guard core.withLock({ $0.running }) else { return }
         outcome.1?(envelope.payload)
+    }
+
+    /// Applies `settings` unless this attempt already applied a newer revision (counted in
+    /// `staleSettingsRevisions`). Equal revisions apply: the agent's next push after a
+    /// crafted or reordered one may repeat it.
+    private static func applySettings(_ settings: AgentSettingsSnapshot, revision: UInt64, core: inout Core) -> Bool {
+        if let current = core.lastAppliedSettingsRevision, revision < current {
+            core.statistics.staleSettingsRevisions += 1
+            return false
+        }
+        core.settings = settings
+        core.lastAppliedSettingsRevision = revision
+        return true
     }
 
     /// Ends the current attempt and schedules the next: backoff, or the open circuit.

@@ -36,9 +36,11 @@ public final class InputSessionCoordinator {
     /// True while `activeClient` shows marked text the shell put there.
     public private(set) var hasMarkedText = false
 
-    /// Called with the engine's state after every result the shell applies (keys, panel
-    /// clicks, `commitComposition`). Never called on a secure-input path, which returns
-    /// before the engine is asked. `EngineHost` reports it to the agent (`NoemaIPC`).
+    /// Called with the engine's state after every composition or mode change the shell
+    /// makes: keys, panel clicks, `commitComposition`, a switch to ASCII mode, and every
+    /// dropped composition (focus loss, controller close, ownership transfer, secure
+    /// input). `EngineHost` hands it to `CompositionIPCReporter`, which updates the local
+    /// generation gate on every call but sends nothing while secure input is on.
     public var onCompositionChange: (@MainActor (CompositionState) -> Void)?
 
     public init(
@@ -124,7 +126,10 @@ public final class InputSessionCoordinator {
         } else {
             commitComposition(token: token, client: client)
         }
-        engineProvider()?.setASCIIMode(true)
+        guard let engine = engineProvider() else { return }
+        // Never inline into `onCompositionChange?(…)`: a nil handler would skip the call.
+        let state = engine.setASCIIMode(true)
+        onCompositionChange?(state)
     }
 
     // MARK: - Keys
@@ -283,14 +288,17 @@ public final class InputSessionCoordinator {
     }
 
     /// Clears the owner's marked text (only if the shell put it there) and the engine's
-    /// composition, keeping `ascii_mode`, and hides the menu. Inserts nothing.
+    /// composition, keeping `ascii_mode`, and hides the menu. Inserts nothing. A cleared
+    /// composition is reported, so neither the agent nor the local gate keeps the old one.
     private func dropComposition() {
         if hasMarkedText { activeClient?.clearMarkedText() }
         hasMarkedText = false
+        var clearedState: CompositionState?
         if let engine = engineProvider(), engine.currentState.isComposing {
-            engine.clearComposition()
+            clearedState = engine.clearComposition()
         }
         candidatePresenter.hide()
+        if let clearedState { onCompositionChange?(clearedState) }
     }
 
     /// Drops the owner's composition and leaves no owner.

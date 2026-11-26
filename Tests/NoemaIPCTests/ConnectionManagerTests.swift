@@ -20,8 +20,11 @@ final class InMemoryRig {
     let manager: IPCConnectionManager
     let recorder = StateRecorder()
 
-    init(policy: IPCReconnectPolicy = InMemoryRig.policy, startAgent: Bool = true, readyNotificationName: String? = nil) {
-        agent = AgentServiceCoordinator(transport: server, agentVersion: "9.9.9")
+    init(
+        policy: IPCReconnectPolicy = InMemoryRig.policy, startAgent: Bool = true, readyNotificationName: String? = nil,
+        agentOnChange: @escaping @Sendable (AgentServiceSnapshot) -> Void = { _ in }
+    ) {
+        agent = AgentServiceCoordinator(transport: server, agentVersion: "9.9.9", onChange: agentOnChange)
         if startAgent { agent.start() }
         transport = InMemoryClientTransport(server: server, clock: clock)
         manager = IPCConnectionManager(
@@ -383,6 +386,33 @@ final class InMemoryRig {
         let seen = rig.recorder.received.compactMap { if case .settingsSnapshot(_, let s, _) = $0 { s.panelBackdropPreference } else { nil } }
         #expect(seen == ["three", "agent"])
         #expect(rig.manager.state == .healthy && rig.manager.consecutiveFailures == 0)
+    }
+
+    /// The agent pushes revision 1 while handling `hello`, so the client sees that
+    /// `settingsSnapshot` before the `helloAck` carrying revision 0. The ack still completes
+    /// the handshake, but its older settings must not roll revision 1 back.
+    @Test func settingsPushedBeforeHelloAckAreNotRolledBack() throws {
+        let push = PushSettingsDuringHello(AgentSettingsSnapshot(panelBackdropPreference: "visualEffect"))
+        let rig = InMemoryRig(agentOnChange: push.onChange)
+        push.attach(rig.agent)
+        rig.startHealthy()
+        #expect(rig.recorder.shape == ["connecting(1)", "healthy"])
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "visualEffect", "helloAck (revision 0, glass) rolled settings back")
+        #expect(rig.manager.statistics.staleSettingsRevisions == 1)
+        #expect(rig.manager.statistics.ignoredOutOfStateMessages == 0)
+        #expect(rig.manager.consecutiveFailures == 0)
+        // Each attempt starts its own revision baseline: a restarted agent counts from 0.
+        rig.agent.stop()
+        rig.settle()
+        let restarted = AgentServiceCoordinator(
+            transport: rig.server, agentVersion: "9.9.9", settings: AgentSettingsSnapshot(panelBackdropPreference: "restarted"))
+        restarted.start()
+        defer { restarted.stop() }
+        rig.clock.advance(by: .milliseconds(150))
+        rig.settle()
+        #expect(rig.manager.state == .healthy)
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "restarted", "a new agent's revision 0 is not stale")
+        #expect(rig.manager.statistics.staleSettingsRevisions == 1)
     }
 
     /// The ready notification is unauthenticated: spamming it cannot bypass the circuit

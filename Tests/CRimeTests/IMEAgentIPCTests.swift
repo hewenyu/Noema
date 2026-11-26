@@ -142,7 +142,9 @@ extension LibrimeSerializedTests {
             reporter.requestOpenSettings(section: .general)
             settle()
             #expect(server.receivedFrames.count == framesBefore, "an IPC frame left the IME under secure input")
-            #expect(reporter.suppressedForSecureInput == 2)
+            // The dropped "ni" (first secure key), the ASCII switch, the direct report, and
+            // the Settings request.
+            #expect(reporter.suppressedForSecureInput == 4)
             #expect(manager.state == .healthy)
 
             secure.isOn = false
@@ -152,6 +154,128 @@ extension LibrimeSerializedTests {
             #expect(server.receivedFrames.count > framesBefore, "reports resume once secure input ends")
         }
     }
+}
+
+extension LibrimeSerializedTests.IMEAgentIPCTests {
+    /// Each way a composition leaves the screen without a commit.
+    enum Leave: CaseIterable {
+        case deactivate, controllerWillClose, ownershipTransfer
+    }
+
+    /// Typing `ni`, then losing it (focus loss, controller close, another client taking
+    /// over) tells the real agent over real libxpc that nothing is composing, and a late AI
+    /// suggestion for the lost generation is dropped as `.notCurrentComposition`. A
+    /// suggestion for the next live composition is still delivered.
+    @Test func droppedCompositionsClearTheAgentAndRejectLateSuggestions() throws {
+        let harness = try Harness()
+        defer { harness.shutdown() }
+        let link = try AgentLink(readyNotificationName: "dev.noema.tests.ready.\(UUID().uuidString)")
+        defer { link.shutdown() }
+        let reporter = CompositionIPCReporter(manager: link.manager, isSecureInputEnabled: { false })
+        harness.coordinator.onCompositionChange = { reporter.report($0) }
+        let suggestions = SuggestionRecorder()
+        link.manager.setMessageHandler { suggestions.record($0) }
+        link.manager.start()
+        try #require(poll { link.manager.state == .healthy }, "state: \(link.manager.state)")
+
+        func push(_ generation: UInt64) {
+            link.agent.pushSuggestion(AISuggestionMessage(
+                sessionEpoch: link.manager.sessionEpoch, generationID: generation, suggestion: "s\(generation)", provider: "test"))
+        }
+        func notCurrentDrops() -> Int { link.manager.statistics.gateDrops[.notCurrentComposition] ?? 0 }
+        func typeNi(token: UUID, client: RecordingClient) -> UInt64 {
+            for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            let generation = harness.engine.currentState.generationID
+            #expect(poll { link.agent.snapshot.lastComposition.map { $0.generationID == generation && $0.isComposing } == true })
+            return generation
+        }
+
+        for leave in Leave.allCases {
+            let token = UUID()
+            let client = RecordingClient()
+            let oldGen = typeNi(token: token, client: client)
+            let other = (token: UUID(), client: RecordingClient())
+            switch leave {
+            case .deactivate: harness.coordinator.deactivate(token: token)
+            case .controllerWillClose: harness.coordinator.controllerWillClose(token: token)
+            case .ownershipTransfer: harness.coordinator.activate(token: other.token, client: other.client)
+            }
+            #expect(!harness.engine.currentState.isComposing, "\(leave)")
+            #expect(
+                poll { link.agent.snapshot.lastComposition.map { !$0.isComposing && $0.generationID > oldGen } == true },
+                "\(leave): the agent still believes generation \(oldGen) is composing: \(String(describing: link.agent.snapshot.lastComposition))")
+
+            let dropsBefore = notCurrentDrops()
+            push(oldGen)
+            #expect(poll { notCurrentDrops() > dropsBefore || suggestions.count(for: oldGen) > 0 }, "\(leave)")
+            #expect(suggestions.count(for: oldGen) == 0, "\(leave): a late suggestion for generation \(oldGen) was delivered")
+            #expect(notCurrentDrops() == dropsBefore + 1, "\(leave)")
+
+            // The next live composition still receives its suggestion.
+            let liveGen = typeNi(token: other.token, client: other.client)
+            push(liveGen)
+            #expect(poll { suggestions.count(for: liveGen) == 1 }, "\(leave)")
+            harness.coordinator.deactivate(token: other.token)
+        }
+        #expect(link.manager.state == .healthy)
+    }
+
+    /// Secure input drops the composition without one IPC frame leaving the IME, yet the
+    /// local gate forgets it: a late suggestion for it is dropped as `.notCurrentComposition`.
+    @Test func secureInputDropInvalidatesTheLocalGateSilently() throws {
+        let secure = SecureFlag()
+        let harness = try Harness(isSecureInputEnabled: { secure.isOn })
+        defer { harness.shutdown() }
+        let server = InMemoryServerTransport()
+        let agent = AgentServiceCoordinator(transport: server, agentVersion: "1.0.0-test")
+        agent.start()
+        let manager = IPCConnectionManager(
+            transport: InMemoryClientTransport(server: server, clock: ManualIPCClock()),
+            client: .init(bundleID: NoemaPaths.imeBundleID, version: "0.0.0-test"),
+            policy: .init(heartbeatInterval: nil), clock: ManualIPCClock(), readyNotificationName: nil)
+        defer { manager.stop() }
+        let reporter = CompositionIPCReporter(manager: manager, isSecureInputEnabled: { secure.isOn })
+        harness.coordinator.onCompositionChange = { reporter.report($0) }
+        let suggestions = SuggestionRecorder()
+        manager.setMessageHandler { suggestions.record($0) }
+        func settle() { for _ in 0..<12 { manager.sync {} } }
+        manager.start()
+        settle()
+        try #require(manager.state == .healthy)
+
+        let client = RecordingClient()
+        let token = UUID()
+        for key in "ni" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+        settle()
+        let oldGen = harness.engine.currentState.generationID
+        #expect(manager.gate.currentCompositionGenerationID == oldGen)
+        let framesBefore = server.receivedFrames.count
+
+        secure.isOn = true
+        #expect(!harness.coordinator.handleKey(.text("h"), token: token, client: client))
+        settle()
+        #expect(!harness.engine.currentState.isComposing, "the secure key dropped the composition")
+        #expect(server.receivedFrames.count == framesBefore, "an IPC frame left the IME under secure input")
+        #expect(reporter.suppressedForSecureInput == 1)
+        #expect(manager.gate.currentCompositionGenerationID == nil, "the local gate still holds generation \(oldGen)")
+
+        agent.pushSuggestion(AISuggestionMessage(sessionEpoch: manager.sessionEpoch, generationID: oldGen, suggestion: "late", provider: "test"))
+        settle()
+        #expect(suggestions.count(for: oldGen) == 0, "a late suggestion for the dropped composition was delivered")
+        #expect(manager.statistics.gateDrops[.notCurrentComposition] == 1)
+        #expect(server.receivedFrames.count == framesBefore)
+    }
+}
+
+/// AI suggestions the manager delivered, by generation.
+final class SuggestionRecorder: @unchecked Sendable {
+    private let generations = OSAllocatedUnfairLock<[UInt64]>(initialState: [])
+
+    func record(_ message: AgentToIME) {
+        if case .aiSuggestion(let suggestion) = message { generations.withLock { $0.append(suggestion.generationID) } }
+    }
+
+    func count(for generation: UInt64) -> Int { generations.withLock { $0.filter { $0 == generation }.count } }
 }
 
 @MainActor

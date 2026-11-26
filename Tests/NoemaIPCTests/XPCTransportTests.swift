@@ -35,12 +35,13 @@ final class XPCRig {
             circuitCooldown: .seconds(60), handshakeTimeout: .seconds(2), heartbeatInterval: nil),
         readyNotificationName: String? = nil,
         serverPolicy: PeerIdentityPolicy? = nil,
-        clientPolicy: PeerIdentityPolicy? = nil
+        clientPolicy: PeerIdentityPolicy? = nil,
+        agentOnChange: @escaping @Sendable (AgentServiceSnapshot) -> Void = { _ in }
     ) throws {
         let policy = try PeerIdentityPolicy.selfTest()
         self.serverPolicy = serverPolicy ?? policy
         self.clientPolicy = clientPolicy ?? policy
-        (server, agent) = try Self.makeAgent(policy: self.serverPolicy)
+        (server, agent) = try Self.makeAgent(policy: self.serverPolicy, onChange: agentOnChange)
         endpoint.set(server.endpoint)
         let box = endpoint
         let transport = XPCClientTransport(policy: self.clientPolicy, queue: queue) { box.get().map { .endpoint($0) } }
@@ -50,9 +51,11 @@ final class XPCRig {
         recorder.attach(to: manager)
     }
 
-    static func makeAgent(policy: PeerIdentityPolicy) throws -> (XPCListenerServerTransport, AgentServiceCoordinator) {
+    static func makeAgent(
+        policy: PeerIdentityPolicy, onChange: @escaping @Sendable (AgentServiceSnapshot) -> Void = { _ in }
+    ) throws -> (XPCListenerServerTransport, AgentServiceCoordinator) {
         let server = XPCListenerServerTransport(mode: .anonymous, policy: policy)
-        let agent = AgentServiceCoordinator(transport: server, agentVersion: "1.0.0-test")
+        let agent = AgentServiceCoordinator(transport: server, agentVersion: "1.0.0-test", onChange: onChange)
         try #require(agent.start() == .listening)
         try #require(server.endpoint != nil)
         return (server, agent)
@@ -111,6 +114,22 @@ final class XPCRig {
         // Heartbeats keep flowing over request/reply.
         #expect(waitUntil { rig.recorder.received.filter { if case .heartbeatAck = $0 { true } else { false } }.count >= 2 })
         #expect(rig.manager.state == .healthy)
+    }
+
+    /// Real libxpc: the agent pushes revision 1 (`visualEffect`) from inside its `hello`
+    /// handler, before the `helloAck` reply carrying revision 0 (`glass`). The ack still
+    /// makes the connection healthy without rolling the settings back.
+    @Test func settingsPushedBeforeHelloAckSurviveTheAck() throws {
+        let push = PushSettingsDuringHello(AgentSettingsSnapshot(panelBackdropPreference: "visualEffect"))
+        let rig = try XPCRig(agentOnChange: push.onChange)
+        defer { rig.shutdown() }
+        push.attach(rig.agent)
+        rig.manager.start()
+        #expect(waitUntil { rig.manager.state == .healthy }, "state: \(rig.manager.state)")
+        #expect(waitUntil { rig.manager.agentSettings?.panelBackdropPreference == "visualEffect" })
+        #expect(rig.manager.statistics.staleSettingsRevisions == 1, "the push must arrive before the ack it overtook")
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "visualEffect")
+        #expect(rig.recorder.shape == ["connecting(1)", "healthy"])
     }
 
     /// Cancelling the listener (the agent dying) drives the client through degraded,

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import NoemaAgentCore
 import NoemaCore
 @testable import NoemaIPC
 import Testing
@@ -32,6 +33,32 @@ final class StateRecorder: @unchecked Sendable {
     func attach(to manager: IPCConnectionManager) {
         manager.setStateObserver { [self] in record($0) }
         manager.setMessageHandler { [self] in record($0) }
+    }
+}
+
+/// The agent pushing new settings while it handles the IME's first `hello`, so the
+/// `settingsSnapshot` leaves before the `helloAck` built from the older revision. Pass
+/// `onChange` to the agent's `onChange`, then `attach(_:)` the agent.
+final class PushSettingsDuringHello: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var agent: AgentServiceCoordinator?
+    private var fired = false
+    let settings: AgentSettingsSnapshot
+
+    init(_ settings: AgentSettingsSnapshot) { self.settings = settings }
+
+    func attach(_ agent: AgentServiceCoordinator) { lock.withLock { self.agent = agent } }
+
+    var onChange: @Sendable (AgentServiceSnapshot) -> Void {
+        { [self] snapshot in
+            guard snapshot.lastHello != nil else { return }
+            let target = lock.withLock { () -> AgentServiceCoordinator? in
+                guard !fired, let agent else { return nil }
+                fired = true
+                return agent
+            }
+            target?.updateSettings(settings)
+        }
     }
 }
 

@@ -74,7 +74,7 @@ IMKit creates one `NoemaInputController` per client session; it forwards every c
 
 - **Peer identity** — both sides set an `XPCPeerRequirement` and re-check every message's audit token with `PeerIdentityVerifier`. A certificate-signed binary always pins its own team and leaf certificate; ad-hoc peers pass only when the binary itself has a valid ad-hoc signature. Without a valid self signature the policy is unpinned strict: no session or listener is opened.
 - **Connection** — `IPCConnectionManager` handshakes within 500 ms, heartbeats, and on failure degrades, backs off exponentially with jitter, and opens a circuit breaker; the agent's `dev.noema.agent.ready` notification retries at once, at most once per open circuit. `helloAck` counts only while connecting, `heartbeatAck` only while healthy, and settings never move to an older `settingsRevision`. Each attempt has an `attemptID`, so late callbacks are ignored.
-- **Hot path** — the IME only sends fire-and-forget metadata (composition updates coalesce in a bounded outbox) and drops it while unhealthy; `CompositionIPCReporter` sends nothing under secure input. `GenerationGate` drops agent messages from another session epoch or an older generation.
+- **Hot path** — the IME only sends fire-and-forget metadata (composition updates coalesce in a bounded outbox) and drops it while unhealthy; `CompositionIPCReporter` sends nothing under secure input. `GenerationGate` drops agent messages from another epoch or an older generation, and suggestions for a cleared composition.
 
 Rationale: [XPC IPC note](../.agents/notes/implemented/architecture/2026-11-25-xpc-ipc-and-companion-agent.md).
 
