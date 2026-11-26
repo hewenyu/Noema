@@ -105,7 +105,8 @@ extension LibrimeSerializedTests {
         }
 
         /// While `IsSecureEventInputEnabled()` is true not one IPC frame leaves the IME:
-        /// keys, commits, panel clicks, mode switches, and direct reports are all silent.
+        /// keys, commits, panel clicks, mode switches, direct reports, and the live 15 s
+        /// heartbeat are all silent. The manager is wired with the same flag, as `EngineHost` does.
         @Test func secureInputEmitsZeroIPCMessages() throws {
             let secure = SecureFlag()
             let harness = try Harness(isSecureInputEnabled: { secure.isOn })
@@ -113,10 +114,12 @@ extension LibrimeSerializedTests {
             let server = InMemoryServerTransport()
             let agent = AgentServiceCoordinator(transport: server, agentVersion: "1.0.0-test")
             agent.start()
+            let clock = ManualIPCClock()
             let manager = IPCConnectionManager(
-                transport: InMemoryClientTransport(server: server, clock: ManualIPCClock()),
+                transport: InMemoryClientTransport(server: server, clock: clock),
                 client: .init(bundleID: NoemaPaths.imeBundleID, version: "0.0.0-test"),
-                policy: .init(heartbeatInterval: nil), clock: ManualIPCClock(), readyNotificationName: nil)
+                policy: .init(heartbeatInterval: .seconds(15)), clock: clock, readyNotificationName: nil,
+                isSecureInputEnabled: { secure.isOn })
             defer { manager.stop() }
             let reporter = CompositionIPCReporter(manager: manager, isSecureInputEnabled: { secure.isOn })
             harness.coordinator.onCompositionChange = { reporter.report($0) }
@@ -141,7 +144,13 @@ extension LibrimeSerializedTests {
             reporter.report(harness.engine.currentState)
             reporter.requestOpenSettings(section: .general)
             settle()
+            // Four heartbeat intervals pass under secure input.
+            for _ in 0..<4 {
+                clock.advance(by: .seconds(15))
+                settle()
+            }
             #expect(server.receivedFrames.count == framesBefore, "an IPC frame left the IME under secure input")
+            #expect(manager.statistics.suppressedForSecureInput >= 4, "the skipped heartbeats")
             // The dropped "ni" (first secure key), the ASCII switch, the direct report, and
             // the Settings request.
             #expect(reporter.suppressedForSecureInput == 4)
@@ -152,6 +161,11 @@ extension LibrimeSerializedTests {
             _ = harness.coordinator.handleKey(.text("a"), token: token, client: client)
             settle()
             #expect(server.receivedFrames.count > framesBefore, "reports resume once secure input ends")
+            let framesAfterResume = server.receivedFrames.count
+            clock.advance(by: .seconds(15))
+            settle()
+            #expect(server.receivedFrames.count == framesAfterResume + 1, "heartbeats resume once secure input ends")
+            #expect(manager.state == .healthy)
         }
     }
 }
@@ -278,9 +292,13 @@ final class SuggestionRecorder: @unchecked Sendable {
     func count(for generation: UInt64) -> Int { generations.withLock { $0.filter { $0 == generation }.count } }
 }
 
-@MainActor
-final class SecureFlag {
-    var isOn = false
+/// The secure-input flag both the main-actor coordinator and the manager's queue read.
+final class SecureFlag: Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: false)
+    var isOn: Bool {
+        get { state.withLock { $0 } }
+        set { state.withLock { $0 = newValue } }
+    }
 }
 
 /// Polls `condition` every 5 ms for up to `timeout`.

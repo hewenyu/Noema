@@ -4,6 +4,7 @@ import NoemaAgentCore
 import NoemaCore
 @testable import NoemaIPC
 import notify
+import os
 import Testing
 
 /// `IPCConnectionManager` against the real `AgentServiceCoordinator` over the in-memory
@@ -19,6 +20,8 @@ final class InMemoryRig {
     let transport: InMemoryClientTransport
     let manager: IPCConnectionManager
     let recorder = StateRecorder()
+    /// What the manager reads as `IsSecureEventInputEnabled()`.
+    let secure = SecureInputFlag()
 
     init(
         policy: IPCReconnectPolicy = InMemoryRig.policy, startAgent: Bool = true, readyNotificationName: String? = nil,
@@ -29,7 +32,8 @@ final class InMemoryRig {
         transport = InMemoryClientTransport(server: server, clock: clock)
         manager = IPCConnectionManager(
             transport: transport, client: .init(bundleID: "dev.noema.tests.ime", version: "1.0.0"), policy: policy,
-            clock: clock, jitter: FixedJitter(fraction: 1), readyNotificationName: readyNotificationName)
+            clock: clock, jitter: FixedJitter(fraction: 1), readyNotificationName: readyNotificationName,
+            isSecureInputEnabled: { [secure] in secure.isOn })
         recorder.attach(to: manager)
     }
 
@@ -44,7 +48,35 @@ final class InMemoryRig {
         #expect(manager.state == .healthy)
     }
 
+    /// The kinds of every frame the agent received, in order.
+    var receivedKinds: [String] {
+        server.receivedFrames.compactMap { try? IPCWireCodec.decode(IMEToAgent.self, from: $0).kind }
+    }
+
     deinit { manager.stop() }
+}
+
+final class SecureInputFlag: Sendable {
+    private struct State {
+        var isOn = false
+        /// Reads left before secure input turns on by itself; `nil` while unarmed.
+        var readsUntilOn: Int?
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    var isOn: Bool {
+        get {
+            state.withLock { state in
+                if let reads = state.readsUntilOn {
+                    if reads == 0 { state.isOn = true; state.readsUntilOn = nil } else { state.readsUntilOn = reads - 1 }
+                }
+                return state.isOn
+            }
+        }
+        set { state.withLock { $0 = State(isOn: newValue) } }
+    }
+
+    /// Secure input begins after `reads` more reads: a race against the manager's checks.
+    func turnOn(afterReads reads: Int) { state.withLock { $0.readsUntilOn = reads } }
 }
 
 @Suite struct ConnectionManagerTests {
@@ -463,6 +495,107 @@ final class InMemoryRig {
             #expect(clock.pendingTimerCount == 1)
         }
         #expect(clock.pendingTimerCount == 0)
+    }
+
+    /// Secure input silences the manager itself, not only the reporter: with the production
+    /// 15 s heartbeat, a composition frame queued just before secure input began, and a
+    /// reconnect plus ready signal, not one frame reaches the transport. A healthy
+    /// connection stays healthy, no failure is counted, and everything resumes afterwards.
+    @MainActor
+    @Test func secureInputSilencesHeartbeatsQueuedFramesAndReconnects() throws {
+        var policy = InMemoryRig.policy
+        policy.heartbeatInterval = IPCReconnectPolicy.default.heartbeatInterval
+        #expect(policy.heartbeatInterval == .seconds(15))
+        let rig = InMemoryRig(policy: policy)
+        rig.startHealthy()
+
+        // 1. Four heartbeat intervals under secure input: no heartbeat, still healthy.
+        let framesBefore = rig.server.receivedFrames.count
+        rig.secure.isOn = true
+        for _ in 0..<4 {
+            rig.clock.advance(by: .seconds(15))
+            rig.settle()
+        }
+        #expect(rig.server.receivedFrames.count == framesBefore, "kinds: \(rig.receivedKinds)")
+        #expect(rig.manager.state == .healthy)
+        #expect(rig.manager.statistics.suppressedForSecureInput >= 4)
+        rig.secure.isOn = false
+        rig.clock.advance(by: .seconds(15))
+        rig.settle()
+        rig.clock.advance(by: .milliseconds(300))
+        #expect(rig.receivedKinds.last == IMEToAgent.heartbeatKind, "heartbeats resume")
+        #expect(rig.manager.state == .healthy, "the heartbeat was acked")
+
+        // 2. A composition frame queued just before secure input began never drains.
+        let reporter = CompositionIPCReporter(manager: rig.manager, isSecureInputEnabled: { [secure = rig.secure] in secure.isOn })
+        let framesBeforeQueued = rig.server.receivedFrames.count
+        let stall = DispatchSemaphore(value: 0)
+        rig.manager.queue.async { stall.wait() }
+        reporter.report(CompositionState(isComposing: true, generationID: 900))
+        #expect(reporter.reportedCount == 1, "queued for the agent")
+        rig.secure.isOn = true
+        reporter.report(CompositionState(isComposing: false, generationID: 901))
+        stall.signal()
+        rig.settle()
+        #expect(!rig.receivedKinds.dropFirst(framesBeforeQueued).contains(IMEToAgent.compositionStateChangedKind), "kinds: \(rig.receivedKinds)")
+        #expect(rig.server.receivedFrames.count == framesBeforeQueued)
+        #expect(rig.manager.gate.currentCompositionGenerationID == nil)
+        #expect(rig.agent.snapshot.lastComposition == nil)
+
+        // 3. The agent dies under secure input: no reconnect, no hello, no counted failure,
+        // even after the backoff and a ready signal with the agent back.
+        rig.agent.stop()
+        rig.settle()
+        #expect(rig.manager.state == .reconnecting(attempt: 1, nextRetryDelay: .milliseconds(150)))
+        let connectCalls = rig.transport.connectCalls
+        let hellos = rig.receivedKinds.filter { $0 == IMEToAgent.helloKind }.count
+        rig.agent.start()
+        rig.clock.advance(by: .seconds(5))
+        rig.manager.agentReadySignalReceived()
+        rig.settle()
+        rig.clock.advance(by: .seconds(5))
+        rig.settle()
+        #expect(rig.transport.connectCalls == connectCalls)
+        #expect(rig.receivedKinds.filter { $0 == IMEToAgent.helloKind }.count == hellos, "kinds: \(rig.receivedKinds)")
+        #expect(rig.manager.consecutiveFailures == 1)
+        #expect(rig.manager.state == .reconnecting(attempt: 1, nextRetryDelay: .milliseconds(150)))
+        rig.secure.isOn = false
+        rig.clock.advance(by: policy.baseDelay)
+        rig.settle()
+        #expect(rig.manager.state == .healthy && rig.manager.consecutiveFailures == 0)
+        #expect(rig.receivedKinds.filter { $0 == IMEToAgent.helloKind }.count == hellos + 1)
+    }
+
+    /// Secure input that begins after a timer's check but before its frame is sent: the
+    /// final gate in `send` still withholds the heartbeat and the `hello`, and neither
+    /// counts as a failure.
+    @Test func secureInputBeginningJustBeforeASendIsStillSilent() {
+        var policy = InMemoryRig.policy
+        policy.heartbeatInterval = .seconds(15)
+        let rig = InMemoryRig(policy: policy)
+        rig.startHealthy()
+        let framesBefore = rig.server.receivedFrames.count
+        rig.secure.turnOn(afterReads: 1)
+        rig.clock.advance(by: .seconds(15))
+        rig.settle()
+        rig.clock.advance(by: .seconds(1))
+        #expect(rig.server.receivedFrames.count == framesBefore, "kinds: \(rig.receivedKinds)")
+        #expect(rig.manager.state == .healthy, "a withheld heartbeat arms no liveness timeout")
+
+        rig.secure.isOn = false
+        rig.agent.stop()
+        rig.settle()
+        rig.agent.start()
+        rig.secure.turnOn(afterReads: 1)
+        rig.clock.advance(by: .milliseconds(150))
+        rig.settle()
+        #expect(rig.receivedKinds.filter { $0 == IMEToAgent.helloKind }.count == 1, "kinds: \(rig.receivedKinds)")
+        #expect(rig.manager.consecutiveFailures == 1)
+        #expect(!rig.transport.isConnected, "the withheld attempt is disconnected")
+        rig.secure.isOn = false
+        rig.clock.advance(by: policy.baseDelay)
+        rig.settle()
+        #expect(rig.manager.state == .healthy && rig.receivedKinds.filter { $0 == IMEToAgent.helloKind }.count == 2)
     }
 
     @Test func stopCancelsTimersAndIgnoresLateEvents() {

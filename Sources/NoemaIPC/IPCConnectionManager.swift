@@ -187,6 +187,8 @@ public struct IPCStatistics: Sendable, Hashable {
     /// `settingsSnapshot`s, and the settings of a `helloAck`, older than the revision this
     /// attempt already applied; ignored.
     public var staleSettingsRevisions = 0
+    /// Frames, heartbeats, and connect attempts withheld because secure input was on.
+    public var suppressedForSecureInput = 0
     public var gateDrops: [GenerationGate.Decision: Int] = [:]
 
     public init() {}
@@ -199,6 +201,10 @@ public struct IPCStatistics: Sendable, Hashable {
 /// queue. `sendFireAndForget(_:)` is the only hot-path entry: it takes one unfair lock for
 /// O(capacity) work and at most enqueues one block, never waits on XPC, and drops in O(1)
 /// while the connection is not healthy.
+///
+/// While `isSecureInputEnabled()` is true nothing reaches the transport: the outbox is
+/// purged, heartbeats and connect attempts are skipped and retried later, and `send` itself
+/// refuses as a last gate. A healthy connection stays healthy and resumes on its own.
 public final class IPCConnectionManager: @unchecked Sendable {
     public struct ClientInfo: Sendable, Hashable {
         public var bundleID: String
@@ -251,6 +257,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
     private let clock: any IPCClock
     private let jitter: any JitterSource
     private let readyNotificationName: String?
+    private let isSecureInputEnabled: @Sendable () -> Bool
     private let core = OSAllocatedUnfairLock(initialState: Core())
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let log = NoemaLog.ipc("connection")
@@ -262,7 +269,8 @@ public final class IPCConnectionManager: @unchecked Sendable {
         clock: any IPCClock = SystemIPCClock(),
         jitter: any JitterSource = SystemJitter(),
         readyNotificationName: String? = NoemaPaths.agentReadyNotificationName,
-        queue: DispatchQueue = DispatchQueue(label: "dev.noema.ipc.connection", qos: .utility)
+        queue: DispatchQueue = DispatchQueue(label: "dev.noema.ipc.connection", qos: .utility),
+        isSecureInputEnabled: @escaping @Sendable () -> Bool = { false }
     ) {
         self.transport = transport
         self.client = client
@@ -270,6 +278,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
         self.clock = clock
         self.jitter = jitter
         self.readyNotificationName = readyNotificationName
+        self.isSecureInputEnabled = isSecureInputEnabled
         self.queue = queue
         queue.setSpecific(key: queueKey, value: 1)
     }
@@ -361,14 +370,20 @@ public final class IPCConnectionManager: @unchecked Sendable {
     // MARK: - Hot path
 
     /// Queues `message` for the agent and returns at once; never blocks on XPC. Dropped in
-    /// O(1) unless healthy. A `compositionStateChanged` replaces the queued one (latest
-    /// wins); others are dropped when `outboxCapacity` is reached. The message's epoch is
-    /// stamped when it is sent.
+    /// O(1) unless healthy, and with the whole outbox under secure input. A
+    /// `compositionStateChanged` replaces the queued one (latest wins); others are dropped
+    /// when `outboxCapacity` is reached. The message's epoch is stamped when it is sent.
     public func sendFireAndForget(_ message: IMEToAgent) {
         let capacity = policy.outboxCapacity
+        let secure = isSecureInputEnabled()
         let schedule = core.withLock { core -> Bool in
             if case .compositionStateChanged(let snapshot) = message {
                 core.gate.noteComposition(generationID: snapshot.generationID, isComposing: snapshot.isComposing)
+            }
+            guard !secure else {
+                core.outbox.removeAll()
+                core.statistics.suppressedForSecureInput += 1
+                return false
             }
             guard core.state == .healthy else {
                 core.statistics.droppedWhileUnhealthy += 1
@@ -394,9 +409,20 @@ public final class IPCConnectionManager: @unchecked Sendable {
 
     /// Tells the gate which composition the IME shows, without sending anything: under
     /// secure input the IME stays silent yet must still drop suggestions for a composition
-    /// it no longer shows. O(1), never blocks; works in every connection state.
+    /// it no longer shows. A queued composition frame never outlives a drop (`isComposing`
+    /// false), and secure input purges the whole outbox. O(capacity), never blocks; works
+    /// in every connection state.
     public func updateLocalComposition(generationID: UInt64, isComposing: Bool) {
-        core.withLock { $0.gate.noteComposition(generationID: generationID, isComposing: isComposing) }
+        let secure = isSecureInputEnabled()
+        core.withLock { core in
+            core.gate.noteComposition(generationID: generationID, isComposing: isComposing)
+            if secure {
+                core.statistics.suppressedForSecureInput += core.outbox.count
+                core.outbox.removeAll()
+            } else if !isComposing {
+                core.outbox.removeAll { if case .compositionStateChanged = $0 { true } else { false } }
+            }
+        }
     }
 
     /// The agent announced it is up: retry now instead of waiting out the backoff or
@@ -422,6 +448,13 @@ public final class IPCConnectionManager: @unchecked Sendable {
     }
 
     private func attempt() {
+        // Secure input: no connect and no `hello`; poll again after `baseDelay` without
+        // counting a failure.
+        guard !isSecureInputEnabled() else {
+            core.withLock { $0.statistics.suppressedForSecureInput += 1 }
+            retryAfterSecureInput()
+            return
+        }
         let prepared = core.withLock { core -> (UInt64, UUID, UInt64, String, Int)? in
             guard core.running else { return nil }
             cancelTimers(&core)
@@ -459,8 +492,31 @@ public final class IPCConnectionManager: @unchecked Sendable {
         }
         let hello = IMEToAgent.hello(IMEHello(
             clientBundleID: client.bundleID, clientVersion: client.version, sessionEpoch: epoch, engineMode: engineMode))
-        guard send(hello, generationID: helloGeneration, expectingReply: true) else { return }
-        armLivenessTimer()
+        switch send(hello, generationID: helloGeneration, expectingReply: true) {
+        case .sent: armLivenessTimer()
+        case .failed: return
+        case .suppressed:
+            // Secure input began mid-handshake: abandon this attempt quietly.
+            core.withLock { core in
+                cancelTimers(&core)
+                core.currentAttemptID = 0
+            }
+            transport.disconnect(reason: "secure input")
+            let failures = consecutiveFailures
+            guard setState(.reconnecting(attempt: failures + 1, nextRetryDelay: policy.baseDelay)) else { return }
+            retryAfterSecureInput()
+        }
+    }
+
+    /// Retries after `policy.baseDelay` without touching the failure count, so the
+    /// connection resumes on its own once secure input ends.
+    private func retryAfterSecureInput() {
+        let running = core.withLock { core -> Bool in
+            core.retryTimer?.cancel()
+            core.retryTimer = nil
+            return core.running
+        }
+        if running { scheduleRetry(after: policy.baseDelay) }
     }
 
     private func handle(_ event: IPCClientEvent, attemptID: UInt64) {
@@ -590,9 +646,15 @@ public final class IPCConnectionManager: @unchecked Sendable {
     }
 
     private func handleReadySignal() {
+        let secure = isSecureInputEnabled()
         let retryNow = core.withLock { core -> Bool in
             guard core.running else { return false }
             core.statistics.readySignals += 1
+            // Under secure input neither the debounce nor the circuit's ready probe is spent.
+            guard !secure else {
+                core.statistics.suppressedForSecureInput += 1
+                return false
+            }
             let now = clock.now
             if let last = core.lastReadySignal, now - last < policy.readyDebounce {
                 core.statistics.debouncedReadySignals += 1
@@ -615,6 +677,14 @@ public final class IPCConnectionManager: @unchecked Sendable {
     }
 
     private func drain() {
+        guard !isSecureInputEnabled() else {
+            core.withLock { core in
+                core.statistics.suppressedForSecureInput += core.outbox.count
+                core.outbox.removeAll()
+                core.drainScheduled = false
+            }
+            return
+        }
         let (messages, epoch) = core.withLock { core -> ([IMEToAgent], UUID) in
             defer { core.outbox.removeAll(); core.drainScheduled = false }
             guard core.state == .healthy, core.currentAttemptID != 0 else {
@@ -623,38 +693,60 @@ public final class IPCConnectionManager: @unchecked Sendable {
             }
             return (core.outbox, core.gate.sessionEpoch)
         }
-        for message in messages {
+        for (index, message) in messages.enumerated() {
             let stamped = message.stamped(epoch: epoch)
             let generation: UInt64?
             switch stamped {
             case .compositionStateChanged(let snapshot): generation = snapshot.generationID
             default: generation = nil
             }
-            guard send(stamped, generationID: generation, expectingReply: false) else { return }
+            switch send(stamped, generationID: generation, expectingReply: false) {
+            case .sent: continue
+            case .failed: return
+            case .suppressed:
+                // Secure input began mid-drain: the rest of the batch is withheld too.
+                let withheld = messages.count - index - 1
+                core.withLock { $0.statistics.suppressedForSecureInput += withheld }
+                return
+            }
         }
     }
 
-    /// Encodes and sends; a transport failure fails the connection. Returns false then.
+    private enum SendOutcome {
+        /// Handed to the transport, or dropped as an unencodable frame.
+        case sent
+        /// Withheld because secure input is on; the connection is untouched.
+        case suppressed
+        /// The transport failed and the connection was failed.
+        case failed
+    }
+
+    /// Encodes and sends; a transport failure fails the connection. The last gate before
+    /// the transport: under secure input nothing is sent.
     @discardableResult
-    private func send(_ message: IMEToAgent, generationID: UInt64?, expectingReply: Bool) -> Bool {
+    private func send(_ message: IMEToAgent, generationID: UInt64?, expectingReply: Bool) -> SendOutcome {
         let sequence = core.withLock { core -> UInt64 in
             core.sequence += 1
             return core.sequence
         }
         do {
             let frame = try IPCWireCodec.encode(IPCEnvelope(sequence: sequence, message: message, generationID: generationID))
+            guard !isSecureInputEnabled() else {
+                core.withLock { $0.statistics.suppressedForSecureInput += 1 }
+                return .suppressed
+            }
             try transport.send(frame, expectingReply: expectingReply)
             core.withLock { $0.statistics.framesSent += 1 }
-            return true
+            return .sent
         } catch .payloadTooLarge {
             core.withLock { $0.statistics.malformedFrames += 1 }
-            return true
+            return .sent
         } catch .malformedFrame {
             core.withLock { $0.statistics.malformedFrames += 1 }
-            return true
+            return .sent
         } catch {
             fail(Self.reason(for: error))
-            return false
+            return .failed
         }
     }
 
@@ -695,14 +787,28 @@ public final class IPCConnectionManager: @unchecked Sendable {
         }
         let timer = clock.schedule(after: interval, on: queue) { [weak self] in
             guard let self else { return }
-            let beat = self.core.withLock { core -> (UUID, UInt64)? in
+            let secure = self.isSecureInputEnabled()
+            let beat = self.core.withLock { core -> (UUID, UInt64)?? in
                 guard core.timerEpoch == epoch, core.state == .healthy else { return nil }
+                // Secure input: skip this beat and its liveness check, stay healthy, and
+                // beat again next interval.
+                guard !secure else {
+                    core.statistics.suppressedForSecureInput += 1
+                    return .some(nil)
+                }
                 core.heartbeatGeneration += 1
                 return (core.gate.sessionEpoch, core.heartbeatGeneration)
             }
-            guard let (sessionEpoch, generation) = beat else { return }
-            guard self.send(.heartbeat(sessionEpoch: sessionEpoch), generationID: generation, expectingReply: true) else { return }
-            self.armLivenessTimer()
+            guard let beat else { return }
+            guard let (sessionEpoch, generation) = beat else {
+                self.scheduleHeartbeat()
+                return
+            }
+            switch self.send(.heartbeat(sessionEpoch: sessionEpoch), generationID: generation, expectingReply: true) {
+            case .sent: self.armLivenessTimer()
+            case .suppressed: self.scheduleHeartbeat()
+            case .failed: return
+            }
         }
         install(timer, epoch: epoch) { $0.heartbeatTimer = timer }
     }

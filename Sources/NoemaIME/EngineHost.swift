@@ -168,7 +168,7 @@ final class EngineHost {
         let manager = IPCConnectionManager(
             transport: transport,
             client: .init(bundleID: NoemaPaths.imeBundleID, version: Self.clientVersion()),
-            queue: queue)
+            queue: queue, isSecureInputEnabled: { IsSecureEventInputEnabled() })
         attachAgentConnection(manager, isSecureInputEnabled: { IsSecureEventInputEnabled() })
         manager.start()
     }
