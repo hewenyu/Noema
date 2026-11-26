@@ -10,9 +10,12 @@ import XPC
 
 /// The endpoint the client dials, swapped when the "agent" restarts.
 final class EndpointBox: Sendable {
-    private let endpoint = OSAllocatedUnfairLock<XPCEndpoint?>(initialState: nil)
-    func set(_ value: XPCEndpoint?) { endpoint.withLock { $0 = value } }
-    func get() -> XPCEndpoint? { endpoint.withLock { $0 } }
+    private let target = OSAllocatedUnfairLock<XPCConnectionTarget?>(initialState: nil)
+    func set(_ value: XPCEndpoint?) {
+        let wrapped = value.map(XPCConnectionTarget.endpoint)
+        target.withLock { $0 = wrapped }
+    }
+    func getTarget() -> XPCConnectionTarget? { target.withLock { $0 } }
 }
 
 /// Real libxpc end to end: an anonymous `XPCListener` serving the real
@@ -44,7 +47,7 @@ final class XPCRig {
         (server, agent) = try Self.makeAgent(policy: self.serverPolicy, onChange: agentOnChange)
         endpoint.set(server.endpoint)
         let box = endpoint
-        let transport = XPCClientTransport(policy: self.clientPolicy, queue: queue) { box.get().map { .endpoint($0) } }
+        let transport = XPCClientTransport(policy: self.clientPolicy, queue: queue) { box.getTarget() }
         manager = IPCConnectionManager(
             transport: transport, client: .init(bundleID: "dev.noema.tests.ime", version: "1.0.0"), policy: reconnect,
             clock: SystemIPCClock(), jitter: FixedJitter(fraction: 0), readyNotificationName: readyNotificationName, queue: queue)
@@ -291,9 +294,9 @@ final class XPCRig {
             onFrame: { frame, _, _ in events.withLock { $0.append("frame") }; return frame },
             onEvent: { event in events.withLock { $0.append("\(event)") } }))
         defer { server.stop() }
-        let endpoint = try #require(server.endpoint)
+        let target = XPCConnectionTarget.endpoint(try #require(server.endpoint))
         let queue = DispatchQueue(label: "dev.noema.tests.unpinned-client")
-        let client = XPCClientTransport(policy: unpinned, queue: queue) { .endpoint(endpoint) }
+        let client = XPCClientTransport(policy: unpinned, queue: queue) { target }
         #expect(throws: IPCError.peerRejected(PeerVerificationError.unpinnedStrictPolicy.description)) {
             try client.connect(attemptID: 1) { _, _ in }
         }

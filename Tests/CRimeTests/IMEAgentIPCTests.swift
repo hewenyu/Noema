@@ -318,7 +318,7 @@ final class AgentLink: @unchecked Sendable {
     let policy: PeerIdentityPolicy
     private(set) var server: XPCListenerServerTransport
     private(set) var agent: AgentServiceCoordinator
-    private let endpoint: OSAllocatedUnfairLock<XPCEndpoint?>
+    private let target: OSAllocatedUnfairLock<XPCConnectionTarget?>
     let manager: IPCConnectionManager
     let recorder = ConnectionRecorder()
 
@@ -329,10 +329,10 @@ final class AgentLink: @unchecked Sendable {
         policy = .allowAdHocForTesting(signingIdentifiers: [identifier])
         let (server, agent) = try Self.makeAgent(policy: policy)
         (self.server, self.agent) = (server, agent)
-        let endpoint = OSAllocatedUnfairLock<XPCEndpoint?>(initialState: server.endpoint)
-        self.endpoint = endpoint
+        let target = OSAllocatedUnfairLock<XPCConnectionTarget?>(initialState: server.endpoint.map(XPCConnectionTarget.endpoint))
+        self.target = target
         let queue = DispatchQueue(label: "dev.noema.tests.ime-ipc")
-        let transport = XPCClientTransport(policy: policy, queue: queue) { endpoint.withLock { $0 }.map { .endpoint($0) } }
+        let transport = XPCClientTransport(policy: policy, queue: queue) { target.withLock { $0 } }
         manager = IPCConnectionManager(
             transport: transport, client: .init(bundleID: NoemaPaths.imeBundleID, version: "0.0.0-test"),
             policy: .init(
@@ -355,8 +355,8 @@ final class AgentLink: @unchecked Sendable {
 
     func restartAgent() throws {
         (server, agent) = try Self.makeAgent(policy: policy)
-        let new = server.endpoint
-        endpoint.withLock { $0 = new }
+        let new = server.endpoint.map(XPCConnectionTarget.endpoint)
+        target.withLock { $0 = new }
     }
 
     func shutdown() {

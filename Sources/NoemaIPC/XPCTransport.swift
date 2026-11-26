@@ -116,7 +116,9 @@ public final class ManagedXPCSession: @unchecked Sendable {
 }
 
 /// Where an `XPCClientTransport` connects.
-public enum XPCConnectionTarget: Sendable {
+/// `@unchecked Sendable` keeps Swift 6.2 SDKs (where `XPCEndpoint` lacked a `Sendable`
+/// declaration) compiling alongside Swift 6.3 SDKs without warnings.
+public enum XPCConnectionTarget: @unchecked Sendable {
     /// The launchd Mach service, e.g. `NoemaPaths.agentMachServiceName`.
     case machService(String)
     /// An anonymous listener's endpoint (tests, or an endpoint handed over by a broker).
@@ -292,7 +294,7 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
     /// The anonymous listener's endpoint once started; nil for a Mach service.
     public var endpoint: XPCEndpoint? {
         guard mode == .anonymous else { return nil }
-        return state.withLock { $0.listener?.endpoint }
+        return state.withLockUnchecked { $0.listener?.endpoint }
     }
 
     public var connectedPeers: [IPCPeerID] { state.withLock { $0.peers.keys.sorted() } }
@@ -305,7 +307,7 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
         guard state.withLock({ $0.listener == nil }) else { throw StartError.alreadyStarted }
         let accept: @Sendable (XPCListener.IncomingSessionRequest) -> XPCListener.IncomingSessionRequest.Decision = { [weak self] request in
             guard let self, self.state.withLock({ $0.listener != nil }) else { return request.reject(reason: "server stopped") }
-            return request.accept { session in self.adopt(session, requirement: requirement) }
+            return request.accept { session in self.adopt(session) }
         }
         let listener: XPCListener
         switch mode {
@@ -374,15 +376,23 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
 
     // MARK: - Peers
 
-    private func adopt(_ session: XPCSession, requirement: XPCPeerRequirement) -> PeerSessionHandler {
+    private func adopt(_ session: XPCSession) -> PeerSessionHandler {
         // Accepted sessions do not inherit the listener's requirement (<xpc/listener.h>).
-        session.setPeerRequirement(requirement)
+        // Rebuild from the Sendable `policy` here instead of capturing `XPCPeerRequirement`
+        // across `@Sendable` boundaries (Swift 6.2 SDK compatibility).
+        let hasRequirement: Bool
+        if let requirement = policy.xpcPeerRequirement {
+            session.setPeerRequirement(requirement)
+            hasRequirement = true
+        } else {
+            hasRequirement = false
+        }
         let managed = ManagedXPCSession(acceptedSession: session)
         let adopted = state.withLock { state -> (IPCPeerID, IPCServerHandlers?)? in
             let peer = IPCPeerID(rawValue: state.nextPeer)
             state.nextPeer += 1
-            // `stop()` ran between accept and adopt: never track the session.
-            guard state.listener != nil else { return nil }
+            // `stop()` ran between accept and adopt, or policy cannot pin peers: never track.
+            guard state.listener != nil, hasRequirement else { return nil }
             state.peers[peer] = managed
             return (peer, state.handlers)
         }
