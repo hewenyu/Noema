@@ -9,11 +9,19 @@ public struct CommitObservation: Sendable, Hashable {
     /// The committed text the call drained.
     public let committedText: String
     public let schemaID: String?
+    /// Whether `schemaID` spells Mandarin pinyin (full, double, or jianpin; its preedit and
+    /// userdb are keyed by full pinyin). False for a shape or non-Mandarin schema (Wubi,
+    /// Cangjie, Zhuyin, Jyutping): its codes (`wo` for 伙 in Wubi 98) are never readings, so
+    /// the commit is never learned. `RimeEngine` always passes the live schema's answer.
+    public let isMandarinPinyinSchema: Bool
 
-    public init(rawInput: String, preedit: String, committedText: String, schemaID: String?) {
+    public init(
+        rawInput: String, preedit: String, committedText: String, schemaID: String?, isMandarinPinyinSchema: Bool = true
+    ) {
         self.rawInput = rawInput
         self.preedit = preedit
         self.committedText = committedText
         self.schemaID = schemaID
+        self.isMandarinPinyinSchema = isMandarinPinyinSchema
     }
 }

@@ -15,17 +15,28 @@ public struct LearningCommitEvent: Sendable, Hashable {
     /// True for a phrase the user added explicitly rather than one learned from typing.
     public var isUserPhrase: Bool
     public var timestamp: Date
+    /// False when the commit came from a schema that does not spell Mandarin pinyin (Wubi,
+    /// Cangjie, Zhuyin, Jyutping; see `CommitObservation.isMandarinPinyinSchema`): its raw
+    /// codes may look like syllables (Wubi 98 `wo` for 伙) but are not readings, so
+    /// `normalized()` refuses it.
+    public var isMandarinPinyinSchema: Bool
 
-    public init(rawInput: String, preedit: String = "", text: String, isUserPhrase: Bool = false, timestamp: Date = Date()) {
+    public init(
+        rawInput: String, preedit: String = "", text: String, isUserPhrase: Bool = false, timestamp: Date = Date(),
+        isMandarinPinyinSchema: Bool = true
+    ) {
         self.rawInput = rawInput
         self.preedit = preedit
         self.text = text
         self.isUserPhrase = isUserPhrase
         self.timestamp = timestamp
+        self.isMandarinPinyinSchema = isMandarinPinyinSchema
     }
 
     public init(observation: CommitObservation, timestamp: Date = Date()) {
-        self.init(rawInput: observation.rawInput, preedit: observation.preedit, text: observation.committedText, timestamp: timestamp)
+        self.init(
+            rawInput: observation.rawInput, preedit: observation.preedit, text: observation.committedText,
+            timestamp: timestamp, isMandarinPinyinSchema: observation.isMandarinPinyinSchema)
     }
 
     /// Longest phrase and spelling the store learns; longer commits are pastes, not words.
@@ -33,13 +44,14 @@ public struct LearningCommitEvent: Sendable, Hashable {
     public static let maximumPinyinScalars = 256
 
     /// The canonical `(pinyin_norm, pinyin_compact, text)` of this event, or nil when it is
-    /// not learnable: no Han character, a control character (tab, newline) in the text, an
+    /// not learnable: committed on a non-Mandarin-pinyin schema, no Han character, a control character (tab, newline) in the text, an
     /// oversized text, or a spelling that is not verifiably full Mandarin pinyin. Leading
     /// and trailing punctuation, symbols, and spaces are trimmed first (`nihao,` commits
     /// `你好，`; `你好` is learned). `pinyinNorm` is always one standard Mandarin syllable
     /// (`TextNormalization.standardMandarinSyllables`) per Han character, never abbreviated
     /// initials or raw double-pinyin keys; see `canonicalSyllables`.
     public func normalized() -> (pinyinNorm: String, pinyinCompact: String, text: String)? {
+        guard isMandarinPinyinSchema else { return nil }
         let text = Self.trimmingEdgePunctuation(self.text)
         guard !text.isEmpty, text.unicodeScalars.count <= Self.maximumTextScalars,
               TextNormalization.containsHanCharacters(text),
@@ -179,9 +191,13 @@ extension LearnedEntry {
     }
 }
 
-/// How far `learning.sqlite` has been projected into one schema set's userdb.
+/// How far `learning.sqlite` has been projected into one userdb of one schema set. Keyed by
+/// `(schemaSet, dictName)`: two schemas of one set with their own user dicts each keep their
+/// own watermark, and schemas sharing a user dict share one.
 public struct ProjectionWatermark: Sendable, Hashable, Codable {
     public var schemaSet: String
+    /// The userdb (`<dictName>.userdb`) the watermark belongs to.
+    public var dictName: String
     public var lastRevision: Int64
     public var projectedCount: Int64
     public var updatedAt: Date
@@ -315,31 +331,36 @@ public final class LearningStore: @unchecked Sendable {
         }
     }
 
+    /// Records that `<dictName>.userdb` of `schemaSet` holds every entry up to `lastRevision`.
     public func setWatermark(
-        for schemaSet: SchemaSetID, lastRevision: Int64, projectedCount: Int64, at date: Date = Date()
+        for schemaSet: SchemaSetID, dictName: String, lastRevision: Int64, projectedCount: Int64, at date: Date = Date()
     ) throws(LearningStoreError) {
         try withWriteTransaction { db throws(LearningStoreError) in
             let statement = try Self.prepare(db, """
-                INSERT INTO projection_watermarks(schema_set, last_revision, projected_count, updated_at)
-                VALUES(?1, ?2, ?3, ?4)
-                ON CONFLICT(schema_set) DO UPDATE SET last_revision = excluded.last_revision,
+                INSERT INTO projection_watermarks(schema_set, dict_name, last_revision, projected_count, updated_at)
+                VALUES(?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(schema_set, dict_name) DO UPDATE SET last_revision = excluded.last_revision,
                   projected_count = excluded.projected_count, updated_at = excluded.updated_at
                 """)
             defer { sqlite3_finalize(statement) }
             Self.bind(statement, 1, schemaSet.rawValue)
-            sqlite3_bind_int64(statement, 2, lastRevision)
-            sqlite3_bind_int64(statement, 3, projectedCount)
-            sqlite3_bind_double(statement, 4, date.timeIntervalSince1970)
+            Self.bind(statement, 2, dictName)
+            sqlite3_bind_int64(statement, 3, lastRevision)
+            sqlite3_bind_int64(statement, 4, projectedCount)
+            sqlite3_bind_double(statement, 5, date.timeIntervalSince1970)
             try Self.stepDone(db, statement)
         }
     }
 
-    /// Forgets the set's watermark, so its next projection replays every entry.
-    public func resetWatermark(for schemaSet: SchemaSetID) throws(LearningStoreError) {
+    /// Forgets the watermark of `<dictName>.userdb` (nil: of every userdb of the set), so its
+    /// next projection replays every entry. Other userdbs of the set keep theirs.
+    public func resetWatermark(for schemaSet: SchemaSetID, dictName: String? = nil) throws(LearningStoreError) {
         try withWriteTransaction { db throws(LearningStoreError) in
-            let statement = try Self.prepare(db, "DELETE FROM projection_watermarks WHERE schema_set = ?1")
+            let statement = try Self.prepare(
+                db, "DELETE FROM projection_watermarks WHERE schema_set = ?1 AND (?2 IS NULL OR dict_name = ?2)")
             defer { sqlite3_finalize(statement) }
             Self.bind(statement, 1, schemaSet.rawValue)
+            if let dictName { Self.bind(statement, 2, dictName) } else { sqlite3_bind_null(statement, 2) }
             try Self.stepDone(db, statement)
         }
     }
@@ -356,8 +377,9 @@ public final class LearningStore: @unchecked Sendable {
         try queryEntries("ORDER BY frequency DESC, updated_at DESC, id ASC", nil)
     }
 
-    public func watermark(for schemaSet: SchemaSetID) throws(LearningStoreError) -> ProjectionWatermark? {
-        try watermarks().first { $0.schemaSet == schemaSet.rawValue }
+    /// The watermark of `<dictName>.userdb` in `schemaSet`; nil when it was never projected.
+    public func watermark(for schemaSet: SchemaSetID, dictName: String) throws(LearningStoreError) -> ProjectionWatermark? {
+        try watermarks().first { $0.schemaSet == schemaSet.rawValue && $0.dictName == dictName }
     }
 
     public func latestRevision() throws(LearningStoreError) -> Int64 {
@@ -392,10 +414,15 @@ public final class LearningStore: @unchecked Sendable {
         }
     }
 
+    /// Every watermark, by set then userdb. A `.readOnly` connection to a store whose
+    /// `projection_watermarks` predates `dict_name` (a read-write open migrates it) reads none.
     private func watermarks() throws(LearningStoreError) -> [ProjectionWatermark] {
         try withConnection { db throws(LearningStoreError) in
-            let statement = try Self.prepare(
-                db, "SELECT schema_set, last_revision, projected_count, updated_at FROM projection_watermarks ORDER BY schema_set")
+            guard try Self.hasPerDictWatermarks(db) else { return [] }
+            let statement = try Self.prepare(db, """
+                SELECT schema_set, dict_name, last_revision, projected_count, updated_at
+                FROM projection_watermarks ORDER BY schema_set, dict_name
+                """)
             defer { sqlite3_finalize(statement) }
             var result: [ProjectionWatermark] = []
             while true {
@@ -404,9 +431,10 @@ public final class LearningStore: @unchecked Sendable {
                 guard status == SQLITE_ROW else { throw Self.error(db, "watermarks") }
                 result.append(ProjectionWatermark(
                     schemaSet: Self.columnString(statement, 0),
-                    lastRevision: sqlite3_column_int64(statement, 1),
-                    projectedCount: sqlite3_column_int64(statement, 2),
-                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))))
+                    dictName: Self.columnString(statement, 1),
+                    lastRevision: sqlite3_column_int64(statement, 2),
+                    projectedCount: sqlite3_column_int64(statement, 3),
+                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))))
             }
         }
     }
@@ -452,7 +480,9 @@ public final class LearningStore: @unchecked Sendable {
             }
             let version = try Self.userVersion(db)
             switch (version, mode) {
-            case (Self.schemaVersion, _):
+            case (Self.schemaVersion, .readWrite):
+                try Self.migrateWatermarksToPerDict(db)
+            case (Self.schemaVersion, .readOnly):
                 return
             case (0, .readWrite):
                 try Self.exec(db, """
@@ -469,11 +499,7 @@ public final class LearningStore: @unchecked Sendable {
                       revision INTEGER NOT NULL,
                       UNIQUE(pinyin_norm, text));
                     CREATE INDEX IF NOT EXISTS entries_revision ON entries(revision);
-                    CREATE TABLE IF NOT EXISTS projection_watermarks(
-                      schema_set TEXT PRIMARY KEY,
-                      last_revision INTEGER NOT NULL,
-                      projected_count INTEGER NOT NULL,
-                      updated_at REAL NOT NULL);
+                    \(Self.watermarksTableSQL)
                     INSERT OR IGNORE INTO meta(key, value) VALUES('revision', 0);
                     PRAGMA user_version = 1;
                     COMMIT;
@@ -481,6 +507,44 @@ public final class LearningStore: @unchecked Sendable {
             default:
                 throw .unsupportedSchemaVersion(version)
             }
+        }
+    }
+
+    /// `projection_watermarks`, one row per `(schema_set, dict_name)`.
+    static let watermarksTableSQL = """
+        CREATE TABLE IF NOT EXISTS projection_watermarks(
+          schema_set TEXT NOT NULL,
+          dict_name TEXT NOT NULL,
+          last_revision INTEGER NOT NULL,
+          projected_count INTEGER NOT NULL,
+          updated_at REAL NOT NULL,
+          PRIMARY KEY (schema_set, dict_name));
+        """
+
+    /// Whether `projection_watermarks` has its `dict_name` column.
+    static func hasPerDictWatermarks(_ db: OpaquePointer) throws(LearningStoreError) -> Bool {
+        let statement = try prepare(db, "SELECT count(*) FROM pragma_table_info('projection_watermarks') WHERE name = 'dict_name'")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw error(db, "table_info") }
+        return sqlite3_column_int64(statement, 0) > 0
+    }
+
+    /// Replaces a pre-release `projection_watermarks` keyed by set alone (no `dict_name`)
+    /// with the per-userdb table. Its rows are dropped, not carried over: a per-set row
+    /// cannot say which userdb it covered, so every userdb conservatively replays every
+    /// entry on its next projection. `entries` and `meta` are untouched.
+    static func migrateWatermarksToPerDict(_ db: OpaquePointer) throws(LearningStoreError) {
+        guard try !hasPerDictWatermarks(db) else { return }
+        try exec(db, "BEGIN IMMEDIATE")
+        do throws(LearningStoreError) {
+            // Re-checked under the write lock: another writer may have migrated meanwhile.
+            if try !hasPerDictWatermarks(db) {
+                try exec(db, "DROP TABLE IF EXISTS projection_watermarks;\n\(watermarksTableSQL)")
+            }
+            try exec(db, "COMMIT")
+        } catch {
+            _ = sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
         }
     }
 

@@ -126,8 +126,8 @@ extension LibrimeSerializedTests {
             }
             let fromUserDB = candidates(engine, "nihao")
             #expect(fromUserDB.contains("泥嚎") && fromUserDB.contains("霓昊"), "\(fromUserDB)")
-            let watermarks = try store.stats().watermarks.map(\.schemaSet).sorted()
-            #expect(watermarks == ["mint", "rime-ice"], "\(watermarks)")
+            let watermarks = try store.stats().watermarks.map { "\($0.schemaSet)/\($0.dictName)" }
+            #expect(watermarks == ["mint/mint_fixture", "rime-ice/rime_ice_fixture"], "\(watermarks)")
         }
 
         /// `nihao,` commits `你好，` (the punctuator commits the candidate plus the full-width
@@ -360,6 +360,107 @@ extension LibrimeSerializedTests {
             let tsv = try String(contentsOf: workspace.setDir(.mint).appending(path: NoemaPaths.learnedTSVFileName), encoding: .utf8)
             #expect(Set(tsv.split(separator: "\n").map { $0.split(separator: "\t").prefix(2).joined(separator: "\t") })
                     == ["shijia\t施加", "nvhai\t女孩", "shijian\t时间"], "\(tsv)")
+        }
+
+        /// Shape and non-Mandarin schemas never feed or take full-pinyin learning (Codex
+        /// #4707351661): `wubi98_mint` (Wubi 98 shape codes, `table_translator` plus a
+        /// tagged `script_translator@pinyin` reverse lookup), `mint_shape` (the same under a
+        /// neutral name, so only the translator check guards it), and `jyutping_fixture`
+        /// (an untagged `script_translator`, so only the name check guards it). Their codes
+        /// `wo` (伙) and `shi` (椒) are valid Mandarin syllables, yet nothing is learned; the
+        /// guardian checks the schema's userdb but projects no `learning.sqlite` entry
+        /// (`霓昊`) into it and records no watermark; `noema_learned.lua` stays off; and the
+        /// full-pinyin 雾凇 set never offers 伙 for `wo` or 椒 for `shi`.
+        @Test(arguments: ["wubi98_mint", "mint_shape", "jyutping_fixture"])
+        func nonMandarinPinyinSchemasNeitherLearnNorReceiveProjection(_ schemaID: String) async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addNonMandarinFixtures(in: .mint)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(engine.currentSchemaIsMandarinPinyin, "noema_pinyin is full pinyin")
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+
+            let report = try await engine.switchSchemaSet(
+                to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: schemaID,
+                learningStore: store, learningWriter: writer, luaFile: LexiconWorkspace.lua)
+            #expect(engine.currentState.schemaID == schemaID)
+            #expect(!report.isMandarinPinyinSchema && !engine.currentSchemaIsMandarinPinyin)
+            #expect(report.userDictName == schemaID)
+            #expect(report.userDBOutcome == .nothingToDo, "\(String(describing: report.userDBOutcome))")
+            #expect(try store.stats().watermarks.isEmpty, "a non-pinyin userdb got a watermark")
+            #expect(!candidates(engine, "nihao").contains("霓昊"), "the learned phrase reached \(schemaID)")
+
+            #expect(try commit(engine, "wo", "伙").committed == "伙")
+            #expect(try commit(engine, "shi", "椒").committed == "椒")
+            writer.flush()
+            #expect(writer.statistics.enqueued == 2, "the commits were not observed")
+            let learned = try store.allEntries()
+            #expect(learned.map(\.text) == ["霓昊"], "\(schemaID) commits were learned: \(learned)")
+
+            let ice = try await engine.switchSchemaSet(
+                to: .rimeIce, sharedDataDir: workspace.schemaDir(.rimeIce), schemaID: "rime_ice_fixture",
+                learningStore: store, learningWriter: writer, luaFile: LexiconWorkspace.lua)
+            #expect(ice.isMandarinPinyinSchema && engine.currentSchemaIsMandarinPinyin)
+            let wo = candidates(engine, "wo")
+            let shi = candidates(engine, "shi")
+            #expect(wo.first == "我" && !wo.contains("伙"), "\(wo)")
+            #expect(!shi.contains("椒"), "\(shi)")
+            #expect(candidates(engine, "nihao").contains("霓昊"))
+            #expect(try store.stats().watermarks.map(\.dictName) == ["rime_ice_fixture"])
+        }
+
+        /// Two userdbs in one set keep their own projection watermarks (Codex #4707351680):
+        /// `schema_a` (`dict_a`) and `schema_b` (`dict_b`) both hold revision 2; `时见` is
+        /// learned at revision 3; `schema_b` takes it, and `schema_a`, switched to after, still
+        /// receives it rather than reading `schema_b`'s watermark. `schema_a_alias` shares
+        /// `dict_a` (`translator/user_dict`), so it shares its watermark and already has it.
+        /// No Lua translator: only the userdbs can serve the phrase.
+        @Test func userDBsOfOneSchemaSetKeepSeparateProjectionWatermarks() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addSchema("schema_a", dictionary: "dict_a", in: .mint)
+            try workspace.addSchema("schema_b", dictionary: "dict_b", in: .mint)
+            try workspace.addSchema("schema_a_alias", dictionary: "dict_a", userDict: "dict_a", in: .mint)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            func to(_ schemaID: String) async throws -> SchemaSetSwitchReport {
+                let report = try await engine.switchSchemaSet(
+                    to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: schemaID, learningStore: store, luaFile: nil)
+                #expect(engine.currentState.schemaID == schemaID && report.userDBFailure == nil)
+                return report
+            }
+            func revision(_ dictName: String) throws -> Int64? { try store.watermark(for: .mint, dictName: dictName)?.lastRevision }
+            #expect(try store.recordBatch([
+                LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊"),
+                LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "泥嚎"),
+            ]) == 2)
+            for (schemaID, dictName) in [("schema_a", "dict_a"), ("schema_b", "dict_b")] {
+                let report = try await to(schemaID)
+                #expect(report.userDictName == dictName)
+                #expect(report.userDBOutcome == .recovered(.init(method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)),
+                        "\(schemaID): \(String(describing: report.userDBOutcome))")
+            }
+            #expect(try revision("dict_a") == 2 && revision("dict_b") == 2)
+
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "shijian", preedit: "shi jian", text: "时见")]) == 1)
+            #expect(try await to("schema_b").userDBOutcome == .healthy(projected: 1))
+            #expect(candidates(engine, "shijian").contains("时见"))
+            #expect(try revision("dict_a") == 2 && revision("dict_b") == 3)
+
+            let a = try await to("schema_a")
+            #expect(a.userDBOutcome == .healthy(projected: 1), "dict_a missed 时见: \(String(describing: a.userDBOutcome))")
+            #expect(candidates(engine, "shijian").contains("时见"), "schema_a never received 时见")
+            #expect(try revision("dict_a") == 3)
+
+            let alias = try await to("schema_a_alias")
+            #expect(alias.userDictName == "dict_a" && alias.userDBOutcome == .healthy(projected: 0))
+            #expect(candidates(engine, "shijian").contains("时见"))
+            #expect(try store.stats().watermarks.map(\.dictName) == ["dict_a", "dict_b"])
         }
 
         /// A user `noema_pinyin.custom.yaml` that already appends `echo_translator` with
@@ -874,6 +975,81 @@ final class LexiconWorkspace {
         let schema = try String(contentsOf: schemaDir(set).appending(path: "\(source).schema.yaml"), encoding: .utf8)
         try write(schema.replacingOccurrences(of: "schema_id: \(source)", with: "schema_id: \(schemaID)"), "\(schemaID).schema.yaml", in: set)
         try replace(in: set, "default.yaml", "  - schema: \(source)", with: "  - schema: \(source)\n  - schema: \(schemaID)")
+    }
+
+    /// Lists `schemaID` after the fixture schema in `set`'s `default.yaml`, so librime deploys it.
+    func listSchema(_ schemaID: String, in set: SchemaSetID) throws {
+        let fixture = Self.fixture(set).schemaID
+        try replace(in: set, "default.yaml", "  - schema: \(fixture)\n", with: "  - schema: \(fixture)\n  - schema: \(schemaID)\n")
+    }
+
+    /// A copy of `set`'s fixture schema as `schemaID` over its own copy of the fixture
+    /// dictionary, `dictionary`, with `translator/user_dict: userDict` when given.
+    func addSchema(_ schemaID: String, dictionary: String, userDict: String? = nil, in set: SchemaSetID) throws {
+        let fixture = Self.fixture(set).schemaID
+        let schema = try String(contentsOf: schemaDir(set).appending(path: "\(fixture).schema.yaml"), encoding: .utf8)
+        var translator = "  dictionary: \(dictionary)"
+        if let userDict { translator += "\n  user_dict: \(userDict)" }
+        try write(schema.replacingOccurrences(of: "schema_id: \(fixture)", with: "schema_id: \(schemaID)")
+            .replacingOccurrences(of: "  dictionary: \(fixture)", with: translator), "\(schemaID).schema.yaml", in: set)
+        let dictionaryURL = schemaDir(set).appending(path: "\(dictionary).dict.yaml")
+        if !FileManager.default.fileExists(atPath: dictionaryURL.path) {
+            try write(Self.dictionary(of: set).replacingOccurrences(of: "name: \(fixture)", with: "name: \(dictionary)"),
+                      "\(dictionary).dict.yaml", in: set)
+        }
+        try listSchema(schemaID, in: set)
+    }
+
+    /// Three schemas whose codes are not Mandarin pinyin, each over its own dictionary
+    /// mapping `wo` to 伙 and `shi` to 椒 (Wubi 98's codes for them): `wubi98_mint` and
+    /// `mint_shape`, shape-code schemas (`table_translator`, plus a tagged
+    /// `script_translator@pinyin` reverse lookup over the fixture dictionary), and
+    /// `jyutping_fixture`, an untagged `script_translator` schema.
+    func addNonMandarinFixtures(in set: SchemaSetID) throws {
+        let fixture = Self.fixture(set).schemaID
+        func dictionary(_ name: String) -> String {
+            "---\nname: \(name)\nversion: \"1\"\nsort: by_weight\nuse_preset_vocabulary: false\n...\n伙\two\t1000\n椒\tshi\t1000\n"
+        }
+        for schemaID in ["wubi98_mint", "mint_shape"] {
+            try write("""
+                schema:
+                  schema_id: \(schemaID)
+                  name: \(schemaID)
+                  version: "1"
+                switches:
+                  - name: ascii_mode
+                    reset: 0
+                    states: [ 中文, 西文 ]
+                engine:
+                  processors: [ ascii_composer, recognizer, key_binder, speller, punctuator, selector, navigator, express_editor ]
+                  segmentors: [ ascii_segmentor, matcher, abc_segmentor, punct_segmentor, fallback_segmentor ]
+                  translators: [ punct_translator, table_translator, "script_translator@pinyin" ]
+                speller:
+                  alphabet: zyxwvutsrqponmlkjihgfedcba
+                  delimiter: " '"
+                translator:
+                  dictionary: \(schemaID)
+                  enable_user_dict: true
+                  enable_sentence: false
+                pinyin:
+                  tag: pinyin_lookup
+                  dictionary: \(fixture)
+                key_binder:
+                  import_preset: default
+                punctuator:
+                  import_preset: default
+                recognizer:
+                  import_preset: default
+
+                """, "\(schemaID).schema.yaml", in: set)
+            try write(dictionary(schemaID), "\(schemaID).dict.yaml", in: set)
+            try listSchema(schemaID, in: set)
+        }
+        let schema = try String(contentsOf: schemaDir(set).appending(path: "\(fixture).schema.yaml"), encoding: .utf8)
+        try write(schema.replacingOccurrences(of: "schema_id: \(fixture)", with: "schema_id: jyutping_fixture")
+            .replacingOccurrences(of: "  dictionary: \(fixture)", with: "  dictionary: jyutping_fixture"), "jyutping_fixture.schema.yaml", in: set)
+        try write(dictionary("jyutping_fixture"), "jyutping_fixture.dict.yaml", in: set)
+        try listSchema("jyutping_fixture", in: set)
     }
 
     func appendToDictionary(of set: SchemaSetID, _ appendix: String) throws {

@@ -202,15 +202,39 @@ final class FakeLevers: UserDictLevers {
         defer { cleanUp() }
         try learn([("ni hao", "你好"), ("shi jie", "世界")])
         #expect(try guardian.project("rime_ice", store: store) == 2)
-        #expect(try store.watermark(for: .rimeIce)?.lastRevision == 2)
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice")?.lastRevision == 2)
         #expect(try guardian.project("rime_ice", store: store) == 0, "nothing new")
         try learn([("ni hao", "你好"), ("zai jian", "再见")])
         #expect(try guardian.project("rime_ice", store: store) == 2)
         #expect(levers.imports.last?.1 == "你好\tni hao\t2\n再见\tzai jian\t1\n", "only the changes, as <text>\\t<code>\\t<weight>")
         #expect(levers.rows("rime_ice")["你好\tni hao"] == 2)
-        let mark = try #require(try store.watermark(for: .rimeIce))
+        let mark = try #require(try store.watermark(for: .rimeIce, dictName: "rime_ice"))
         #expect(mark.lastRevision == 4 && mark.projectedCount == 3)
-        #expect(try store.watermark(for: .mint) == nil)
+        #expect(try store.watermark(for: .mint, dictName: "rime_ice") == nil)
+    }
+
+    /// Two userdbs of one set keep their own watermarks: projecting a new entry into
+    /// `dict_b` leaves `dict_a` behind it, so `dict_a` still receives the entry; resetting a
+    /// diverged `dict_a` leaves `dict_b`'s watermark untouched.
+    @Test func userDBsOfOneSetKeepSeparateWatermarks() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "你好"), ("shi jie", "世界")])
+        #expect(try guardian.maintain("dict_a", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        #expect(try guardian.maintain("dict_b", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        try learn([("shi jian", "时见")])
+        #expect(try guardian.maintain("dict_b", store: store) == .healthy(projected: 1))
+        #expect(try store.watermark(for: .rimeIce, dictName: "dict_a")?.lastRevision == 2)
+        #expect(try guardian.maintain("dict_a", store: store) == .healthy(projected: 1))
+        #expect(levers.rows("dict_a")["时见\tshi jian"] == 1 && levers.rows("dict_b")["时见\tshi jian"] == 1)
+        #expect(try guardian.maintain("dict_a", store: store) == .healthy(projected: 0))
+
+        try Data("你好\tni hao\t1\n".utf8).write(to: levers.rowsURL("dict_a"))
+        #expect(try guardian.maintain("dict_a", store: store) == .reprojected(imported: 3))
+        let b = try #require(try store.watermark(for: .rimeIce, dictName: "dict_b"))
+        #expect(b.lastRevision == 3 && b.projectedCount == 3, "resetting dict_a clobbered dict_b: \(b)")
+        #expect(try store.stats().watermarks.map(\.dictName) == ["dict_a", "dict_b"])
     }
 
     @Test func corruptUserDBIsQuarantinedAndRestoredFromSnapshotPlusReplay() throws {
@@ -241,7 +265,7 @@ final class FakeLevers: UserDictLevers {
         #expect(rows["原生\tyuan sheng"] == 5, "restored from the snapshot")
         #expect(rows["再见\tzai jian"] == 1, "replayed from learning.sqlite")
         #expect(levers.imports.last?.1 == "再见\tzai jian\t1\n", "only entries newer than the snapshot are replayed")
-        #expect(try store.watermark(for: .rimeIce)?.lastRevision == 3)
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice")?.lastRevision == 3)
     }
 
     @Test func withoutAUsableSnapshotTheUserDBIsRebuiltFromTheStore() throws {

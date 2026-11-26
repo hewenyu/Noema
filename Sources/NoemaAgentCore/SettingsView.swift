@@ -259,9 +259,9 @@ struct LexiconSettingsForm: View {
                     LabeledContent("用户词组", value: "\(stats.userPhraseCount)")
                     LabeledContent("累计上屏", value: "\(stats.totalFrequency)")
                     LabeledContent("最新修订", value: "\(stats.latestRevision)")
-                    ForEach(stats.watermarks, id: \.schemaSet) { mark in
+                    ForEach(stats.watermarks, id: \.self) { mark in
                         LabeledContent(
-                            "投影水位 · \(SchemaSetID(rawValue: mark.schemaSet)?.displayName ?? mark.schemaSet)",
+                            "投影水位 · \(SchemaSetID(rawValue: mark.schemaSet)?.displayName ?? mark.schemaSet) · \(mark.dictName)",
                             value: "修订 \(mark.lastRevision) · \(mark.projectedCount) 条")
                     }
                 } else if let error = lexicon.inventory?.learningError {

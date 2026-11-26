@@ -126,6 +126,25 @@ func permissions(_ url: URL) -> mode_t {
         #expect(event("yh", "银行", preedit: "y h").normalized() == nil)
     }
 
+    /// A shape-code commit (Wubi 98 `wo` for 伙, `shi` for 椒) spells valid syllables but is
+    /// never a reading: an event from a non-Mandarin-pinyin schema is not learnable, from a
+    /// `CommitObservation` too, and `recordBatch` writes no row for it.
+    @Test func nonMandarinPinyinSchemaCommitsAreNotLearned() throws {
+        #expect(LearningCommitEvent(rawInput: "wo", preedit: "wo", text: "伙", isMandarinPinyinSchema: false).normalized() == nil)
+        #expect(LearningCommitEvent(rawInput: "shi", preedit: "shi", text: "椒", isMandarinPinyinSchema: false).normalized() == nil)
+        #expect(LearningCommitEvent(rawInput: "wo", preedit: "wo", text: "伙").normalized()?.pinyinNorm == "wo")
+        let wubi = CommitObservation(rawInput: "wo", preedit: "wo", committedText: "伙", schemaID: "wubi98_mint", isMandarinPinyinSchema: false)
+        #expect(!LearningCommitEvent(observation: wubi).isMandarinPinyinSchema)
+        #expect(LearningCommitEvent(observation: wubi).normalized() == nil)
+        let pinyin = CommitObservation(rawInput: "nihao", preedit: "ni hao", committedText: "你好", schemaID: "rime_ice")
+        #expect(LearningCommitEvent(observation: pinyin).normalized()?.pinyinNorm == "ni hao")
+
+        let directory = try TemporaryDirectory()
+        let store = try LearningStore(url: directory.store)
+        #expect(try store.recordBatch([LearningCommitEvent(observation: wubi)]) == 0)
+        #expect(try store.stats().entryCount == 0)
+    }
+
     @Test(arguments: [
         ("女孩", ["nv", "hai"]), ("旅游", ["lv", "you"]), ("绿茶", ["lv", "cha"]), ("时间", ["shi", "jian"]),
         ("施加", ["shi", "jia"]), ("略", ["lve"]), ("虐", ["nve"]), ("儿", ["er"]), ("哦", ["o"]),
@@ -161,7 +180,7 @@ func permissions(_ url: URL) -> mode_t {
         try writer.recordBatch([event("a", "啊")])
         let reader = try LearningStore(url: directory.store, mode: .readOnly)
         #expect(throws: LearningStoreError.notWritable) { try reader.recordBatch([event("ni", "你")]) }
-        #expect(throws: LearningStoreError.notWritable) { try reader.setWatermark(for: .wanxiang, lastRevision: 1, projectedCount: 1) }
+        #expect(throws: LearningStoreError.notWritable) { try reader.setWatermark(for: .wanxiang, dictName: "wanxiang", lastRevision: 1, projectedCount: 1) }
 
         let syllables = ["ba", "pa", "ma", "fa", "da", "ta", "na", "la", "ga", "ka"]
         let texts = ["八", "怕", "马", "发", "大", "他", "那", "拉", "嘎", "卡"]
@@ -223,19 +242,93 @@ func permissions(_ url: URL) -> mode_t {
         let directory = try TemporaryDirectory()
         let store = try LearningStore(url: directory.store)
         try store.recordBatch([event("ni", "你"), event("hao", "好")])
-        #expect(try store.watermark(for: .rimeIce) == nil)
-        try store.setWatermark(for: .rimeIce, lastRevision: try store.latestRevision(), projectedCount: 2,
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice") == nil)
+        try store.setWatermark(for: .rimeIce, dictName: "rime_ice", lastRevision: try store.latestRevision(), projectedCount: 2,
                                at: Date(timeIntervalSince1970: 5))
         try store.recordBatch([event("ma", "吗"), event("ni", "你")])
-        let mark = try #require(try store.watermark(for: .rimeIce))
+        let mark = try #require(try store.watermark(for: .rimeIce, dictName: "rime_ice"))
         #expect(mark.lastRevision == 2 && mark.projectedCount == 2 && mark.updatedAt == Date(timeIntervalSince1970: 5))
+        #expect(mark.schemaSet == "rime-ice" && mark.dictName == "rime_ice")
         // Only the changes after the watermark replay: the new 吗 and the re-learned 你.
         #expect(try store.entriesSince(revision: mark.lastRevision).map(\.text) == ["吗", "你"])
-        #expect(try store.watermark(for: .mint) == nil, "watermarks are per set")
+        #expect(try store.watermark(for: .mint, dictName: "rime_ice") == nil, "watermarks are per set")
         try store.resetWatermark(for: .rimeIce)
-        #expect(try store.watermark(for: .rimeIce) == nil)
+        #expect(try store.watermark(for: .rimeIce, dictName: "rime_ice") == nil)
         let stats = try store.stats()
         #expect(stats.entryCount == 3 && stats.totalFrequency == 4 && stats.latestRevision == 4 && stats.watermarks.isEmpty)
+    }
+
+    /// Two userdbs of one set have independent watermarks: advancing `dict_b` leaves
+    /// `dict_a` where it was; a single-userdb reset clears only that userdb, a set-wide reset
+    /// clears the set's userdbs and no other set's.
+    @Test func watermarksArePerSchemaSetAndUserDB() throws {
+        let directory = try TemporaryDirectory()
+        let store = try LearningStore(url: directory.store)
+        try store.setWatermark(for: .mint, dictName: "dict_a", lastRevision: 2, projectedCount: 2)
+        try store.setWatermark(for: .mint, dictName: "dict_b", lastRevision: 2, projectedCount: 2)
+        try store.setWatermark(for: .rimeIce, dictName: "dict_a", lastRevision: 7, projectedCount: 7)
+        try store.setWatermark(for: .mint, dictName: "dict_b", lastRevision: 3, projectedCount: 3)
+        #expect(try store.watermark(for: .mint, dictName: "dict_a")?.lastRevision == 2)
+        #expect(try store.watermark(for: .mint, dictName: "dict_b")?.lastRevision == 3)
+        #expect(try store.watermark(for: .rimeIce, dictName: "dict_a")?.lastRevision == 7)
+        #expect(try store.stats().watermarks.map { "\($0.schemaSet)/\($0.dictName)" } == ["mint/dict_a", "mint/dict_b", "rime-ice/dict_a"])
+
+        try store.resetWatermark(for: .mint, dictName: "dict_a")
+        #expect(try store.watermark(for: .mint, dictName: "dict_a") == nil)
+        #expect(try store.watermark(for: .mint, dictName: "dict_b")?.lastRevision == 3, "a single-userdb reset cleared dict_b")
+        #expect(try store.watermark(for: .rimeIce, dictName: "dict_a")?.lastRevision == 7)
+        try store.setWatermark(for: .mint, dictName: "dict_a", lastRevision: 3, projectedCount: 3)
+        try store.resetWatermark(for: .mint)
+        #expect(try store.stats().watermarks.map { "\($0.schemaSet)/\($0.dictName)" } == ["rime-ice/dict_a"])
+    }
+
+    /// A pre-release store (`user_version` 1) whose `projection_watermarks` is keyed by set
+    /// alone: a read-only connection reads it without error and reports no watermarks; a
+    /// read-write open replaces the table with the per-userdb one, keeps every entry and the
+    /// revision, and drops the legacy watermark so every userdb re-projects in full.
+    @Test func legacyPerSetWatermarksMigrateConservatively() throws {
+        let directory = try TemporaryDirectory()
+        var db: OpaquePointer?
+        try #require(sqlite3_open(directory.store.path, &db) == SQLITE_OK)
+        let legacy = """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            CREATE TABLE entries(
+              id INTEGER PRIMARY KEY, pinyin_norm TEXT NOT NULL, pinyin_compact TEXT NOT NULL, text TEXT NOT NULL,
+              frequency INTEGER NOT NULL DEFAULT 1, is_user_phrase INTEGER NOT NULL DEFAULT 0,
+              updated_at REAL NOT NULL, revision INTEGER NOT NULL, UNIQUE(pinyin_norm, text));
+            CREATE INDEX entries_revision ON entries(revision);
+            CREATE TABLE projection_watermarks(
+              schema_set TEXT PRIMARY KEY, last_revision INTEGER NOT NULL,
+              projected_count INTEGER NOT NULL, updated_at REAL NOT NULL);
+            INSERT INTO meta VALUES('revision', 2);
+            INSERT INTO entries(pinyin_norm, pinyin_compact, text, frequency, updated_at, revision)
+              VALUES('ni hao', 'nihao', '你好', 3, 10, 1), ('shi jie', 'shijie', '世界', 1, 11, 2);
+            INSERT INTO projection_watermarks VALUES('mint', 2, 2, 12);
+            PRAGMA journal_mode=WAL;
+            PRAGMA user_version = 1;
+            """
+        #expect(sqlite3_exec(db, legacy, nil, nil, nil) == SQLITE_OK, "\(String(cString: sqlite3_errmsg(db)))")
+        sqlite3_close(db)
+
+        let reader = try LearningStore(url: directory.store, mode: .readOnly)
+        let before = try reader.stats()
+        #expect(before.entryCount == 2 && before.latestRevision == 2 && before.watermarks.isEmpty)
+        #expect(try reader.watermark(for: .mint, dictName: "mint") == nil)
+        reader.close()
+
+        let store = try LearningStore(url: directory.store)
+        #expect(try store.allEntries().map(\.text) == ["你好", "世界"])
+        #expect(try store.latestRevision() == 2)
+        #expect(try store.stats().watermarks.isEmpty, "the legacy per-set watermark survived")
+        try store.setWatermark(for: .mint, dictName: "dict_a", lastRevision: 2, projectedCount: 2)
+        try store.setWatermark(for: .mint, dictName: "dict_b", lastRevision: 1, projectedCount: 1)
+        #expect(try store.stats().watermarks.map(\.dictName) == ["dict_a", "dict_b"])
+        store.close()
+        // Reopening a migrated store changes nothing.
+        let again = try LearningStore(url: directory.store)
+        #expect(try again.stats().watermarks.count == 2 && again.stats().entryCount == 2)
+        let reread = try LearningStore(url: directory.store, mode: .readOnly)
+        #expect(try reread.watermark(for: .mint, dictName: "dict_b")?.lastRevision == 1)
     }
 }
 

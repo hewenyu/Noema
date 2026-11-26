@@ -98,6 +98,11 @@ public final class RimeEngine: TypingEngine {
     private var generation: UInt64 = 0
     /// True while `switchSchemaSet` runs; a second switch is refused meanwhile.
     var isSwitchingSchemaSet = false
+    /// Whether the live schema spells Mandarin pinyin (`isMandarinPinyinSchema(schemaID:)`),
+    /// for `cachedSchemaID`. Recomputed when a session opens and whenever `refreshState`
+    /// sees another schema (librime's own schema switcher); false until then (fail-closed).
+    public private(set) var currentSchemaIsMandarinPinyin = false
+    private var cachedSchemaID: String?
 
     /// Called on the main actor after every call that committed text containing a Han
     /// character, with the raw input and preedit captured before the call changed them.
@@ -383,7 +388,17 @@ public final class RimeEngine: TypingEngine {
         guard session != 0 else { return false }
         resources.session = session
         guard api.pointee.select_schema(session, configuration.schemaID) != 0 else { return false }
-        return readStatus().schemaID == configuration.schemaID
+        let schemaID = readStatus().schemaID
+        // A new session may run another set's build under the same schema ID: always re-classify.
+        noteSchema(schemaID, force: true)
+        return schemaID == configuration.schemaID
+    }
+
+    /// Re-classifies the live schema when it is not `cachedSchemaID` (or with `force`).
+    private func noteSchema(_ schemaID: String?, force: Bool = false) {
+        guard force || schemaID != cachedSchemaID else { return }
+        cachedSchemaID = schemaID
+        currentSchemaIsMandarinPinyin = schemaID.map { isMandarinPinyinSchema(schemaID: $0) } ?? false
     }
 
     /// Recreates the session if librime dropped it (e.g. stale-session cleanup).
@@ -492,7 +507,8 @@ public final class RimeEngine: TypingEngine {
               !before.rawInput.isEmpty, TextNormalization.containsHanCharacters(committed)
         else { return }
         observer(CommitObservation(
-            rawInput: before.rawInput, preedit: before.preedit, committedText: committed, schemaID: currentState.schemaID))
+            rawInput: before.rawInput, preedit: before.preedit, committedText: committed, schemaID: currentState.schemaID,
+            isMandarinPinyinSchema: currentSchemaIsMandarinPinyin))
     }
 
     private func drainCommit() -> String? {
@@ -543,6 +559,7 @@ public final class RimeEngine: TypingEngine {
     @discardableResult
     func refreshState() -> CompositionState {
         let status = readStatus()
+        noteSchema(status.schemaID)
         var context = RimeContext()
         noema_rime_context_init(&context)
         let generationID = nextGeneration()

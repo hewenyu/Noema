@@ -12,6 +12,9 @@ public struct SchemaSetSwitchReport: Sendable {
     /// The userdb the guardian checked (`translator/user_dict`, else `translator/dictionary`),
     /// nil when the schema has none or disables it.
     public var userDictName: String?
+    /// Whether the target schema spells Mandarin pinyin. When false the guardian still checks
+    /// the userdb but never projects `learning.sqlite` (full-pinyin keys) into it.
+    public var isMandarinPinyinSchema: Bool
     /// The guardian's outcome; nil when it did not run (no levers API, no user dict).
     public var userDBOutcome: UserDBGuardian.MaintenanceOutcome?
     /// Why the guardian failed, if it did; the switch still completes.
@@ -112,16 +115,19 @@ extension RimeEngine {
         configuration = target
         initializeRime()
 
+        // A shape or non-Mandarin schema's userdb is keyed by its own codes: the guardian
+        // keeps it healthy but never fills it with full-pinyin entries or a watermark.
+        let isPinyin = isMandarinPinyinSchema(schemaID: targetSchema)
         var report = SchemaSetSwitchReport(
-            schemaSetID: set, schemaID: targetSchema, userDictName: nil, userDBOutcome: nil, userDBFailure: nil,
-            learnedLines: nil, linkedGram: linkedGram, savedActiveRecord: false)
+            schemaSetID: set, schemaID: targetSchema, userDictName: nil, isMandarinPinyinSchema: isPinyin,
+            userDBOutcome: nil, userDBFailure: nil, learnedLines: nil, linkedGram: linkedGram, savedActiveRecord: false)
         if let dictName = userDictName(schemaID: targetSchema), let levers = RimeUserDictLevers() {
             report.userDictName = dictName
             let guardian = UserDBGuardian(
                 schemaSet: set, userDataDir: target.rimeUserDataDir,
                 snapshotsDir: NoemaPaths.userDBSnapshotsDir(set, root: target.userDataDir), levers: levers)
             do {
-                report.userDBOutcome = try guardian.maintain(dictName, store: learningStore)
+                report.userDBOutcome = try guardian.maintain(dictName, store: isPinyin ? learningStore : nil)
             } catch {
                 report.userDBFailure = error
             }
@@ -186,6 +192,46 @@ extension RimeEngine {
             }
         }
         return nil
+    }
+
+    /// Lowercase substrings of a schema ID, `translator/dictionary`, or `translator/prism`
+    /// that mark a schema whose codes are not Mandarin pinyin (shape codes, Zhuyin,
+    /// Cantonese and other languages), even one whose primary translator is
+    /// `script_translator` (Jyutping, Zhuyin). Double pinyin (`double_pinyin_flypy`,
+    /// `xiaohe`) is Mandarin pinyin: its preedit spells full pinyin and its userdb is keyed
+    /// by it, so it is not listed.
+    nonisolated static let nonMandarinPinyinMarkers = [
+        "wubi", "cangjie", "stroke", "erbi", "zhengma", "bopomofo", "zhuyin", "jyutping", "jyut6ping3",
+        "cantonese", "hakka", "array", "quick", "dayi", "kana", "hangul", "easy_en", "melt_eng", "english",
+        "tiger", "wugniu", "soutzoe", "xingma",
+    ]
+
+    /// Whether the compiled schema `schemaID` spells Mandarin pinyin (full, double, or
+    /// jianpin): `engine/translators` lists an untagged `script_translator` and no untagged
+    /// `table_translator` (the primary translator of Wubi, Cangjie, Stroke, Zhengma; full
+    /// pinyin uses only tagged ones such as `table_translator@custom_phrase`), and neither
+    /// the schema ID, `translator/dictionary`, nor `translator/prism` names a
+    /// `nonMandarinPinyinMarkers` entry. Fail-closed: false for an empty ID, a schema that
+    /// will not open, or a librime without the config API.
+    func isMandarinPinyinSchema(schemaID: String) -> Bool {
+        guard !schemaID.isEmpty, let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring, let listSize = api.pointee.config_list_size
+        else { return false }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return false }
+        defer { _ = configClose(&config) }
+        let translators = (0..<listSize(&config, "engine/translators")).compactMap { index in
+            getCString(&config, "engine/translators/@\(index)").map { String(cString: $0) }
+        }
+        guard translators.contains("script_translator"), !translators.contains("table_translator") else { return false }
+        var names = [schemaID]
+        for key in ["translator/dictionary", "translator/prism"] {
+            if let value = getCString(&config, key) { names.append(String(cString: value)) }
+        }
+        return !names.contains { name in
+            let lowered = name.lowercased()
+            return Self.nonMandarinPinyinMarkers.contains { lowered.contains($0) }
+        }
     }
 
     /// Creates `sets/<set>/` (and its `lua/`), installs `luaFile` there as

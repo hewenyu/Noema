@@ -96,14 +96,15 @@ local function lookup_key(input, delimiters)
   return (key:gsub("%u", string.lower))
 end
 
--- Lowercase substrings of a schema ID or `translator/prism` that mark a schema whose keys
+-- Lowercase substrings of a schema ID, `translator/dictionary`, or `translator/prism` that mark a schema whose keys
 -- are not full pinyin, even one whose speller keeps the full spellings (a mixed schema
 -- that only `derive`s double-pinyin codes would read `shui` both ways). `terra_pinyin`
 -- is full pinyin (tone digits are optional), so it is not listed.
 local NON_FULL_PINYIN_NAMES = {
   "double_pinyin", "shuangpin", "flypy", "xiaohe", "zrm", "ziranma", "mspy", "pyjj",
   "ziguang", "sogou", "wubi", "cangjie", "bopomofo", "zhuyin", "stroke", "erbi",
-  "zhengma", "jyutping", "cantonese",
+  "zhengma", "jyutping", "jyut6ping3", "cantonese", "hakka", "array", "quick", "dayi",
+  "kana", "hangul", "easy_en", "melt_eng", "english", "tiger", "wugniu", "soutzoe", "xingma",
 }
 
 -- Standard Mandarin syllables whose initials and finals every double-pinyin layout (and
@@ -113,21 +114,29 @@ local PROBE_SYLLABLES = {
   "chang", "sheng", "qiong", "huang", "ang", "er", "ai", "ou",
 }
 
+-- Whether the primary translator is an untagged `script_translator`: one is listed and no
+-- untagged `table_translator` is (the primary translator of Wubi, Cangjie, Stroke, and
+-- Zhengma). A tagged one (`script_translator@reverse_lookup` beside Wubi's table, or full
+-- pinyin's `table_translator@custom_phrase`) never decides it.
 local function has_script_translator(config)
   local list = config:get_list("engine/translators")
   if not list then return false end
+  local script = false
   for index = 0, list.size - 1 do
     local item = list:get_value_at(index)
     local name = item and item.value or ""
-    if name == "script_translator" or name:sub(1, #"script_translator@") == "script_translator@" then
-      return true
-    end
+    if name == "table_translator" then return false end
+    if name == "script_translator" then script = true end
   end
-  return false
+  return script
 end
 
 local function has_non_full_pinyin_name(env, config)
-  local names = { env.engine.schema.schema_id or "", config:get_string("translator/prism") or "" }
+  local names = {
+    env.engine.schema.schema_id or "",
+    config:get_string("translator/dictionary") or "",
+    config:get_string("translator/prism") or "",
+  }
   for _, name in ipairs(names) do
     local lowered = name:lower()
     for _, marker in ipairs(NON_FULL_PINYIN_NAMES) do
@@ -172,7 +181,8 @@ local function speller_keeps_full_pinyin(config)
   return ok and keeps == true
 end
 
--- True only for a schema whose raw input spells full pinyin: a `script_translator`, no
+-- True only for a schema whose raw input spells full pinyin: an untagged `script_translator`
+-- and no untagged `table_translator`, no
 -- non-full-pinyin name, and a speller that leaves full-pinyin syllables as they are.
 local function is_full_pinyin_schema(env)
   local config = env.engine and env.engine.schema and env.engine.schema.config

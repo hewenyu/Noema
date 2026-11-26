@@ -132,7 +132,7 @@ enum LexiconCommand {
         if let stats = inventory.learning {
             print("learning entries=\(stats.entryCount) userPhrases=\(stats.userPhraseCount) commits=\(stats.totalFrequency) revision=\(stats.latestRevision)")
             for mark in stats.watermarks {
-                print("  watermark \(mark.schemaSet)\trevision \(mark.lastRevision)\tprojected \(mark.projectedCount)")
+                print("  watermark \(mark.schemaSet)\t\(mark.dictName)\trevision \(mark.lastRevision)\tprojected \(mark.projectedCount)")
             }
         } else if let error = inventory.learningError {
             print("learning: unreadable (\(error))")

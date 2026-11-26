@@ -51,7 +51,8 @@ struct RimeUserDictLevers: UserDictLevers {
 /// - **Health**: `<dict>.userdb` must be a real directory (`lstat`; a symlink is corrupt),
 ///   hold no LevelDB `lost/` directory (left by a repair that dropped data), export
 ///   (`export_user_dict >= 0`) into a private probe file, and export at least half the
-///   entries the store last projected into it.
+///   entries the store last projected into it. Every watermark read or written here is the
+///   one of `(schemaSet, dictName)`, never a set-wide one.
 /// - **Snapshots**: `snapshots/<set>/<dict>.snapshot.tsv` plus `<dict>.snapshot.meta.json`
 ///   (SHA-256, size, entry count, the `learningRevision` it contains), written only after a
 ///   successful export, each through a `0600` temporary file, `fsync`, and `rename(2)`.
@@ -157,7 +158,7 @@ public struct UserDBGuardian {
         if FileSafety.fileType(userdb.appending(path: "lost")) != nil { return .corrupted(.lostDirectory) }
         let exported = try withProbe { probe in levers.exportUserDict(dictName, to: probe) }
         guard exported >= 0 else { return .corrupted(.exportFailed) }
-        if let store, let mark = try storeCall({ () throws(LearningStoreError) in try store.watermark(for: schemaSet) }),
+        if let store, let mark = try storeCall({ () throws(LearningStoreError) in try store.watermark(for: schemaSet, dictName: dictName) }),
            mark.projectedCount > 0, Int64(exported) * 2 < mark.projectedCount {
             return .diverged(exported: exported, projected: mark.projectedCount)
         }
@@ -166,20 +167,22 @@ public struct UserDBGuardian {
 
     // MARK: Projection
 
-    /// Imports the store entries changed after the set's watermark and advances it; a
-    /// watermark ahead of the store (a replaced store) replays everything. Returns how many
-    /// entries were imported.
+    /// Imports the store entries changed after the watermark of `(schemaSet, dictName)` and
+    /// advances it; other userdbs of the set keep their own. A watermark ahead of the store
+    /// (a replaced store) replays everything. Returns how many entries were imported.
     @discardableResult
     public func project(_ dictName: String, store: LearningStore) throws(Failure) -> Int {
         try requirePlainName(dictName)
         let latest = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
-        var since = try storeCall { () throws(LearningStoreError) in try store.watermark(for: schemaSet) }?.lastRevision ?? 0
+        var since = try storeCall { () throws(LearningStoreError) in
+            try store.watermark(for: schemaSet, dictName: dictName)
+        }?.lastRevision ?? 0
         if since > latest { since = 0 }
         let entries = try storeCall { () throws(LearningStoreError) in try store.entriesSince(revision: since) }
         let imported = entries.isEmpty ? 0 : try importEntries(entries, into: dictName)
         let count = try storeCall { () throws(LearningStoreError) in try store.stats() }.entryCount
         try storeCall { () throws(LearningStoreError) in
-            try store.setWatermark(for: schemaSet, lastRevision: latest, projectedCount: count)
+            try store.setWatermark(for: schemaSet, dictName: dictName, lastRevision: latest, projectedCount: count)
         }
         return imported
     }
@@ -213,7 +216,7 @@ public struct UserDBGuardian {
             if !entries.isEmpty { imported += try importEntries(entries, into: dictName) }
             let count = try storeCall { () throws(LearningStoreError) in try store.stats() }.entryCount
             try storeCall { () throws(LearningStoreError) in
-                try store.setWatermark(for: schemaSet, lastRevision: latest, projectedCount: count)
+                try store.setWatermark(for: schemaSet, dictName: dictName, lastRevision: latest, projectedCount: count)
             }
             revision = latest
         }
@@ -238,7 +241,7 @@ public struct UserDBGuardian {
             return .healthy(projected: projected)
         case .diverged:
             guard let store else { return .nothingToDo }
-            try storeCall { () throws(LearningStoreError) in try store.resetWatermark(for: schemaSet) }
+            try storeCall { () throws(LearningStoreError) in try store.resetWatermark(for: schemaSet, dictName: dictName) }
             return .reprojected(imported: try project(dictName, store: store))
         case .corrupted:
             return .recovered(try recover(dictName, store: store))

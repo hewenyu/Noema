@@ -139,7 +139,7 @@ import Testing
                 LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "你好"),
                 LearningCommitEvent(rawInput: "shijie", preedit: "shi jie", text: "世界"),
             ]) == 3)
-            try store.setWatermark(for: .rimeIce, lastRevision: 2, projectedCount: 2)
+            try store.setWatermark(for: .rimeIce, dictName: "rime_ice", lastRevision: 2, projectedCount: 2)
             store.close()
         }
         try ActiveSchemaSetRecord(schemaSetID: .rimeIce, schemaID: "rime_ice").save(to: NoemaPaths.activeSchemaSetURL(root: root))
@@ -162,7 +162,7 @@ import Testing
         #expect(dictionaries.contains { $0.schemaSetID == .builtin && $0.relativePath == "noema_pinyin.dict.yaml" && $0.byteSize == 1234 })
         let stats = try #require(controller.inventory?.learning)
         #expect(stats.entryCount == 2 && stats.totalFrequency == 3)
-        #expect(stats.watermarks.map(\.schemaSet) == ["rime-ice"])
+        #expect(stats.watermarks.map { "\($0.schemaSet)/\($0.dictName)" } == ["rime-ice/rime_ice"])
         let after = try sidecarDigests(storeURL)
         #expect(after[""] == before[""], "the agent wrote learning.sqlite: \(before.keys.sorted()) -> \(after.keys.sorted())")
         #expect(after["-wal"].map(\.isEmpty) ?? true, "the agent left WAL frames: \(after["-wal"]?.count ?? 0) bytes")
