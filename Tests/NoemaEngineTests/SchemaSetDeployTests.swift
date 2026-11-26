@@ -237,4 +237,27 @@ import Testing
         #expect(RimeEngine.linkGram(symlink, into: set) == nil)
         #expect(RimeEngine.linkGram(models.appending(path: "missing.gram"), into: set) == nil)
     }
+
+    /// librime's `Language::get_language_component`: a `translator/dictionary` without a
+    /// `translator/user_dict` names the userdb up to its first `.` past index 0.
+    @Test func defaultUserDictNameIsTheDictionaryLanguageComponent() {
+        #expect(RimeEngine.defaultUserDictName(fromDictionary: "noema_pinyin.extra") == "noema_pinyin")
+        #expect(RimeEngine.defaultUserDictName(fromDictionary: "rime_ice.extended") == "rime_ice")
+        #expect(RimeEngine.defaultUserDictName(fromDictionary: "a.b.c") == "a")
+        #expect(RimeEngine.defaultUserDictName(fromDictionary: "noema_pinyin") == "noema_pinyin")
+        #expect(RimeEngine.defaultUserDictName(fromDictionary: ".hidden") == ".hidden")
+    }
+
+    /// Prefixes claim input at its start; a recognizer pattern only with a match that ends
+    /// at the input's end (薄荷's unanchored `Uw[a-z]*'?$` also after confirmed text).
+    @Test func secondaryInputRulesClaimPrefixesAndEndAnchoredPatterns() throws {
+        let rules = SecondaryInputRules(prefixes: ["Uw", "`"], patterns: [
+            try NSRegularExpression(pattern: "Uw[a-z]*'?$"),
+            try NSRegularExpression(pattern: "^R[0-9]+[.]?[0-9]*"),
+            try NSRegularExpression(pattern: "^[a-z]+[.].+$"),
+        ])
+        for claimed in ["Uwwo", "`wo", "nihaoUwwo", "R12", "R1.5", "www.a"] { #expect(rules.claims(claimed), "\(claimed)") }
+        for pinyin in ["nihao", "ni'hao", "nh", "uijx", "shij", "R12x"] { #expect(!rules.claims(pinyin), "\(pinyin)") }
+        #expect(!SecondaryInputRules().claims("Uwwo"))
+    }
 }

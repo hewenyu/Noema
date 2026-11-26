@@ -543,6 +543,149 @@ extension LibrimeSerializedTests {
             #expect(try store.stats().watermarks.map(\.dictName) == ["rime_ice_fixture"])
         }
 
+        /// A reverse lookup inside a full-pinyin schema is never learned (Codex #4710447100):
+        /// in `mint_reverse` (薄荷's `Uw` Wubi 98 lookup), `Uwwo` commits 伙, whose Wubi code
+        /// `wo` is a valid syllable, yet `learning.sqlite` stays empty and 雾凇 never offers 伙
+        /// for `wo`; ordinary pinyin in the same schema (`nihao`, `ni'hao`) is still learned.
+        @Test func reverseLookupCommitsInAPinyinSchemaAreNotLearned() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addReverseLookupSchema(in: .mint)
+            let engine = try workspace.engine(luaFile: nil)
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+
+            let report = try await engine.switchSchemaSet(
+                to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: "mint_reverse",
+                learningStore: store, learningWriter: writer, luaFile: nil)
+            #expect(engine.currentState.schemaID == "mint_reverse" && report.isMandarinPinyinSchema)
+            #expect(!engine.isPrimaryPinyinInput("Uwwo") && !engine.isPrimaryPinyinInput("nihao`wo") && engine.isPrimaryPinyinInput("nihao"))
+            #expect(try commit(engine, "Uwwo", "伙").committed == "伙")
+            #expect(try commit(engine, "Uwshi", "椒").committed == "椒")
+            // Mid-composition reverse lookup after a pinyin prefix (`nihao` + `` `wo ``):
+            // commits `你好伙` in one composition, yet must never learn `("ni hao wo", "你好伙")`.
+            for character in "nihao`wo" { _ = engine.processKey(.text(character)) }
+            #expect(engine.processKey(.key(VirtualKeyCode.space, " ")).committedText == nil)
+            let mixedCommit = engine.processKey(.key(VirtualKeyCode.space, " "))
+            #expect(mixedCommit.committedText == "你好伙", "\(mixedCommit)")
+            writer.flush()
+            #expect(writer.statistics.enqueued == 3, "the reverse-lookup commits were not observed")
+            let afterLookup = try store.allEntries()
+            #expect(afterLookup.isEmpty, "reverse lookup was learned: \(afterLookup)")
+
+            #expect(try commit(engine, "nihao", "你好").committed == "你好")
+            #expect(try commit(engine, "ni'hao", "你好").committed == "你好")
+            writer.flush()
+            let learned = try store.allEntries()
+            #expect(learned.map(\.text) == ["你好"] && learned.first?.pinyinNorm == "ni hao", "\(learned)")
+
+            _ = try await engine.switchSchemaSet(
+                to: .rimeIce, sharedDataDir: workspace.schemaDir(.rimeIce), schemaID: "rime_ice_fixture",
+                learningStore: store, learningWriter: writer, luaFile: nil)
+            let wo = candidates(engine, "wo")
+            #expect(wo.first == "我" && !wo.contains("伙"), "\(wo)")
+            #expect(!candidates(engine, "shi").contains("椒"))
+        }
+
+        /// A `translator/dictionary` with a dot and no `translator/user_dict` names the userdb
+        /// by its language component, as librime does (Codex #4710447107): `dotted_dict` over
+        /// `noema_pinyin.extra` opens `noema_pinyin.userdb`, which the guardian fills, checks,
+        /// and restores after corruption; `explicit_user_dict` keeps `custom.user` verbatim.
+        @Test func dottedDictionaryUsesItsLanguageComponentAsTheUserDB() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addSchema("dotted_dict", dictionary: "noema_pinyin.extra", in: .mint)
+            try workspace.addSchema("explicit_user_dict", dictionary: "noema_pinyin.extra", userDict: "custom.user", in: .mint)
+            let engine = try workspace.engine(luaFile: nil)
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            #expect(!LexiconWorkspace.dictionary(of: .mint).contains("霓昊"))
+            func to(_ schemaID: String) async throws -> SchemaSetSwitchReport {
+                let report = try await engine.switchSchemaSet(
+                    to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: schemaID, learningStore: store, luaFile: nil)
+                #expect(engine.currentState.schemaID == schemaID && report.userDBFailure == nil)
+                return report
+            }
+            func toBuiltin() async throws {
+                try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store)
+            }
+            // librime's session also opens the set's first schema (`mint_fixture`) before selecting.
+            func userdbs() throws -> Set<String> {
+                Set(try FileManager.default.contentsOfDirectory(atPath: workspace.setDir(.mint).path)
+                    .filter { $0.hasSuffix(".userdb") && $0 != "mint_fixture.userdb" })
+            }
+
+            let first = try await to("dotted_dict")
+            #expect(first.userDictName == "noema_pinyin")
+            let created = try userdbs()
+            #expect(created == ["noema_pinyin.userdb"], "\(created)")
+            #expect(candidates(engine, "nihao").contains("霓昊"), "librime's userdb lacks the projected phrase")
+            try await toBuiltin()
+            #expect(try await to("dotted_dict").userDBOutcome == .healthy(projected: 0))
+            try await toBuiltin()
+
+            let userdb = workspace.setDir(.mint).appending(path: "noema_pinyin.userdb")
+            #expect(try !LevelDBCorruption.current.apply(to: userdb).isEmpty)
+            let recovered = try await to("dotted_dict")
+            guard case .recovered = recovered.userDBOutcome else {
+                Issue.record("the guardian missed the corrupt userdb: \(String(describing: recovered.userDBOutcome))")
+                return
+            }
+            #expect(candidates(engine, "nihao").contains("霓昊"), "the restored userdb lacks the phrase")
+            #expect(try userdbs() == ["noema_pinyin.userdb"])
+
+            #expect(try await to("explicit_user_dict").userDictName == "custom.user")
+            let both = try userdbs()
+            #expect(both == ["custom.user.userdb", "noema_pinyin.userdb"], "\(both)")
+            #expect(candidates(engine, "nihao").contains("霓昊"))
+        }
+
+        /// Standard OpenCC configs resolve from `openccDataDir` when the set's `opencc/` lacks
+        /// them (Codex #4710447111), while the set's own `opencc/` files keep precedence:
+        /// `opencc_s2t` (`s2t.json`) turns `hanyu` into 漢語; `opencc_std` uses a config that
+        /// exists only in `openccDataDir`; `opencc_custom`'s config exists in both, and the
+        /// set's copy wins. `scripts/dev/test.sh` under `sandbox-exec` denying librime's
+        /// build-time OpenCC prefix reproduces a clean machine.
+        @Test func standardOpenCCDataResolvesFromOpenCCDataDirWithoutShadowingPackFiles() async throws {
+            let workspace = try LexiconWorkspace()
+            let standard = Tool.repository.appending(path: "vendor-out/librime/share/opencc", directoryHint: .isDirectory)
+            let dataDir = workspace.root.appending(path: "opencc-data", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+            for name in try FileManager.default.contentsOfDirectory(atPath: standard.path) {
+                try FileManager.default.createSymbolicLink(at: dataDir.appending(path: name), withDestinationURL: standard.appending(path: name))
+            }
+            try LexiconWorkspace.writeOpenCCConfig("noema_std", mapping: "汉语标准", in: dataDir)
+            try LexiconWorkspace.writeOpenCCConfig("noema_custom", mapping: "汉语乙", in: dataDir)
+            let packOpenCC = workspace.schemaDir(.mint).appending(path: "opencc", directoryHint: .isDirectory)
+            try LexiconWorkspace.writeOpenCCConfig("noema_custom", mapping: "汉语甲", in: packOpenCC)
+            #expect(!FileManager.default.fileExists(atPath: packOpenCC.appending(path: "s2t.json").path))
+            for (schemaID, config) in [("opencc_s2t", "s2t.json"), ("opencc_std", "noema_std.json"), ("opencc_custom", "noema_custom.json")] {
+                try workspace.addOpenCCSchema(schemaID, config: config, dictionary: "opencc_dict", in: .mint)
+            }
+
+            let previous = getenv(RimeEngineConfiguration.openccDataDirVariable).map { String(cString: $0) }
+            defer {
+                if let previous { setenv(RimeEngineConfiguration.openccDataDirVariable, previous, 1) } else {
+                    unsetenv(RimeEngineConfiguration.openccDataDirVariable)
+                }
+            }
+            let engine = try workspace.engine(luaFile: nil, openccDataDir: dataDir)
+            defer { engine.shutdown() }
+            #expect(engine.configuration.openccDataDir == dataDir)
+            var firsts: [String: String?] = [:]
+            for schemaID in ["opencc_s2t", "opencc_std", "opencc_custom"] {
+                _ = try await engine.switchSchemaSet(to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: schemaID, luaFile: nil)
+                #expect(engine.currentState.schemaID == schemaID)
+                #expect(engine.configuration.openccDataDir == dataDir, "the switch dropped openccDataDir")
+                firsts[schemaID] = candidates(engine, "hanyu").first
+            }
+            #expect(getenv(RimeEngineConfiguration.openccDataDirVariable).map { String(cString: $0) } == dataDir.path)
+            #expect(firsts == ["opencc_s2t": "漢語", "opencc_std": "汉语标准", "opencc_custom": "汉语甲"], "\(firsts)")
+        }
+
         /// Two userdbs in one set keep their own projection watermarks (Codex #4707351680):
         /// `schema_a` (`dict_a`) and `schema_b` (`dict_b`) both hold revision 2; `时见` is
         /// learned at revision 3; `schema_b` takes it, and `schema_a`, switched to after, still
@@ -1313,8 +1456,86 @@ final class LexiconWorkspace {
 
     /// The input method's boot: `active-schema-set.json`, else the built-in set, with the Lua translator.
     @MainActor
-    func engine(luaFile: URL? = LexiconWorkspace.lua) throws -> RimeEngine {
-        try RimeEngine(configuration: .activeSchemaSet(root: user, builtinSharedDataDir: Self.builtin, logDir: logs, luaFile: luaFile))
+    func engine(luaFile: URL? = LexiconWorkspace.lua, openccDataDir: URL? = nil) throws -> RimeEngine {
+        try RimeEngine(configuration: .activeSchemaSet(
+            root: user, builtinSharedDataDir: Self.builtin, logDir: logs, luaFile: luaFile, openccDataDir: openccDataDir))
+    }
+
+    /// `schemaID` in `set`, a copy of its fixture schema whose `translator/dictionary` is
+    /// `dictionary` and whose candidates pass through `simplifier@cc` with `opencc_config:
+    /// config` (switch `cc` on by default); `汉语 han yu` tops `dictionary`.
+    func addOpenCCSchema(_ schemaID: String, config: String, dictionary: String, in set: SchemaSetID) throws {
+        try addSchema(schemaID, dictionary: dictionary, in: set)
+        let dictionaryURL = schemaDir(set).appending(path: "\(dictionary).dict.yaml")
+        let text = try String(contentsOf: dictionaryURL, encoding: .utf8)
+        if !text.contains("汉语\t") {
+            try (text + "汉语\than yu\t100000\n").write(to: dictionaryURL, atomically: true, encoding: .utf8)
+        }
+        try replace(in: set, "\(schemaID).schema.yaml", "    - script_translator\n", with: """
+                - script_translator
+              filters:
+                - simplifier@cc
+                - uniquifier
+
+            """)
+        try replace(in: set, "\(schemaID).schema.yaml", "switches:\n", with: """
+            switches:
+              - name: cc
+                reset: 1
+                states: [ 简, 繁 ]
+
+            """)
+        let url = schemaDir(set).appending(path: "\(schemaID).schema.yaml")
+        try (try String(contentsOf: url, encoding: .utf8) + "\ncc:\n  option_name: cc\n  opencc_config: \(config)\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Writes the OpenCC config `<name>.json` and its text dictionary mapping `汉语` to
+    /// `replacement` into `directory`.
+    static func writeOpenCCConfig(_ name: String, mapping replacement: String, in directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let dict = #"{ "type": "text", "file": "\#(name).txt" }"#
+        try #"{ "name": "\#(name)", "segmentation": { "type": "mmseg", "dict": \#(dict) }, "conversion_chain": [ { "dict": \#(dict) } ] }"#
+            .write(to: directory.appending(path: "\(name).json"), atomically: true, encoding: .utf8)
+        try "汉语\t\(replacement)\n".write(to: directory.appending(path: "\(name).txt"), atomically: true, encoding: .utf8)
+    }
+
+    /// A 薄荷-style reverse lookup inside `set`'s full-pinyin fixture: schema `mint_reverse`
+    /// adds `affix_segmentor@wubi98_mint` and `table_translator@wubi98_mint` (`prefix: "Uw"`,
+    /// over `wubi98_mint`'s `伙 wo`, `椒 shi`; `addNonMandarinFixtures`), 薄荷's
+    /// `recognizer/patterns/wubi98_mint` and empty `uppercase` (the default one would tag
+    /// `Uwwo` first), and upper-case letters in `speller/alphabet`.
+    func addReverseLookupSchema(in set: SchemaSetID) throws {
+        try addNonMandarinFixtures(in: set)
+        try addSchema("mint_reverse", copying: Self.fixture(set).schemaID, in: set)
+        let name = "mint_reverse.schema.yaml"
+        try replace(in: set, name, "    - matcher\n", with: "    - matcher\n    - affix_segmentor@wubi98_mint\n    - affix_segmentor@backtick_lookup\n")
+        try replace(in: set, name, "    - script_translator\n", with: "    - script_translator\n    - table_translator@wubi98_mint\n    - table_translator@backtick_lookup\n")
+        try replace(in: set, name, "  alphabet: zyxwvutsrqponmlkjihgfedcba\n",
+                    with: "  alphabet: zyxwvutsrqponmlkjihgfedcbaZYXWVUTSRQPONMLKJIHGFEDCBA`\n")
+        try replace(in: set, name, "recognizer:\n  import_preset: default\n", with: """
+            recognizer:
+              import_preset: default
+              patterns:
+                wubi98_mint: "Uw[a-z]*'?$"
+                backtick_lookup: "^`[a-z]*'?$"
+                uppercase: ""
+
+            wubi98_mint:
+              tag: wubi98_mint
+              dictionary: wubi98_mint
+              enable_user_dict: false
+              prefix: "Uw"
+              tips: 〔五笔〕
+
+            backtick_lookup:
+              tag: backtick_lookup
+              dictionary: wubi98_mint
+              enable_user_dict: false
+              prefix: "`"
+              tips: 〔反查〕
+
+            """)
     }
 
     func openStore() throws -> LearningStore {

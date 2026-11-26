@@ -115,6 +115,23 @@ public enum NoemaPaths {
         root.appending(path: ActiveSchemaSetRecord.fileName)
     }
 
+    /// The standard OpenCC data directory (`s2t.json`, …): the first real directory among
+    /// `<bundle resources>/opencc/`, `<installedBundle>/Contents/Resources/opencc/`,
+    /// `<workingDirectory>/dist/NoemaIME.app/Contents/Resources/opencc/`, and
+    /// `<workingDirectory>/vendor-out/librime/share/opencc/` (a checkout).
+    public static func resolveOpenCCDataDir(
+        bundle: Bundle = .main,
+        workingDirectory: URL = URL(filePath: FileManager.default.currentDirectoryPath, directoryHint: .isDirectory),
+        installedBundle: URL = installedIMEBundleURL()
+    ) -> URL? {
+        var candidates: [URL] = []
+        if let resources = bundle.resourceURL { candidates.append(resources.appending(path: "opencc", directoryHint: .isDirectory)) }
+        candidates.append(installedBundle.appending(path: "Contents/Resources/opencc", directoryHint: .isDirectory))
+        candidates.append(workingDirectory.appending(path: "dist/\(imeBundleName)/Contents/Resources/opencc", directoryHint: .isDirectory))
+        candidates.append(workingDirectory.appending(path: "vendor-out/librime/share/opencc", directoryHint: .isDirectory))
+        return candidates.first(where: FileSafety.isRealDirectory)
+    }
+
     /// The bundled `noema_learned.lua`: the first regular file among
     /// `<bundle resources>/rime-lua/`, `<workingDirectory>/Resources/rime-lua/`, and
     /// `<installedBundle>/Contents/Resources/rime-lua/`.

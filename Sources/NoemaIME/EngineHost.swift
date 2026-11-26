@@ -122,7 +122,9 @@ final class EngineHost {
         luaFile = NoemaPaths.resolveLearnedLua(bundle: .main)
         if luaFile == nil { log.error("no bundled noema_learned.lua; learned phrases reach Rime only through userdbs") }
         let configuration = RimeEngineConfiguration.activeSchemaSet(
-            root: userDataDir, builtinSharedDataDir: sharedDataDir, logDir: logDir, luaFile: luaFile)
+            root: userDataDir, builtinSharedDataDir: sharedDataDir, logDir: logDir, luaFile: luaFile,
+            openccDataDir: RimeEngineConfiguration.bundledOpenCCDataDir())
+        if configuration.openccDataDir == nil { log.error("no bundled opencc data; standard OpenCC configs such as s2t.json may not load") }
         startBoot(configuration)
     }
 
@@ -207,7 +209,7 @@ final class EngineHost {
         startBoot(RimeEngineConfiguration(
             sharedDataDir: builtinSharedDataDir, userDataDir: rootDir, logDir: logDir,
             schemaID: SchemaSetID.builtin.defaultSchemaID, deployerURL: configuration.deployerURL,
-            schemaSetID: .builtin, luaFile: luaFile))
+            schemaSetID: .builtin, luaFile: luaFile, openccDataDir: configuration.openccDataDir))
         return true
     }
 

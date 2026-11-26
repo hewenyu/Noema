@@ -121,6 +121,13 @@ extension RimeEngine {
         if let set = configuration.schemaSetID { arguments += ["--schema-set", set.rawValue] }
         if let lua = configuration.luaFile { arguments += ["--lua-file", lua.absoluteURL.path] }
         process.arguments = arguments
+        if let (opencc, overriding) = configuration.effectiveOpenCCDataDir {
+            var environment = ProcessInfo.processInfo.environment
+            if overriding || environment[RimeEngineConfiguration.openccDataDirVariable] == nil {
+                environment[RimeEngineConfiguration.openccDataDirVariable] = opencc.path
+                process.environment = environment
+            }
+        }
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         let logURL = configuration.logDir.appending(path: "\(Self.deployerExecutableName).log")

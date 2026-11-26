@@ -12,7 +12,9 @@ public struct CommitObservation: Sendable, Hashable {
     /// Whether `schemaID` spells Mandarin pinyin (full, double, or jianpin; its preedit and
     /// userdb are keyed by full pinyin). False for a shape or non-Mandarin schema (Wubi,
     /// Cangjie, Zhuyin, Jyutping): its codes (`wo` for 伙 in Wubi 98) are never readings, so
-    /// the commit is never learned. `RimeEngine` always passes the live schema's answer.
+    /// the commit is never learned. `RimeEngine` passes the live schema's answer, false also
+    /// for input a pinyin schema routes to a reverse lookup or recognizer pattern (薄荷's
+    /// `Uwwo` for 伙): `RimeEngine.isPrimaryPinyinInput`.
     public let isMandarinPinyinSchema: Bool
 
     public init(

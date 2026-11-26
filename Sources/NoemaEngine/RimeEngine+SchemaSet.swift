@@ -173,6 +173,7 @@ extension RimeEngine {
     }
 
     private func initializeRime() {
+        configuration.exportOpenCCDataDir()
         withTraits { traits in
             RimeProcessLifecycle.setupIfNeeded(owner: resources.owner, api: api, traits: &traits)
             api.pointee.initialize(&traits)
@@ -180,8 +181,10 @@ extension RimeEngine {
         resources.isInitialized = true
     }
 
-    /// `translator/user_dict`, else `translator/dictionary`, of the compiled schema; nil when
-    /// neither is set, `translator/enable_user_dict` is false, or the name is not plain.
+    /// The userdb librime opens for the compiled schema (`UserDictionaryComponent::Create`):
+    /// `translator/user_dict` verbatim, else the language component of
+    /// `translator/dictionary` (`defaultUserDictName(fromDictionary:)`); nil when neither is
+    /// set, `translator/enable_user_dict` is false, or the name is not plain.
     func userDictName(schemaID: String) -> String? {
         guard let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
               let getCString = api.pointee.config_get_cstring
@@ -193,12 +196,23 @@ extension RimeEngine {
             var enabled: Int32 = 1
             if getBool(&config, "translator/enable_user_dict", &enabled) != 0, enabled == 0 { return nil }
         }
-        for key in ["translator/user_dict", "translator/dictionary"] {
-            if let value = getCString(&config, key).map({ String(cString: $0) }), !value.isEmpty {
-                return FileSafety.isPlainName(value) ? value : nil
-            }
+        if let value = getCString(&config, "translator/user_dict").map({ String(cString: $0) }), !value.isEmpty {
+            return FileSafety.isPlainName(value) ? value : nil
+        }
+        if let value = getCString(&config, "translator/dictionary").map({ String(cString: $0) }), !value.isEmpty {
+            guard FileSafety.isPlainName(value) else { return nil }
+            return Self.defaultUserDictName(fromDictionary: value)
         }
         return nil
+    }
+
+    /// The userdb name librime derives from a `translator/dictionary` when no
+    /// `translator/user_dict` is set: `Language::get_language_component`, the name up to its
+    /// first `.` past index 0 (`noema_pinyin.extra` → `noema_pinyin`, `a.b.c` → `a`), else
+    /// the whole name.
+    nonisolated static func defaultUserDictName(fromDictionary dictionary: String) -> String {
+        guard let dot = dictionary.firstIndex(of: "."), dot != dictionary.startIndex else { return dictionary }
+        return String(dictionary[..<dot])
     }
 
     /// The NFC precomposed Mandarin tone-marked vowels (tones 1–4) a toned dictionary's
@@ -266,6 +280,51 @@ extension RimeEngine {
         }
     }
 
+    /// The compiled schema `schemaID`'s secondary-input rules: the non-empty `<ns>/prefix` of
+    /// `reverse_lookup` and of every tagged `engine/translators` or `engine/segmentors` entry
+    /// (`table_translator@wubi98_mint` reads `wubi98_mint/prefix`), and every
+    /// `recognizer/patterns` entry with a non-empty key that compiles as an
+    /// `NSRegularExpression` (one that does not is skipped, as librime skips a bad pattern).
+    /// Empty for a schema that will not open or a librime without the config API.
+    func secondaryInputRules(schemaID: String) -> SecondaryInputRules {
+        guard !schemaID.isEmpty, let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring, let listSize = api.pointee.config_list_size
+        else { return SecondaryInputRules() }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return SecondaryInputRules() }
+        defer { _ = configClose(&config) }
+        var namespaces = ["reverse_lookup"]
+        for list in ["engine/translators", "engine/segmentors"] {
+            for index in 0..<listSize(&config, list) {
+                guard let entry = getCString(&config, "\(list)/@\(index)").map({ String(cString: $0) }),
+                      let at = entry.firstIndex(of: "@") else { continue }
+                let tag = String(entry[entry.index(after: at)...])
+                if !tag.isEmpty, !namespaces.contains(tag) { namespaces.append(tag) }
+            }
+        }
+        var rules = SecondaryInputRules()
+        for namespace in namespaces {
+            if let prefix = getCString(&config, "\(namespace)/prefix").map({ String(cString: $0) }), !prefix.isEmpty,
+               !rules.prefixes.contains(prefix) {
+                rules.prefixes.append(prefix)
+            }
+        }
+        if let beginMap = api.pointee.config_begin_map, let next = api.pointee.config_next, let end = api.pointee.config_end {
+            var iterator = RimeConfigIterator()
+            if beginMap(&iterator, &config, "recognizer/patterns") != 0 {
+                defer { end(&iterator) }
+                while next(&iterator) != 0 {
+                    guard let key = iterator.key.map({ String(cString: $0) }), !key.isEmpty,
+                          let path = iterator.path, let value = getCString(&config, path).map({ String(cString: $0) }),
+                          !value.isEmpty, let pattern = try? NSRegularExpression(pattern: value)
+                    else { continue }
+                    rules.patterns.append(pattern)
+                }
+            }
+        }
+        return rules
+    }
+
     /// Creates `sets/<set>/` (and its `lua/`), installs `luaFile` there as
     /// `noema_learned.lua`, and hard-links `gramPath` into it. Returns the linked gram (or
     /// `.some(nil)` with none), nil on failure. Makes no librime call.
@@ -312,5 +371,35 @@ extension RimeEngine {
         }
         FileSafety.syncDirectory(directory)
         return target
+    }
+}
+
+/// Input a pinyin schema hands to a translator other than its primary pinyin one, whose
+/// commits are therefore never pinyin readings (`RimeEngine.secondaryInputRules(schemaID:)`).
+struct SecondaryInputRules {
+    /// Reverse-lookup and tagged-translator prefixes (`Uw`, `` ` ``). Prefixes containing any
+    /// character outside lowercase `[a-z']` match anywhere in the raw input (catching a
+    /// reverse-lookup segment appended after a pinyin prefix, like ``nihao`wo``); pure
+    /// lowercase prefixes match only at the start so normal pinyin is never claimed mid-word.
+    var prefixes: [String] = []
+    /// `recognizer/patterns`; one claims the input when a non-empty match ends at the input's
+    /// end, as librime's `RecognizerPatterns::GetMatch` requires.
+    var patterns: [NSRegularExpression] = []
+
+    func claims(_ rawInput: String) -> Bool {
+        for prefix in prefixes {
+            let hasNonLowerPinyinScalar = prefix.unicodeScalars.contains { scalar in
+                !(scalar >= "a" && scalar <= "z") && scalar != "'"
+            }
+            if hasNonLowerPinyinScalar ? rawInput.contains(prefix) : rawInput.hasPrefix(prefix) {
+                return true
+            }
+        }
+        let whole = NSRange(rawInput.startIndex..., in: rawInput)
+        return patterns.contains { pattern in
+            pattern.matches(in: rawInput, range: whole).contains {
+                $0.range.length > 0 && $0.range.upperBound == whole.upperBound
+            }
+        }
     }
 }

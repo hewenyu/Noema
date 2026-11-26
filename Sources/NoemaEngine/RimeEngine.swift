@@ -39,6 +39,40 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
     /// `noema_learned.lua`, passed to the deployer as `--lua-file` and copied to
     /// `<rimeUserDataDir>/lua/`. Nil: no learned-phrase translator.
     public var luaFile: URL?
+    /// The standard OpenCC data (`s2t.json`, `STCharacters.ocd2`, …), exported as
+    /// `OPENCC_DATA_DIR` before librime initializes and to the deployer, so a schema set whose
+    /// `opencc/` lacks a standard config still converts. librime's `Simplifier` first tries
+    /// `<user_data_dir>/opencc/` and `<shared_data_dir>/opencc/`, so a pack's own files win;
+    /// OpenCC consults `OPENCC_DATA_DIR` last, for the config file only (its dictionaries
+    /// resolve beside the config). Nil: `bundledOpenCCDataDir()`, without overriding an
+    /// `OPENCC_DATA_DIR` the process already has. Ignored unless a real directory.
+    public var openccDataDir: URL?
+
+    /// `<bundle resources>/opencc` (`NoemaIME.app/Contents/Resources/opencc`) when it is a
+    /// real directory, else nil.
+    public static func bundledOpenCCDataDir(bundle: Bundle = .main) -> URL? {
+        guard let resources = bundle.resourceURL else { return nil }
+        let directory = resources.appending(path: "opencc", directoryHint: .isDirectory)
+        return FileSafety.isRealDirectory(directory) ? directory : nil
+    }
+
+    /// The OpenCC directory to export and whether it overrides an inherited `OPENCC_DATA_DIR`:
+    /// an explicit real `openccDataDir` does, the bundled fallback does not.
+    var effectiveOpenCCDataDir: (url: URL, overriding: Bool)? {
+        if let openccDataDir, FileSafety.isRealDirectory(openccDataDir) { return (openccDataDir, true) }
+        return Self.bundledOpenCCDataDir().map { ($0, false) }
+    }
+
+    /// Exports `effectiveOpenCCDataDir` as `OPENCC_DATA_DIR` in this process, calling
+    /// `setenv` only when the value changes.
+    func exportOpenCCDataDir() {
+        guard let (url, overriding) = effectiveOpenCCDataDir else { return }
+        let current = getenv(Self.openccDataDirVariable).map { String(cString: $0) }
+        guard current != url.path, overriding || current == nil else { return }
+        setenv(Self.openccDataDirVariable, url.path, 1)
+    }
+
+    public static let openccDataDirVariable = "OPENCC_DATA_DIR"
 
     /// librime's `user_data_dir`: `<userDataDir>/sets/<set>/` or `userDataDir`.
     public var rimeUserDataDir: URL {
@@ -55,8 +89,10 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
         deployerURL: URL? = nil,
         deployTimeout: Duration = .seconds(60),
         schemaSetID: SchemaSetID? = nil,
-        luaFile: URL? = nil
+        luaFile: URL? = nil,
+        openccDataDir: URL? = nil
     ) {
+        self.openccDataDir = openccDataDir
         self.sharedDataDir = sharedDataDir
         self.userDataDir = userDataDir
         self.logDir = logDir
@@ -102,7 +138,18 @@ public final class RimeEngine: TypingEngine {
     /// for `cachedSchemaID`. Recomputed when a session opens and whenever `refreshState`
     /// sees another schema (librime's own schema switcher); false until then (fail-closed).
     public private(set) var currentSchemaIsMandarinPinyin = false
+    /// The live schema's reverse-lookup and recognizer rules (`secondaryInputRules(schemaID:)`),
+    /// cached with `currentSchemaIsMandarinPinyin`; empty for a schema that is not pinyin.
+    private(set) var currentSecondaryInputRules = SecondaryInputRules()
     private var cachedSchemaID: String?
+
+    /// Whether `rawInput` went to the live schema's primary Mandarin pinyin translator, so its
+    /// commit may be learned: the schema spells Mandarin pinyin, and the input neither starts
+    /// with a reverse-lookup or other secondary translator's prefix (薄荷's `Uw` for Wubi 98)
+    /// nor ends in a `recognizer/patterns` match (`currentSecondaryInputRules`).
+    public func isPrimaryPinyinInput(_ rawInput: String) -> Bool {
+        currentSchemaIsMandarinPinyin && !currentSecondaryInputRules.claims(rawInput)
+    }
 
     /// Called on the main actor after every call that committed text containing a Han
     /// character, with the raw input and preedit captured before the call changed them.
@@ -363,6 +410,7 @@ public final class RimeEngine: TypingEngine {
     /// Safe Mode with the sentinel left armed.
     private func finishBoot(prepared: Bool) {
         guard prepared else { return enterSafeMode(.engineInitFailed) }
+        configuration.exportOpenCCDataDir()
         withTraits { traits in
             RimeProcessLifecycle.setupIfNeeded(owner: resources.owner, api: api, traits: &traits)
             api.pointee.initialize(&traits)
@@ -399,6 +447,8 @@ public final class RimeEngine: TypingEngine {
         guard force || schemaID != cachedSchemaID else { return }
         cachedSchemaID = schemaID
         currentSchemaIsMandarinPinyin = schemaID.map { isMandarinPinyinSchema(schemaID: $0) } ?? false
+        currentSecondaryInputRules = currentSchemaIsMandarinPinyin
+            ? schemaID.map { secondaryInputRules(schemaID: $0) } ?? SecondaryInputRules() : SecondaryInputRules()
     }
 
     /// Recreates the session if librime dropped it (e.g. stale-session cleanup).
@@ -508,7 +558,7 @@ public final class RimeEngine: TypingEngine {
         else { return }
         observer(CommitObservation(
             rawInput: before.rawInput, preedit: before.preedit, committedText: committed, schemaID: currentState.schemaID,
-            isMandarinPinyinSchema: currentSchemaIsMandarinPinyin))
+            isMandarinPinyinSchema: isPrimaryPinyinInput(before.rawInput)))
     }
 
     private func drainCommit() -> String? {

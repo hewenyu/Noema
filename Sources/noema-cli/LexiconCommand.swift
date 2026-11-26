@@ -228,7 +228,7 @@ enum LexiconCommand {
         let configuration = RimeEngineConfiguration(
             sharedDataDir: builtin, userDataDir: options.root, logDir: options.logDir,
             schemaID: SchemaSetID.builtin.defaultSchemaID, deployerURL: options.deployer, schemaSetID: .builtin,
-            luaFile: options.luaFile)
+            luaFile: options.luaFile, openccDataDir: NoemaPaths.resolveOpenCCDataDir(bundle: .main))
         let engine: RimeEngine
         do {
             engine = try await RimeEngine.start(configuration: configuration)

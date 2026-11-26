@@ -8,7 +8,8 @@ extension RimeEngineConfiguration {
     /// else the built-in set. Every set, the built-in one included, runs in its own
     /// `<root>/sets/<set>/` with `luaFile` as its learned-phrase translator.
     public static func activeSchemaSet(
-        root: URL, builtinSharedDataDir: URL, logDir: URL, luaFile: URL?, deployerURL: URL? = nil
+        root: URL, builtinSharedDataDir: URL, logDir: URL, luaFile: URL?, deployerURL: URL? = nil,
+        openccDataDir: URL? = nil
     ) -> RimeEngineConfiguration {
         var set = SchemaSetID.builtin
         var schemaID = SchemaSetID.builtin.defaultSchemaID
@@ -22,7 +23,7 @@ extension RimeEngineConfiguration {
         }
         return RimeEngineConfiguration(
             sharedDataDir: shared, userDataDir: root, logDir: logDir, schemaID: schemaID, deployerURL: deployerURL,
-            schemaSetID: set, luaFile: luaFile)
+            schemaSetID: set, luaFile: luaFile, openccDataDir: openccDataDir)
     }
 }
 
