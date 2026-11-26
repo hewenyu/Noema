@@ -36,7 +36,11 @@ extension RimeEngine {
         guard let inputs = try? DeployManifest.inputs(
             sharedDataDir: configuration.sharedDataDir, userDataDir: user, luaFile: configuration.luaFile)
         else { return false }
-        if configuration.deployPolicy == .deployIfNeeded, let manifest, manifest.inputs == inputs { return true }
+        // A build from a deployer that staged fewer patches (before v-mode) is redeployed.
+        if configuration.deployPolicy == .deployIfNeeded, let manifest, manifest.inputs == inputs,
+           manifest.carriesRequiredSchemaPatches {
+            return true
+        }
         guard !cancellation.isCancelled else { return false }
         return deployIsolated(configuration, expecting: inputs, into: build, cancellation: cancellation)
     }
@@ -96,7 +100,7 @@ extension RimeEngine {
         guard runDeployer(configuration, deployer, staging: staging, cancellation: cancellation) else { return false }
         let staged = staging.appending(path: "build")
         guard let manifest = DeployManifest.validated(buildDir: staged, schemaID: configuration.schemaID),
-              manifest.inputs == inputs,
+              manifest.inputs == inputs, manifest.carriesRequiredSchemaPatches,
               // Past this check the switch runs to completion: it is two renames.
               !cancellation.isCancelled
         else { return false }

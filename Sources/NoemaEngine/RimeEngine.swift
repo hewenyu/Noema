@@ -336,6 +336,25 @@ public final class RimeEngine: TypingEngine {
         return refreshState()
     }
 
+    /// Session options the shell set with `setOption(_:enabled:)`. librime resets options when
+    /// a session opens or a schema loads (`switches/reset`), so every new session gets them
+    /// again (`noteOpenedSession`).
+    public private(set) var optionOverrides: [String: Bool] = [:]
+
+    /// Sets librime session option `name` (`emoji_suggestion`, …) now and on every later
+    /// session. An option the schema does not declare is stored and set, and changes nothing.
+    public func setOption(_ name: String, enabled: Bool) {
+        optionOverrides[name] = enabled
+        guard isServing, resources.session != 0 else { return }
+        api.pointee.set_option(resources.session, name, enabled ? 1 : 0)
+    }
+
+    /// librime's current value of session option `name`; nil without a live session.
+    public func option(_ name: String) -> Bool? {
+        guard isServing, resources.session != 0 else { return nil }
+        return api.pointee.get_option(resources.session, name) != 0
+    }
+
     public func commitComposition() -> KeyHandlingResult {
         if let degraded = degradedResult() { return degraded }
         guard currentState.isComposing else { return KeyHandlingResult(handled: false, state: currentState) }
@@ -518,12 +537,17 @@ public final class RimeEngine: TypingEngine {
         return opening.opened
     }
 
-    /// Caches the classification of a newly opened session's schema: a new session may run
-    /// another set's build under the same schema ID, so it is always re-classified.
+    /// Caches the classification of a newly opened session's schema (a new session may run
+    /// another set's build under the same schema ID, so it is always re-classified) and
+    /// re-applies `optionOverrides` to it.
     func noteOpenedSession(_ opening: RimeLibrary.SessionOpening) {
         cachedSchemaID = opening.schemaID
         currentSchemaIsMandarinPinyin = opening.isMandarinPinyin
         currentSecondaryInputRules = opening.secondaryInputRules
+        guard opening.opened, isServing, resources.session != 0 else { return }
+        for (name, enabled) in optionOverrides.sorted(by: { $0.key < $1.key }) {
+            api.pointee.set_option(resources.session, name, enabled ? 1 : 0)
+        }
     }
 
     /// Re-classifies the live schema when it is not `cachedSchemaID`.
@@ -531,6 +555,10 @@ public final class RimeEngine: TypingEngine {
         guard schemaID != cachedSchemaID else { return }
         cachedSchemaID = schemaID
         (currentSchemaIsMandarinPinyin, currentSecondaryInputRules) = library.classify(schemaID)
+        // librime's own schema switcher reset the options with the schema.
+        for (name, enabled) in optionOverrides.sorted(by: { $0.key < $1.key }) where resources.session != 0 {
+            api.pointee.set_option(resources.session, name, enabled ? 1 : 0)
+        }
     }
 
     /// Recreates the session if librime dropped it (e.g. stale-session cleanup).

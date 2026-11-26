@@ -15,6 +15,11 @@ switches:
     states: [ 中文, 西文 ]
   - name: full_shape
     states: [ 半角, 全角 ]
+  # Emoji after matching words (`opencc/noema_emoji.txt`); NoemaIME turns it off from
+  # Settings with `RimeEngine.setOption("emoji_suggestion", enabled: false)`.
+  - name: emoji_suggestion
+    reset: 1
+    states: [ "🈚️", "😄" ]
 
 engine:
   processors:
@@ -35,9 +40,10 @@ engine:
   translators:
     - punct_translator
     - script_translator
-  # One candidate per text: the userdb and `lua_translator@*noema_learned` may both
-  # offer a learned phrase.
+  # Emoji suggestions follow the word they decorate; then one candidate per
+  # text: the userdb and `lua_translator@*noema_learned` may both offer a learned phrase.
   filters:
+    - simplifier@emoji_suggestion
     - uniquifier
 
 speller:
@@ -51,6 +57,12 @@ translator:
   spelling_hints: 0
   preedit_format:
     - xform/([nl])v/$1ü/
+
+# The word stays first; its emoji follow (`你好` then `👋`), without comments.
+emoji_suggestion:
+  opencc_config: noema_emoji.json
+  option_name: emoji_suggestion
+  tips: none
 
 key_binder:
   import_preset: default

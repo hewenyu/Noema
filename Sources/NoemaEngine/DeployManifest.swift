@@ -21,6 +21,9 @@ import Foundation
 ///   A manifest without it (written before it existed) requires `<dict>.prism.bin` for every
 ///   required dictionary, exactly as before.
 /// - `schemaSetID` (optional, appended to version 1): the schema set the build belongs to.
+/// - `schemaPatches` (optional, appended to version 1): the IDs of the patches the deployer
+///   staged (`SchemaPatch.requiredPatchIDs`). `RimeEngine` redeploys a build that lacks one
+///   even when its inputs are unchanged, so a build from an older deployer never survives.
 public struct DeployManifest: Codable, Equatable, Sendable {
     public struct ManifestEntry: Codable, Hashable, Sendable {
         /// `/`-separated, relative, without `.` or `..` components.
@@ -47,6 +50,8 @@ public struct DeployManifest: Codable, Equatable, Sendable {
     /// Nil in manifests written before prisms were recorded separately; see `effectivePrisms`.
     public var requiredPrisms: [String]?
     public var schemaSetID: String?
+    /// Nil in manifests written before staged patches were recorded.
+    public var schemaPatches: [String]?
 
     public init(
         version: Int = DeployManifest.currentVersion,
@@ -55,7 +60,8 @@ public struct DeployManifest: Codable, Equatable, Sendable {
         outputs: [ManifestEntry],
         requiredDictionaries: [String],
         requiredPrisms: [String]? = nil,
-        schemaSetID: String? = nil
+        schemaSetID: String? = nil,
+        schemaPatches: [String]? = nil
     ) {
         self.version = version
         self.schemaID = schemaID
@@ -64,6 +70,7 @@ public struct DeployManifest: Codable, Equatable, Sendable {
         self.requiredDictionaries = requiredDictionaries
         self.requiredPrisms = requiredPrisms
         self.schemaSetID = schemaSetID
+        self.schemaPatches = schemaPatches
     }
 
     /// The prisms a build must contain: `requiredPrisms`, or `requiredDictionaries` for a
