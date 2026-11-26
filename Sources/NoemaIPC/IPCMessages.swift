@@ -68,11 +68,25 @@ public struct AgentHelloAck: Codable, Sendable, Hashable {
     public var agentVersion: String
     public var sessionEpoch: UUID
     public var settings: AgentSettingsSnapshot
+    /// The agent's monotonic settings revision of `settings` (appended to v1; absent
+    /// decodes as 0). A later `settingsSnapshot` below it is ignored.
+    public var settingsRevision: UInt64
 
-    public init(agentVersion: String, sessionEpoch: UUID, settings: AgentSettingsSnapshot) {
+    public init(agentVersion: String, sessionEpoch: UUID, settings: AgentSettingsSnapshot, settingsRevision: UInt64 = 0) {
         self.agentVersion = agentVersion
         self.sessionEpoch = sessionEpoch
         self.settings = settings
+        self.settingsRevision = settingsRevision
+    }
+
+    private enum CodingKeys: String, CodingKey { case agentVersion, sessionEpoch, settings, settingsRevision }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        agentVersion = try container.decode(String.self, forKey: .agentVersion)
+        sessionEpoch = try container.decode(UUID.self, forKey: .sessionEpoch)
+        settings = try container.decode(AgentSettingsSnapshot.self, forKey: .settings)
+        settingsRevision = try container.decodeIfPresent(UInt64.self, forKey: .settingsRevision) ?? 0
     }
 }
 
@@ -161,7 +175,9 @@ public enum IMEToAgent: IPCMessage {
 public enum AgentToIME: IPCMessage {
     case helloAck(AgentHelloAck)
     case heartbeatAck(sessionEpoch: UUID)
-    case settingsSnapshot(sessionEpoch: UUID, settings: AgentSettingsSnapshot)
+    /// `revision` is the agent's monotonic settings revision (appended to v1; absent
+    /// decodes as 0).
+    case settingsSnapshot(sessionEpoch: UUID, settings: AgentSettingsSnapshot, revision: UInt64 = 0)
     case aiSuggestion(AISuggestionMessage)
 
     public static let helloAckKind = "agent.helloAck"
@@ -182,12 +198,12 @@ public enum AgentToIME: IPCMessage {
         switch self {
         case .helloAck(let ack): ack.sessionEpoch
         case .heartbeatAck(let epoch): epoch
-        case .settingsSnapshot(let epoch, _): epoch
+        case .settingsSnapshot(let epoch, _, _): epoch
         case .aiSuggestion(let suggestion): suggestion.sessionEpoch
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case kind, ack, sessionEpoch, settings, suggestion }
+    private enum CodingKeys: String, CodingKey { case kind, ack, sessionEpoch, settings, settingsRevision, suggestion }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -197,7 +213,8 @@ public enum AgentToIME: IPCMessage {
         case Self.settingsSnapshotKind:
             self = .settingsSnapshot(
                 sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
-                settings: try container.decode(AgentSettingsSnapshot.self, forKey: .settings))
+                settings: try container.decode(AgentSettingsSnapshot.self, forKey: .settings),
+                revision: try container.decodeIfPresent(UInt64.self, forKey: .settingsRevision) ?? 0)
         case Self.aiSuggestionKind: self = .aiSuggestion(try container.decode(AISuggestionMessage.self, forKey: .suggestion))
         default:
             throw IPCError.malformedFrame
@@ -210,9 +227,10 @@ public enum AgentToIME: IPCMessage {
         switch self {
         case .helloAck(let ack): try container.encode(ack, forKey: .ack)
         case .heartbeatAck(let epoch): try container.encode(epoch, forKey: .sessionEpoch)
-        case .settingsSnapshot(let epoch, let settings):
+        case .settingsSnapshot(let epoch, let settings, let revision):
             try container.encode(epoch, forKey: .sessionEpoch)
             try container.encode(settings, forKey: .settings)
+            try container.encode(revision, forKey: .settingsRevision)
         case .aiSuggestion(let suggestion): try container.encode(suggestion, forKey: .suggestion)
         }
     }

@@ -2,13 +2,14 @@
 # Verify assembled Noema bundles.
 #
 #   NoemaIME.app: layout, IMKit Info.plist keys, Mach-O linkage of MacOS/NoemaIME,
-#     MacOS/noema-rime-deployer, and Frameworks/librime.1.dylib, code signatures and empty
-#     signed entitlements, and real launches that report the packaged version, load
+#     MacOS/noema-rime-deployer, and Frameworks/librime.1.dylib, code signatures (signing
+#     Identifier dev.noema.inputmethod.NoemaIME) and empty signed entitlements, and real launches that report the packaged version, load
 #     librime, and start the deployer.
 #   Noema.app (the companion agent): layout, Info.plist (LSUIElement, identifiers, no usage
 #     descriptions), Contents/Library/LaunchAgents/dev.noema.agent.plist (BundleProgram,
 #     MachServices), arm64-only MacOS/NoemaAgent with system-only linkage, no librime, and
-#     zero LC_RPATH, signatures and empty signed entitlements, and real `--version` and
+#     zero LC_RPATH, signatures (signing Identifier dev.noema.agent) and empty signed
+#     entitlements, and real `--version` and
 #     `--bogus` (exit 2) launches.
 #
 # Usage: scripts/build/verify-bundle.sh [--require-signed] [path]
@@ -63,6 +64,18 @@ check_no_homebrew() {
   local hits
   hits="$(grep -rlF /opt/homebrew "$1" 2>/dev/null || true)"
   [[ -z "${hits}" ]] || bad "bundle contains /opt/homebrew strings in: ${hits//$'\n'/, }"
+}
+
+# check_identifier <expected> <signed part>...: each part's signing identifier is exactly
+# <expected>, the identifier the peer's IPC policy pins (PeerIdentityPolicy).
+check_identifier() {
+  local expected="$1"; shift
+  local target identifier
+  for target in "$@"; do
+    identifier="$(codesign -dvv "${target}" 2>&1 | sed -n 's/^Identifier=//p' || true)"
+    [[ "${identifier}" == "${expected}" ]] \
+      || bad "${target##*/}: signing Identifier is '${identifier:-missing}', expected '${expected}' (IPC peer pinning)"
+  done
 }
 
 # check_signatures <app> <signed part>...: each part verifies strictly, and its signature
@@ -255,6 +268,7 @@ PY
 
   # 5. Signatures (inside-out; the bundle check is --deep only for verification)
   check_signatures "${APP}" "${APP}" "${EXE}" "${DEPLOYER}" "${DYLIB}"
+  check_identifier dev.noema.inputmethod.NoemaIME "${APP}" "${EXE}"
   check_entitlements "${APP}" "${APP}" "${EXE}" "${DEPLOYER}"
 
   # 6. Real launch: --version must report the packaged version, dyld must resolve the
@@ -374,6 +388,7 @@ PY
 
   # 5. Signatures
   check_signatures "${APP}" "${APP}" "${EXE}"
+  check_identifier dev.noema.agent "${APP}" "${EXE}"
   check_entitlements "${APP}" "${APP}" "${EXE}"
 
   # 6. Real launch: --version is answered before AppKit; an unknown option exits 2.

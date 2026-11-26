@@ -223,6 +223,91 @@ final class XPCRig {
         // Reaching here means no session trapped on release.
     }
 
+    /// An unpinned strict policy (what a process without a valid self signature resolves
+    /// to) never creates a listener: the agent reports `.failed`, never `.listening`.
+    @Test func unpinnedStrictPolicyRefusesToStartTheServer() throws {
+        let identifier = try #require(SelfCodeIdentity.current()?.signingIdentifier)
+        let unpinned = PeerIdentityPolicy.resolved(
+            requested: .allowAdHocForTesting(signingIdentifiers: [identifier]), selfIdentity: nil)
+        #expect(unpinned.isUnpinnedStrict)
+        let server = XPCListenerServerTransport(mode: .anonymous, policy: unpinned)
+        #expect(throws: XPCListenerServerTransport.StartError.unpinnedStrictPolicy) {
+            try server.start(IPCServerHandlers(onFrame: { frame, _, _ in frame }))
+        }
+        #expect(server.endpoint == nil)
+        let mach = XPCListenerServerTransport(machService: "dev.noema.tests.unpinned.\(UUID().uuidString)", policy: unpinned)
+        let agent = AgentServiceCoordinator(transport: mach, agentVersion: "1.0.0-test")
+        guard case .failed = agent.start() else {
+            Issue.record("expected .failed, got \(agent.snapshot.listenerState)")
+            return
+        }
+    }
+
+    /// An unpinned strict client opens no session: not one frame (no `ime.hello`) reaches
+    /// a listening agent, and the manager degrades as `peerRejected`.
+    @Test func unpinnedStrictPolicyRefusesToOpenAClientSession() throws {
+        let identifier = try #require(SelfCodeIdentity.current()?.signingIdentifier)
+        let unpinned = PeerIdentityPolicy.resolved(
+            requested: .allowAdHocForTesting(signingIdentifiers: [identifier]), selfIdentity: nil)
+        let events = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let server = XPCListenerServerTransport(mode: .anonymous, policy: try .selfTest())
+        try server.start(IPCServerHandlers(
+            onFrame: { frame, _, _ in events.withLock { $0.append("frame") }; return frame },
+            onEvent: { event in events.withLock { $0.append("\(event)") } }))
+        defer { server.stop() }
+        let endpoint = try #require(server.endpoint)
+        let queue = DispatchQueue(label: "dev.noema.tests.unpinned-client")
+        let client = XPCClientTransport(policy: unpinned, queue: queue) { .endpoint(endpoint) }
+        #expect(throws: IPCError.peerRejected(PeerVerificationError.unpinnedStrictPolicy.description)) {
+            try client.connect(attemptID: 1) { _, _ in }
+        }
+        #expect(throws: IPCError.connectionUnavailable(.agentUnavailable)) { try client.send(Data("{}".utf8), expectingReply: false) }
+
+        let manager = IPCConnectionManager(
+            transport: client, client: .init(bundleID: "dev.noema.tests.ime", version: "1.0.0"),
+            policy: .init(baseDelay: .seconds(5), circuitBreakerThreshold: 3), readyNotificationName: nil, queue: queue)
+        let recorder = StateRecorder()
+        recorder.attach(to: manager)
+        defer { manager.stop() }
+        manager.start()
+        #expect(waitUntil { recorder.shape.contains("degraded(peerRejected)") }, "\(recorder.shape)")
+        usleep(200_000)
+        #expect(events.withLock { $0 }.isEmpty, "the agent saw \(events.withLock { $0 })")
+        #expect(manager.statistics.framesSent == 0)
+    }
+
+    /// `stop()` racing incoming sessions: once it returns, no peer is tracked and no
+    /// `peerConnected` is reported, however many clients were mid-accept.
+    @Test func stopRacingIncomingSessionsLeavesNoPeer() throws {
+        let policy = try PeerIdentityPolicy.selfTest()
+        for round in 0..<10 {
+            let afterStop = OSAllocatedUnfairLock(initialState: (stopped: false, lateConnects: 0))
+            let server = XPCListenerServerTransport(mode: .anonymous, policy: policy)
+            try server.start(IPCServerHandlers(
+                onFrame: { frame, _, _ in frame },
+                onEvent: { event in
+                    if case .peerConnected = event { afterStop.withLock { if $0.stopped { $0.lateConnects += 1 } } }
+                }))
+            let endpoint = try #require(server.endpoint)
+            let queue = DispatchQueue(label: "dev.noema.tests.race.\(round)")
+            let frame = try XPCFraming.message(carrying: Data("{}".utf8))
+            let clients = try (0..<8).map { _ in
+                let session = try ManagedXPCSession(
+                    activating: try XPCSession(endpoint: endpoint, targetQueue: queue, options: .inactive), requirement: nil)
+                try? session.send(frame)
+                return session
+            }
+            usleep(UInt32(round % 3) * 1_000)
+            server.stop()
+            afterStop.withLock { $0.stopped = true }
+            #expect(server.connectedPeers.isEmpty, "round \(round)")
+            usleep(50_000)
+            #expect(server.connectedPeers.isEmpty && afterStop.withLock { $0.lateConnects } == 0, "round \(round)")
+            clients.forEach { $0.cancel(reason: "done") }
+            queue.sync {}
+        }
+    }
+
     /// A Mach service this process was not launched for cannot be checked in: EPERM.
     @Test func machServiceCheckInOutsideLaunchdIsStandby() throws {
         let server = XPCListenerServerTransport(machService: "dev.noema.tests.checkin.\(UUID().uuidString)", policy: try .selfTest())

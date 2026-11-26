@@ -5,8 +5,9 @@
 // 2 at once. Anything else starts the agent: check in to the launchd Mach service
 // `NoemaPaths.agentMachServiceName`, post `NoemaPaths.agentReadyNotificationName`, and own
 // the status item and the Settings window. A direct launch (not by launchd) cannot check
-// in: it hands over to an already running instance, or stays up in standby so Settings
-// can register the LaunchAgent.
+// in: it hands over to an already running instance (LaunchServices reopens it, so its
+// Settings window shows), or stays up in standby so Settings can register the LaunchAgent,
+// and quits once the launchd-managed instance posts the ready notification.
 import AppKit
 import Dispatch
 import Foundation
@@ -44,6 +45,8 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var statusMenuItem: NSMenuItem?
     private var settingsWindow: NSWindow?
+    /// Standby only: the ready-notification registration that ends this instance.
+    private var standbyReadyToken: Int32 = NOTIFY_TOKEN_INVALID
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ad-hoc development builds accept the ad-hoc IME by signing identifier; a
@@ -76,11 +79,12 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
         case .standbyNotLaunchdManaged:
             if let other = otherRunningInstance() {
                 log.info("another NoemaAgent (pid \(other.processIdentifier, privacy: .public)) is running; handing over")
-                other.activate()
                 coordinator.stop()
+                handOver(to: other)
                 exit(0)
             }
             log.info("not launched by launchd; standing by so Settings can register the LaunchAgent")
+            exitWhenManagedInstanceIsReady()
             installStatusItem()
             showSettings(section: .general)
         case .failed(let reason):
@@ -97,7 +101,48 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        cancelStandbyReadyObserver()
         coordinator?.stop()
+    }
+
+    /// Asks LaunchServices to reopen the running instance, which delivers
+    /// `applicationShouldHandleReopen` there (its Settings window opens), and waits up to
+    /// 1 s so the request is out before this duplicate exits.
+    private func handOver(to other: NSRunningApplication) {
+        let done = DispatchSemaphore(value: 0)
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: other.bundleURL ?? Bundle.main.bundleURL, configuration: configuration) { _, error in
+            if let error { NoemaLog.agent("lifecycle").error("reopen failed: \(error.localizedDescription, privacy: .public)") }
+            done.signal()
+        }
+        if done.wait(timeout: .now() + 1) == .timedOut { log.info("reopen still pending after 1 s") }
+        other.activate()
+    }
+
+    /// Standby: once the launchd-managed instance checks in and posts
+    /// `NoemaPaths.agentReadyNotificationName`, quit, so only one status item remains.
+    private func exitWhenManagedInstanceIsReady() {
+        guard standbyReadyToken == NOTIFY_TOKEN_INVALID else { return }
+        var token: Int32 = NOTIFY_TOKEN_INVALID
+        let status = notify_register_dispatch(NoemaPaths.agentReadyNotificationName, &token, .main) { _ in
+            MainActor.assumeIsolated {
+                NoemaLog.agent("lifecycle").info("the launchd-managed NoemaAgent is ready; leaving standby")
+                AgentAppDelegate.current?.cancelStandbyReadyObserver()
+                NSApp.terminate(nil)
+            }
+        }
+        if status == UInt32(NOTIFY_STATUS_OK) {
+            standbyReadyToken = token
+        } else {
+            log.error("notify_register_dispatch failed: \(status, privacy: .public)")
+        }
+    }
+
+    func cancelStandbyReadyObserver() {
+        guard standbyReadyToken != NOTIFY_TOKEN_INVALID else { return }
+        notify_cancel(standbyReadyToken)
+        standbyReadyToken = NOTIFY_TOKEN_INVALID
     }
 
     private func otherRunningInstance() -> NSRunningApplication? {

@@ -68,12 +68,12 @@ IMKit creates one `NoemaInputController` per client session; it forwards every c
 
 ## Companion agent and IPC
 
-`Noema.app` is an `LSUIElement` menu bar app registered with `SMAppService.agent` from its embedded `Contents/Library/LaunchAgents/dev.noema.agent.plist`, which vends the Mach service `dev.noema.agent.ipc`. Its menu opens one reused settings window (基础设置, 快速操作, 其他). Outside launchd the listener check-in fails with `EPERM`: the agent stays in standby, or hands off to a running instance and exits.
+`Noema.app` is an `LSUIElement` menu bar app registered with `SMAppService.agent` from its embedded `Contents/Library/LaunchAgents/dev.noema.agent.plist`, which vends the Mach service `dev.noema.agent.ipc`. Its menu opens one reused settings window (基础设置, 快速操作, 其他). Outside launchd the listener check-in fails with `EPERM`: the agent hands off to a running instance (LaunchServices reopens it) and exits, or stays in standby until the launchd-managed instance posts `dev.noema.agent.ready`.
 
 `NoemaIPC` carries JSON `IPCEnvelope`s (protocol version, kind, sequence, optional `generationID`, at most 256 KiB) under key `e` of an XPC dictionary:
 
-- **Peer identity** — both sides set an `XPCPeerRequirement` and re-check every message's audit token with `PeerIdentityVerifier`. A certificate-signed binary always pins its own team and leaf certificate; ad-hoc peers pass only in ad-hoc builds.
-- **Connection** — `IPCConnectionManager` handshakes within 500 ms, heartbeats, and on failure degrades, backs off exponentially with jitter, and opens a circuit breaker; the agent's `dev.noema.agent.ready` notification retries at once. Each attempt has an `attemptID`, so late callbacks are ignored.
+- **Peer identity** — both sides set an `XPCPeerRequirement` and re-check every message's audit token with `PeerIdentityVerifier`. A certificate-signed binary always pins its own team and leaf certificate; ad-hoc peers pass only when the binary itself has a valid ad-hoc signature. Without a valid self signature the policy is unpinned strict: no session or listener is opened.
+- **Connection** — `IPCConnectionManager` handshakes within 500 ms, heartbeats, and on failure degrades, backs off exponentially with jitter, and opens a circuit breaker; the agent's `dev.noema.agent.ready` notification retries at once, at most once per open circuit. `helloAck` counts only while connecting, `heartbeatAck` only while healthy, and settings never move to an older `settingsRevision`. Each attempt has an `attemptID`, so late callbacks are ignored.
 - **Hot path** — the IME only sends fire-and-forget metadata (composition updates coalesce in a bounded outbox) and drops it while unhealthy; `CompositionIPCReporter` sends nothing under secure input. `GenerationGate` drops agent messages from another session epoch or an older generation.
 
 Rationale: [XPC IPC note](../.agents/notes/implemented/architecture/2026-11-25-xpc-ipc-and-companion-agent.md).

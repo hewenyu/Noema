@@ -32,6 +32,9 @@ import Testing
             }
         }
         #expect(agent.snapshot.connectedPeers == 1)
+        // Two settings changes before any hello: nothing is pushed, the revision is 2.
+        agent.updateSettings(AgentSettingsSnapshot(panelBackdropPreference: "visualEffect"))
+        agent.updateSettings(.defaults)
         let epoch = UUID()
         func send(_ message: IMEToAgent, _ generation: UInt64?) throws {
             try client.send(IPCWireCodec.encode(IPCEnvelope(sequence: 1, message: message, generationID: generation)), expectingReply: true)
@@ -47,6 +50,11 @@ import Testing
         #expect(received.map(\.kind) == [AgentToIME.helloAckKind, AgentToIME.heartbeatAckKind])
         #expect(received.map(\.generationID) == [1, 7], "replies echo the request generation")
         #expect(received.allSatisfy { $0.payload.sessionEpoch == epoch })
+        if case .helloAck(let ack) = received.first?.payload {
+            #expect(ack.settingsRevision == 2, "helloAck carries the agent's settings revision")
+        } else {
+            Issue.record("expected helloAck first")
+        }
         let snapshot = agent.snapshot
         #expect(snapshot.lastComposition?.generationID == 5 && snapshot.staleCompositionDrops == 1)
         #expect(snapshot.lastHello?.engineMode == "rime" && snapshot.framesHandled == 7)

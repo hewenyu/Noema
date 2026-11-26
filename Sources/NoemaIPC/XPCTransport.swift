@@ -150,6 +150,11 @@ public final class XPCClientTransport: IPCClientTransport, @unchecked Sendable {
 
     public func connect(attemptID: UInt64, events: @escaping IPCClientEventHandler) throws(IPCError) {
         disconnect(reason: "reconnect")
+        // Fail closed before any session exists: no `ime.hello` leaves this process under
+        // a policy that would reject every peer anyway.
+        guard !policy.isUnpinnedStrict else {
+            throw .peerRejected(PeerVerificationError.unpinnedStrictPolicy.description)
+        }
         guard let target = target() else { throw .connectionUnavailable(.agentUnavailable) }
         guard let requirement = policy.xpcPeerRequirement else {
             throw .peerRejected(PeerVerificationError.noExpectedSigningIdentifiers.description)
@@ -254,6 +259,8 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
         /// was not started by launchd for that service.
         case checkInFailed(description: String, permissionDenied: Bool)
         case noExpectedSigningIdentifiers
+        /// `.strict` without a Team ID or certificate pin: no listener is created.
+        case unpinnedStrictPolicy
         case alreadyStarted
     }
 
@@ -267,6 +274,7 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
     public let mode: Mode
     public let policy: PeerIdentityPolicy
     private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let log = NoemaLog.ipc("xpc-server")
 
@@ -274,6 +282,7 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
         self.mode = mode
         self.policy = policy
         self.queue = queue
+        queue.setSpecific(key: queueKey, value: 1)
     }
 
     public convenience init(machService: String, policy: PeerIdentityPolicy, queue: DispatchQueue = DispatchQueue(label: "dev.noema.ipc.server")) {
@@ -289,10 +298,13 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
     public var connectedPeers: [IPCPeerID] { state.withLock { $0.peers.keys.sorted() } }
 
     public func start(_ handlers: IPCServerHandlers) throws {
+        // Fail closed before the listener exists: no check-in, so the agent never reports
+        // `.listening` or posts the ready notification under such a policy.
+        guard !policy.isUnpinnedStrict else { throw StartError.unpinnedStrictPolicy }
         guard let requirement = policy.xpcPeerRequirement else { throw StartError.noExpectedSigningIdentifiers }
         guard state.withLock({ $0.listener == nil }) else { throw StartError.alreadyStarted }
         let accept: @Sendable (XPCListener.IncomingSessionRequest) -> XPCListener.IncomingSessionRequest.Decision = { [weak self] request in
-            guard let self else { return request.reject(reason: "server stopped") }
+            guard let self, self.state.withLock({ $0.listener != nil }) else { return request.reject(reason: "server stopped") }
             return request.accept { session in self.adopt(session, requirement: requirement) }
         }
         let listener: XPCListener
@@ -326,12 +338,22 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
         try session.send(try XPCFraming.message(carrying: frame))
     }
 
+    /// Cancels the listener, waits for any `accept`/`adopt` already running on `queue`
+    /// (a session adopted after the listener is gone is cancelled, never tracked), then
+    /// cancels every tracked peer session. So no active peer session outlives `stop()`,
+    /// and each peer's `peerConnected` precedes its `peerDisconnected`.
     public func stop() {
-        let (listener, peers, handlers) = state.withLock { state -> (XPCListener?, [IPCPeerID: ManagedXPCSession], IPCServerHandlers?) in
-            defer { state.listener = nil; state.peers = [:]; state.handlers = nil }
-            return (state.listener, state.peers, state.handlers)
+        let listener = state.withLock { state -> XPCListener? in
+            defer { state.listener = nil }
+            return state.listener
         }
         listener?.cancel()
+        // Barrier, skipped on `queue` itself, where no accept handler can be in flight.
+        if listener != nil, DispatchQueue.getSpecific(key: queueKey) == nil { queue.sync {} }
+        let (peers, handlers) = state.withLock { state -> ([IPCPeerID: ManagedXPCSession], IPCServerHandlers?) in
+            defer { state.peers = [:]; state.handlers = nil }
+            return (state.peers, state.handlers)
+        }
         for (peer, session) in peers.sorted(by: { $0.key < $1.key }) {
             session.cancel(reason: "server stopped")
             handlers?.onEvent(.peerDisconnected(peer))
@@ -356,11 +378,19 @@ public final class XPCListenerServerTransport: IPCServerTransport, @unchecked Se
         // Accepted sessions do not inherit the listener's requirement (<xpc/listener.h>).
         session.setPeerRequirement(requirement)
         let managed = ManagedXPCSession(acceptedSession: session)
-        let (peer, handlers) = state.withLock { state -> (IPCPeerID, IPCServerHandlers?) in
+        let adopted = state.withLock { state -> (IPCPeerID, IPCServerHandlers?)? in
             let peer = IPCPeerID(rawValue: state.nextPeer)
             state.nextPeer += 1
+            // `stop()` ran between accept and adopt: never track the session.
+            guard state.listener != nil else { return nil }
             state.peers[peer] = managed
             return (peer, state.handlers)
+        }
+        guard let (peer, handlers) = adopted else {
+            // libxpc activates the session once the accept handler returns; cancelling it
+            // before then would trap, so cancel right after, on the same queue.
+            queue.async { managed.cancel(reason: "server stopped") }
+            return PeerSessionHandler(transport: nil, peer: IPCPeerID(rawValue: 0))
         }
         handlers?.onEvent(.peerConnected(peer))
         return PeerSessionHandler(transport: self, peer: peer)

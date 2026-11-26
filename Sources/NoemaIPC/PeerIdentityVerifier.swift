@@ -20,8 +20,8 @@ public enum PeerIdentityMode: String, Sendable, Hashable {
     /// A certificate signature: never ad-hoc, pinned to a Team ID and/or leaf certificate.
     case strict
     /// Development and CI builds: an ad-hoc (or any valid) signature with an expected
-    /// signing identifier. Never honoured when the running binary is certificate-signed
-    /// (`PeerIdentityPolicy.resolved(requested:selfIdentity:)`).
+    /// signing identifier. Honoured only when the running binary has a valid ad-hoc
+    /// signature (`PeerIdentityPolicy.resolved(requested:selfIdentity:)`).
     case allowAdHocForTesting
 }
 
@@ -59,21 +59,30 @@ public struct PeerIdentityPolicy: Sendable, Hashable {
     }
 
     /// True for a `.strict` policy that pins neither a Team ID nor a certificate: it
-    /// rejects every peer (fail closed).
+    /// rejects every peer, and the XPC transports refuse to start under it (fail closed).
     public var isUnpinnedStrict: Bool {
         mode == .strict && expectedTeamID == nil && expectedLeafCertificateSHA1 == nil
     }
 
-    /// The policy a process actually enforces (anti-downgrade). A certificate-signed binary
-    /// (non-ad-hoc, with a Team ID or a certificate) never accepts ad-hoc peers: it ignores
-    /// `.allowAdHocForTesting` and an unpinned `.strict`, and enforces `.strict` pinned to
-    /// its own Team ID and leaf certificate, keeping `requested`'s signing identifiers and
-    /// requiring Hardened Runtime when it runs hardened itself. No Team ID is written in
-    /// source. An ad-hoc or unsigned binary gets `requested` unchanged; a pinned `.strict`
-    /// request is always kept.
+    /// The policy a process actually enforces (anti-downgrade, fail closed). A pinned
+    /// `.strict` request is always kept. Otherwise only a verified, valid ad-hoc self
+    /// signature honours `requested` (`.allowAdHocForTesting` or an unpinned `.strict`):
+    ///
+    /// - No valid self signature (`selfIdentity == nil`, e.g. `SecCodeCheckValidity`
+    ///   failing after the bundle was replaced or tampered with): an unpinned `.strict`,
+    ///   which rejects every peer and opens no XPC session or listener.
+    /// - Non-ad-hoc: `.strict` pinned to its own Team ID and leaf certificate, keeping
+    ///   `requested`'s signing identifiers and requiring Hardened Runtime when it runs
+    ///   hardened itself. Without a Team ID or leaf certificate that is an unpinned
+    ///   `.strict` too. No Team ID is written in source.
     public static func resolved(requested: PeerIdentityPolicy, selfIdentity: SelfCodeIdentity?) -> PeerIdentityPolicy {
         if requested.mode == .strict && !requested.isUnpinnedStrict { return requested }
-        guard let selfIdentity, selfIdentity.isCertificateSigned else { return requested }
+        guard let selfIdentity else {
+            return .strict(
+                signingIdentifiers: requested.expectedSigningIdentifiers, teamID: nil,
+                leafCertificateSHA1: nil, requireHardenedRuntime: true)
+        }
+        if selfIdentity.isAdHoc { return requested }
         return .strict(
             signingIdentifiers: requested.expectedSigningIdentifiers, teamID: selfIdentity.teamID,
             leafCertificateSHA1: selfIdentity.leafCertificateSHA1,
@@ -82,9 +91,10 @@ public struct PeerIdentityPolicy: Sendable, Hashable {
 
     /// The layer-1 requirement libxpc enforces before any message is delivered: the
     /// signing identifier, plus the Team ID when pinned. Layer 2 still runs on every
-    /// message. Nil when no identifier is expected (layer 2 rejects every message then).
+    /// message. Nil when no identifier is expected or the policy is an unpinned `.strict`:
+    /// the transports then refuse to open a session or listener at all (fail closed).
     public var xpcPeerRequirement: XPCPeerRequirement? {
-        guard !expectedSigningIdentifiers.isEmpty else { return nil }
+        guard !expectedSigningIdentifiers.isEmpty, !isUnpinnedStrict else { return nil }
         let requirement = xpc_dictionary_create_empty()
         let identifiers = expectedSigningIdentifiers.sorted()
         if identifiers.count == 1 {

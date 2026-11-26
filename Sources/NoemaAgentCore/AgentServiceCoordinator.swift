@@ -102,7 +102,8 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
         }
     }
 
-    /// Replaces the settings and pushes a `settingsSnapshot` to every peer that said hello.
+    /// Replaces the settings, bumps the monotonic settings revision, and pushes a
+    /// `settingsSnapshot` carrying it to every peer that said hello.
     public func updateSettings(_ settings: AgentSettingsSnapshot) {
         let pushes = update { state -> [(IPCPeerID, Data)] in
             state.snapshot.settings = settings
@@ -112,7 +113,7 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
                 guard let epoch = info.epoch else { return nil }
                 state.sequence += 1
                 let envelope = IPCEnvelope(
-                    sequence: state.sequence, message: AgentToIME.settingsSnapshot(sessionEpoch: epoch, settings: settings),
+                    sequence: state.sequence, message: AgentToIME.settingsSnapshot(sessionEpoch: epoch, settings: settings, revision: revision),
                     generationID: revision)
                 return (try? IPCWireCodec.encode(envelope)).map { (peer, $0) }
             }
@@ -159,7 +160,9 @@ public final class AgentServiceCoordinator: @unchecked Sendable {
                 info.epoch = hello.sessionEpoch
                 info.compositionWatermark = nil
                 state.snapshot.lastHello = hello
-                return .helloAck(AgentHelloAck(agentVersion: agentVersion, sessionEpoch: hello.sessionEpoch, settings: state.snapshot.settings))
+                return .helloAck(AgentHelloAck(
+                    agentVersion: agentVersion, sessionEpoch: hello.sessionEpoch, settings: state.snapshot.settings,
+                    settingsRevision: state.settingsRevision))
             case .heartbeat(let epoch):
                 guard epoch == info.epoch else { return nil }
                 return .heartbeatAck(sessionEpoch: epoch)

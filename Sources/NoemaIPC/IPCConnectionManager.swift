@@ -169,6 +169,12 @@ public struct IPCStatistics: Sendable, Hashable {
     public var ignoredStaleCallbacks = 0
     public var readySignals = 0
     public var debouncedReadySignals = 0
+    /// Ready signals ignored because this open circuit already used its one ready probe.
+    public var rateLimitedReadySignals = 0
+    /// `helloAck` outside `.connecting` or `heartbeatAck` outside `.healthy`, ignored.
+    public var ignoredOutOfStateMessages = 0
+    /// `settingsSnapshot`s older than the applied settings revision, ignored.
+    public var staleSettingsRevisions = 0
     public var gateDrops: [GenerationGate.Decision: Int] = [:]
 
     public init() {}
@@ -211,6 +217,12 @@ public final class IPCConnectionManager: @unchecked Sendable {
         /// Bumped whenever timers are cancelled, so a timer that already fired is ignored.
         var timerEpoch: UInt64 = 0
         var lastReadySignal: IPCInstant?
+        /// The ready notification is unauthenticated: an open circuit honours one
+        /// ready-triggered probe, then waits out its cooldown. Reset on `.healthy` and
+        /// when a cooldown elapses.
+        var readyProbeUsedInCurrentCircuit = false
+        /// The revision of `settings`; a `settingsSnapshot` below it is ignored.
+        var lastAppliedSettingsRevision: UInt64 = 0
         var notifyToken: Int32 = NOTIFY_TOKEN_INVALID
         var settings: AgentSettingsSnapshot?
         var statistics = IPCStatistics()
@@ -246,6 +258,16 @@ public final class IPCConnectionManager: @unchecked Sendable {
         self.readyNotificationName = readyNotificationName
         self.queue = queue
         queue.setSpecific(key: queueKey, value: 1)
+    }
+
+    /// Dropped without `stop()`: release the notification and every timer.
+    deinit {
+        let token = core.withLock { core -> Int32 in
+            cancelTimers(&core)
+            defer { core.notifyToken = NOTIFY_TOKEN_INVALID }
+            return core.notifyToken
+        }
+        if token != NOTIFY_TOKEN_INVALID { notify_cancel(token) }
     }
 
     // MARK: - Observation
@@ -392,7 +414,8 @@ public final class IPCConnectionManager: @unchecked Sendable {
             return (attemptID, epoch, core.helloGeneration, core.engineMode, core.consecutiveFailures + 1)
         }
         guard let (attemptID, epoch, helloGeneration, engineMode, attemptNumber) = prepared else { return }
-        setState(.connecting(attempt: attemptNumber))
+        // The observer may call `stop()`; never connect after that.
+        guard setState(.connecting(attempt: attemptNumber)) else { return }
         do {
             try transport.connect(attemptID: attemptID) { [weak self] attemptID, event in
                 guard let self else { return }
@@ -403,7 +426,15 @@ public final class IPCConnectionManager: @unchecked Sendable {
             fail(Self.reason(for: error))
             return
         }
-        core.withLock { $0.currentAttemptID = attemptID }
+        let installed = core.withLock { core -> Bool in
+            guard core.running else { return false }
+            core.currentAttemptID = attemptID
+            return true
+        }
+        guard installed else {
+            transport.disconnect(reason: "stopped")
+            return
+        }
         let hello = IMEToAgent.hello(IMEHello(
             clientBundleID: client.bundleID, clientVersion: client.version, sessionEpoch: epoch, engineMode: engineMode))
         guard send(hello, generationID: helloGeneration, expectingReply: true) else { return }
@@ -451,28 +482,51 @@ public final class IPCConnectionManager: @unchecked Sendable {
         guard outcome.0 == .accept else { return }
         switch envelope.payload {
         case .helloAck(let ack):
-            let becameHealthy = core.withLock { core -> Bool in
+            // Only the handshake of the current attempt: a late or repeated ack can neither
+            // reset the failure count nor replace newer settings.
+            let accepted = core.withLock { core -> Bool in
+                guard case .connecting = core.state else {
+                    core.statistics.ignoredOutOfStateMessages += 1
+                    return false
+                }
                 core.settings = ack.settings
-                guard core.state != .healthy else { return false }
+                core.lastAppliedSettingsRevision = ack.settingsRevision
                 cancelTimers(&core)
                 core.consecutiveFailures = 0
+                core.readyProbeUsedInCurrentCircuit = false
                 return true
             }
-            if becameHealthy {
-                setState(.healthy)
-                scheduleHeartbeat()
-            }
+            guard accepted else { return }
+            guard setState(.healthy) else { return }
+            scheduleHeartbeat()
         case .heartbeatAck:
-            core.withLock { core in
+            // While `.connecting` only `helloAck` may disarm the handshake timeout.
+            let accepted = core.withLock { core -> Bool in
+                guard core.state == .healthy else {
+                    core.statistics.ignoredOutOfStateMessages += 1
+                    return false
+                }
                 core.livenessTimer?.cancel()
                 core.livenessTimer = nil
+                return true
             }
+            guard accepted else { return }
             scheduleHeartbeat()
-        case .settingsSnapshot(_, let settings):
-            core.withLock { $0.settings = settings }
+        case .settingsSnapshot(_, let settings, let revision):
+            let accepted = core.withLock { core -> Bool in
+                guard revision >= core.lastAppliedSettingsRevision else {
+                    core.statistics.staleSettingsRevisions += 1
+                    return false
+                }
+                core.settings = settings
+                core.lastAppliedSettingsRevision = revision
+                return true
+            }
+            guard accepted else { return }
         case .aiSuggestion:
             break
         }
+        guard core.withLock({ $0.running }) else { return }
         outcome.1?(envelope.payload)
     }
 
@@ -492,16 +546,17 @@ public final class IPCConnectionManager: @unchecked Sendable {
         guard let plan else { return }
         if plan.installed { transport.disconnect(reason: "failed: \(reason.rawValue)") }
         log.info("agent connection degraded: \(reason.rawValue, privacy: .public), failures \(plan.failures, privacy: .public)")
-        setState(.degraded(reason))
+        // The observer may call `stop()`: then schedule nothing.
+        guard setState(.degraded(reason)) else { return }
         if plan.failures >= policy.circuitBreakerThreshold {
             let until = clock.now + policy.circuitCooldown
-            setState(.circuitOpen(failures: plan.failures, cooldownUntil: until))
+            guard setState(.circuitOpen(failures: plan.failures, cooldownUntil: until)) else { return }
             scheduleRetry(after: policy.circuitCooldown)
         } else {
             let base = policy.backoff(afterFailures: plan.failures)
             let maximumJitter = Duration.nanoseconds(Int64(Double(base.nanoseconds) * min(max(policy.jitterFraction, 0), 1)))
             let delay = base + jitter.jitter(maximum: maximumJitter)
-            setState(.reconnecting(attempt: plan.failures, nextRetryDelay: delay))
+            guard setState(.reconnecting(attempt: plan.failures, nextRetryDelay: delay)) else { return }
             scheduleRetry(after: delay)
         }
     }
@@ -517,7 +572,14 @@ public final class IPCConnectionManager: @unchecked Sendable {
             }
             core.lastReadySignal = now
             switch core.state {
-            case .reconnecting, .circuitOpen, .degraded: return true
+            case .circuitOpen:
+                guard !core.readyProbeUsedInCurrentCircuit else {
+                    core.statistics.rateLimitedReadySignals += 1
+                    return false
+                }
+                core.readyProbeUsedInCurrentCircuit = true
+                return true
+            case .reconnecting, .degraded: return true
             case .idle, .connecting, .healthy: return false
             }
         }
@@ -573,10 +635,18 @@ public final class IPCConnectionManager: @unchecked Sendable {
     private func scheduleRetry(after delay: Duration) {
         let epoch = core.withLock { $0.timerEpoch }
         let timer = clock.schedule(after: delay, on: queue) { [weak self] in
-            guard let self, self.core.withLock({ $0.timerEpoch == epoch && $0.running }) else { return }
+            guard let self else { return }
+            let due = self.core.withLock { core -> Bool in
+                guard core.timerEpoch == epoch, core.running else { return false }
+                // The backoff or cooldown elapsed on its own: a later open circuit gets a
+                // fresh ready probe.
+                core.readyProbeUsedInCurrentCircuit = false
+                return true
+            }
+            guard due else { return }
             self.attempt()
         }
-        core.withLock { $0.retryTimer = timer }
+        install(timer, epoch: epoch) { $0.retryTimer = timer }
     }
 
     /// Fails the attempt with `.timeout` unless an ack cancels this timer first.
@@ -586,7 +656,7 @@ public final class IPCConnectionManager: @unchecked Sendable {
             guard let self, self.core.withLock({ $0.timerEpoch == epoch && $0.livenessTimer != nil }) else { return }
             self.fail(.timeout)
         }
-        core.withLock { $0.livenessTimer = timer }
+        install(timer, epoch: epoch) { $0.livenessTimer = timer }
     }
 
     private func scheduleHeartbeat() {
@@ -606,7 +676,18 @@ public final class IPCConnectionManager: @unchecked Sendable {
             guard self.send(.heartbeat(sessionEpoch: sessionEpoch), generationID: generation, expectingReply: true) else { return }
             self.armLivenessTimer()
         }
-        core.withLock { $0.heartbeatTimer = timer }
+        install(timer, epoch: epoch) { $0.heartbeatTimer = timer }
+    }
+
+    /// Stores `timer` unless the manager stopped or its timers were cancelled since
+    /// `epoch` was read (a re-entrant `stop()` from an observer); then cancels it at once.
+    private func install(_ timer: any IPCCancellable, epoch: UInt64, _ store: (inout Core) -> Void) {
+        let installed = core.withLockUnchecked { core -> Bool in
+            guard core.running, core.timerEpoch == epoch else { return false }
+            store(&core)
+            return true
+        }
+        if !installed { timer.cancel() }
     }
 
     private func cancelTimers(_ core: inout Core) {
@@ -619,12 +700,19 @@ public final class IPCConnectionManager: @unchecked Sendable {
         core.heartbeatTimer = nil
     }
 
-    private func setState(_ state: IPCConnectionState) {
-        let observer = core.withLock { core -> (@Sendable (IPCConnectionState) -> Void)? in
+    /// Publishes `state` and returns whether the manager is still running afterwards: the
+    /// observer may call `stop()` re-entrantly, and callers then schedule nothing. Only
+    /// `.idle` is published once stopped.
+    @discardableResult
+    private func setState(_ state: IPCConnectionState) -> Bool {
+        let observer = core.withLock { core -> (@Sendable (IPCConnectionState) -> Void)?? in
+            guard core.running || state == .idle else { return nil }
             core.state = state
-            return core.onStateChange
+            return .some(core.onStateChange)
         }
+        guard let observer else { return false }
         observer?(state)
+        return core.withLock { $0.running }
     }
 
     static func reason(for error: IPCError) -> IPCDegradationReason {

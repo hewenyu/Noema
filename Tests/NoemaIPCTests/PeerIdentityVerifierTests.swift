@@ -48,11 +48,13 @@ import Testing
         #expect(PeerIdentityVerifier.verify(auditToken: token, policy: unpinned) == .failure(.unpinnedStrictPolicy))
         #expect(PeerIdentityVerifier.verify(auditToken: token, policy: .allowAdHocForTesting(signingIdentifiers: []))
             == .failure(.noExpectedSigningIdentifiers))
-        #expect(unpinned.xpcPeerRequirement != nil && PeerIdentityPolicy.allowAdHocForTesting(signingIdentifiers: []).xpcPeerRequirement == nil)
+        // No layer-1 requirement either, so the transports refuse to open anything.
+        #expect(unpinned.xpcPeerRequirement == nil && PeerIdentityPolicy.allowAdHocForTesting(signingIdentifiers: []).xpcPeerRequirement == nil)
     }
 
     /// A certificate-signed binary ignores an ad-hoc request: it pins itself and rejects
-    /// the real ad-hoc child. An ad-hoc binary keeps the request.
+    /// the real ad-hoc child. Only a valid ad-hoc binary keeps the request; no valid self
+    /// signature, or a non-ad-hoc one with nothing to pin, fails closed.
     @Test func antiDowngradeGuardPinsASignedSelf() throws {
         let signedSelf = SelfCodeIdentity(
             signingIdentifier: "dev.noema.inputmethod.NoemaIME", teamID: Self.fakeTeam,
@@ -76,7 +78,18 @@ import Testing
 
         let adHocSelf = SelfCodeIdentity(signingIdentifier: "x", teamID: nil, leafCertificateSHA1: nil, isAdHoc: true, hasHardenedRuntime: false)
         #expect(PeerIdentityPolicy.resolved(requested: requested, selfIdentity: adHocSelf) == requested)
-        #expect(PeerIdentityPolicy.resolved(requested: requested, selfIdentity: nil) == requested)
+
+        // Fail closed: no valid self signature (e.g. -67034 after the bundle was replaced).
+        let resolvedNil = PeerIdentityPolicy.resolved(requested: requested, selfIdentity: nil)
+        #expect(resolvedNil.isUnpinnedStrict && resolvedNil.expectedSigningIdentifiers == requested.expectedSigningIdentifiers)
+        #expect(resolvedNil.xpcPeerRequirement == nil)
+        let selfToken = try #require(PeerIdentityVerifier.currentAuditToken())
+        #expect(PeerIdentityVerifier.verify(auditToken: selfToken, policy: resolvedNil) == .failure(.unpinnedStrictPolicy))
+        #expect(PeerIdentityVerifier.verify(auditToken: token, policy: resolvedNil) == .failure(.unpinnedStrictPolicy))
+        // Non-ad-hoc but with neither a Team ID nor a leaf certificate: nothing to pin.
+        let nonAdHocUnpinned = SelfCodeIdentity(signingIdentifier: "x", teamID: nil, leafCertificateSHA1: nil, isAdHoc: false, hasHardenedRuntime: true)
+        #expect(PeerIdentityPolicy.resolved(requested: requested, selfIdentity: nonAdHocUnpinned).isUnpinnedStrict)
+        #expect(PeerIdentityPolicy.resolved(requested: unpinned, selfIdentity: nil).isUnpinnedStrict)
     }
 
     @Test func strictEvaluationChecksRuntimeTeamAndCertificate() {

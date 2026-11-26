@@ -233,7 +233,7 @@ final class InMemoryRig {
         rig.settle()
         let suggestions = rig.recorder.received.compactMap { if case .aiSuggestion(let s) = $0 { s.suggestion } else { nil } }
         #expect(suggestions == ["s20"])
-        let settingsSeen = rig.recorder.received.compactMap { if case .settingsSnapshot(_, let s) = $0 { s.panelBackdropPreference } else { nil } }
+        let settingsSeen = rig.recorder.received.compactMap { if case .settingsSnapshot(_, let s, _) = $0 { s.panelBackdropPreference } else { nil } }
         #expect(settingsSeen == ["five", "six", "eight"])
         #expect(rig.manager.statistics.gateDrops == [.duplicate: 3, .stale: 2, .epochMismatch: 1, .notCurrentComposition: 1])
     }
@@ -302,6 +302,137 @@ final class InMemoryRig {
         rig.agent.start()
         #expect(notify_post(name) == UInt32(NOTIFY_STATUS_OK))
         #expect(waitUntil { rig.settle(); return rig.manager.state == .healthy })
+    }
+
+    /// `stop()` called from the state observer itself, on `.degraded` and on `.healthy`:
+    /// nothing is scheduled after it, the state stays `.idle`, no timer is left.
+    @Test func reentrantStopFromTheStateObserverLeavesNothingRunning() {
+        var policy = InMemoryRig.policy
+        policy.heartbeatInterval = .seconds(1)
+        for trigger in ["degraded", "healthy"] {
+            let rig = InMemoryRig(policy: policy, startAgent: trigger == "healthy")
+            let recorder = rig.recorder
+            rig.manager.setStateObserver { [weak manager = rig.manager] state in
+                recorder.record(state)
+                let hit: Bool
+                switch state {
+                case .degraded: hit = trigger == "degraded"
+                case .healthy: hit = trigger == "healthy"
+                default: hit = false
+                }
+                if hit { manager?.stop() }
+            }
+            rig.manager.start()
+            rig.settle()
+            #expect(rig.manager.state == .idle, "\(trigger): \(rig.manager.state)")
+            #expect(rig.recorder.shape.last == "idle", "\(trigger): \(rig.recorder.shape)")
+            #expect(rig.clock.pendingTimerCount == 0, "\(trigger): a timer survived the re-entrant stop")
+            rig.clock.advance(by: .seconds(60))
+            rig.settle()
+            #expect(rig.transport.connectCalls == 1 && rig.manager.state == .idle, "\(trigger)")
+        }
+    }
+
+    /// A `heartbeatAck` while `.connecting` must not disarm the handshake timeout.
+    @Test func heartbeatAckWhileConnectingIsIgnored() throws {
+        let rig = InMemoryRig(startAgent: false)
+        try rig.server.start(IPCServerHandlers(onFrame: { _, _, _ in nil }))
+        rig.manager.start()
+        rig.settle()
+        #expect(rig.manager.state == .connecting(attempt: 1))
+        rig.transport.injectInbound(try agentFrame(.heartbeatAck(sessionEpoch: rig.manager.sessionEpoch), generationID: 1))
+        rig.settle()
+        #expect(rig.manager.statistics.ignoredOutOfStateMessages == 1)
+        #expect(rig.recorder.received.isEmpty)
+        rig.clock.advance(by: .milliseconds(300))
+        #expect(rig.recorder.shape.suffix(2) == ["degraded(timeout)", "reconnecting(1)"], "\(rig.recorder.shape)")
+    }
+
+    /// `helloAck` counts only while `.connecting`; settings revisions never go backwards.
+    @Test func lateHelloAckAndOlderSettingsRevisionsAreIgnored() throws {
+        let rig = InMemoryRig()
+        rig.agent.updateSettings(AgentSettingsSnapshot(panelBackdropPreference: "one"))
+        rig.agent.updateSettings(AgentSettingsSnapshot(panelBackdropPreference: "two"))
+        rig.startHealthy()
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "two", "helloAck carries revision 2")
+        let epoch = rig.manager.sessionEpoch
+
+        // A second helloAck (new generation, so the gate admits it) changes nothing.
+        rig.transport.injectInbound(try agentFrame(
+            .helloAck(AgentHelloAck(agentVersion: "evil", sessionEpoch: epoch, settings: AgentSettingsSnapshot(panelBackdropPreference: "late"), settingsRevision: 99)),
+            generationID: 50))
+        rig.settle()
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "two")
+        #expect(rig.manager.statistics.ignoredOutOfStateMessages == 1)
+
+        // Gate-fresh generations (no settingsSnapshot seen yet), but revision 1 < 2: ignored.
+        func snapshot(_ backdrop: String, revision: UInt64, generation: UInt64) throws -> Data {
+            try agentFrame(.settingsSnapshot(sessionEpoch: epoch, settings: AgentSettingsSnapshot(panelBackdropPreference: backdrop), revision: revision), generationID: generation)
+        }
+        rig.transport.injectInbound(try snapshot("older", revision: 1, generation: 1))
+        rig.settle()
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "two")
+        #expect(rig.manager.statistics.staleSettingsRevisions == 1)
+        rig.transport.injectInbound(try snapshot("three", revision: 3, generation: 2))
+        rig.settle()
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "three")
+        // The real agent's next push is revision 3 as well (>= applied): accepted.
+        rig.agent.updateSettings(AgentSettingsSnapshot(panelBackdropPreference: "agent"))
+        rig.settle()
+        #expect(rig.manager.agentSettings?.panelBackdropPreference == "agent")
+        let seen = rig.recorder.received.compactMap { if case .settingsSnapshot(_, let s, _) = $0 { s.panelBackdropPreference } else { nil } }
+        #expect(seen == ["three", "agent"])
+        #expect(rig.manager.state == .healthy && rig.manager.consecutiveFailures == 0)
+    }
+
+    /// The ready notification is unauthenticated: spamming it cannot bypass the circuit
+    /// cooldown. One ready probe per open circuit, then a fresh one after a cooldown elapses.
+    @Test func readyProbesFromAnOpenCircuitAreRateLimited() {
+        let rig = InMemoryRig(startAgent: false)
+        rig.manager.start()
+        rig.settle()
+        for delay in [150, 300, 600] { rig.clock.advance(by: .milliseconds(delay)) }
+        #expect(rig.transport.connectCalls == 4)
+        rig.manager.agentReadySignalReceived()
+        rig.settle()
+        #expect(rig.transport.connectCalls == 5, "the first ready signal probes at once")
+        guard case .circuitOpen(5, _) = rig.manager.state else {
+            Issue.record("the failed probe re-opens the circuit, got \(rig.manager.state)")
+            return
+        }
+        for _ in 0..<20 {
+            rig.clock.advance(by: .milliseconds(100))
+            rig.manager.agentReadySignalReceived()
+            rig.settle()
+        }
+        #expect(rig.transport.connectCalls == 5, "spammed ready signals must not bypass the cooldown")
+        #expect(rig.manager.statistics.rateLimitedReadySignals == 20)
+
+        // 2 s already passed; the cooldown elapses on its own: one natural probe, and the
+        // next open circuit honours one ready probe again.
+        rig.clock.advance(by: .seconds(8))
+        rig.settle()
+        #expect(rig.transport.connectCalls == 6)
+        rig.agent.start()
+        rig.clock.advance(by: .milliseconds(100))
+        rig.manager.agentReadySignalReceived()
+        rig.settle()
+        #expect(rig.transport.connectCalls == 7 && rig.manager.state == .healthy)
+    }
+
+    /// Dropped without `stop()`: `deinit` cancels every pending timer.
+    @Test func droppingAManagerCancelsItsTimers() {
+        let clock = ManualIPCClock()
+        do {
+            let manager = IPCConnectionManager(
+                transport: InMemoryClientTransport(server: InMemoryServerTransport(), clock: clock),
+                client: .init(bundleID: "dev.noema.tests.ime", version: "1.0.0"), policy: InMemoryRig.policy,
+                clock: clock, jitter: FixedJitter(fraction: 1), readyNotificationName: "dev.noema.tests.ready.\(UUID().uuidString)")
+            manager.start()
+            for _ in 0..<4 { manager.sync {} }
+            #expect(clock.pendingTimerCount == 1)
+        }
+        #expect(clock.pendingTimerCount == 0)
     }
 
     @Test func stopCancelsTimersAndIgnoresLateEvents() {

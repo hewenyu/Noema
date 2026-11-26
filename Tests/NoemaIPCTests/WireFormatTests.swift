@@ -53,6 +53,31 @@ import XPC
         #expect(Set(ime.map(\.kind)).count == 4 && Set(agent.map(\.kind)).count == 4)
     }
 
+    /// `settingsRevision` is append-only: a v1 frame without it decodes as revision 0.
+    @Test func settingsRevisionIsOptionalOnTheWire() throws {
+        let epoch = UUID()
+        func strip(_ value: Any) -> Any {
+            if let dictionary = value as? [String: Any] {
+                return dictionary.filter { $0.key != "settingsRevision" }.mapValues(strip)
+            }
+            return value
+        }
+        for message: AgentToIME in [
+            .helloAck(AgentHelloAck(agentVersion: "1.0.0", sessionEpoch: epoch, settings: .defaults, settingsRevision: 7)),
+            .settingsSnapshot(sessionEpoch: epoch, settings: .defaults, revision: 7),
+        ] {
+            let frame = try IPCWireCodec.encode(IPCEnvelope(sequence: 1, message: message, generationID: 1))
+            #expect(String(decoding: frame, as: UTF8.self).contains("\"settingsRevision\":7"))
+            let legacy = try JSONSerialization.data(withJSONObject: strip(try JSONSerialization.jsonObject(with: frame)))
+            #expect(!String(decoding: legacy, as: UTF8.self).contains("settingsRevision"))
+            switch try IPCWireCodec.decode(AgentToIME.self, from: legacy).payload {
+            case .helloAck(let ack): #expect(ack.settingsRevision == 0 && ack.sessionEpoch == epoch)
+            case .settingsSnapshot(_, _, let revision): #expect(revision == 0)
+            default: Issue.record("unexpected payload")
+            }
+        }
+    }
+
     @Test func unknownKindIsMalformed() {
         let json = #"{"version":1,"sequence":1,"kind":"ime.future","payload":{"kind":"ime.future"}}"#
         #expect(throws: IPCError.malformedFrame) { try IPCWireCodec.decode(IMEToAgent.self, from: Data(json.utf8)) }
