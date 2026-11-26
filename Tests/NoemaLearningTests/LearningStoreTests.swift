@@ -67,7 +67,7 @@ func permissions(_ url: URL) -> mode_t {
         #expect(entries.map(\.text) == ["你好", "世界"])
         #expect(entries[0].pinyinNorm == "ni hao" && entries[0].pinyinCompact == "nihao" && entries[0].frequency == 2)
         #expect(entries[0].updatedAt == Date(timeIntervalSince1970: 20))
-        #expect(entries[1].pinyinNorm == "shijie" && entries[1].frequency == 1)
+        #expect(entries[1].pinyinNorm == "shi jie" && entries[1].frequency == 1)
         #expect(try store.latestRevision() == 3)
         #expect(entries[0].revision == 2 && entries[1].revision == 3)
         #expect(try store.entriesSince(revision: 2).map(\.text) == ["世界"])
@@ -86,12 +86,60 @@ func permissions(_ url: URL) -> mode_t {
         #expect(event("nihao", "你\t好").normalized() == nil)
     }
 
-    @Test func normalizationPrefersThePreeditOnlyWhenItSpellsTheRawInput() {
+    @Test func normalizationKeysFullPinyinFromThePreeditOrTheReading() {
         #expect(event("nihao", "你好", preedit: "ni hao").normalized()?.pinyinNorm == "ni hao")
-        #expect(event("nihao", "你好", preedit: "你 hao").normalized()?.pinyinNorm == "nihao")
+        // A preedit holding Han text: the raw input spells the reading.
+        #expect(event("nihao", "你好", preedit: "你 hao").normalized()?.pinyinNorm == "ni hao")
         #expect(event("xian", "西安", preedit: "xi'an").normalized()?.pinyinNorm == "xi an")
+        #expect(event("xian", "西安").normalized()?.pinyinNorm == "xi an")
         #expect(event("lv", "绿", preedit: "lü").normalized()?.pinyinNorm == "lv")
+        #expect(event("lue", "略", preedit: "lue").normalized()?.pinyinNorm == "lve")
+        // Out-of-dictionary text and the user's own polyphone reading are kept as typed.
+        #expect(event("nihao", "霓昊", preedit: "ni hao").normalized()?.pinyinNorm == "ni hao")
+        #expect(event("yinhang", "银行", preedit: "yin hang").normalized()?.pinyinNorm == "yin hang")
+        #expect(event("hangy", "行业", preedit: "hang y").normalized()?.pinyinNorm == "hang ye")
         #expect(event("nihao", String(repeating: "好", count: 33)).normalized() == nil)
+    }
+
+    /// Double pinyin: the preedit spells full pinyin, never the raw keys.
+    @Test func doublePinyinIsLearnedUnderTheFullPinyinPreedit() {
+        let shuangpin = event("uijx", "施加", preedit: "shi jia").normalized()
+        #expect(shuangpin?.pinyinNorm == "shi jia" && shuangpin?.pinyinCompact == "shijia")
+        // Raw double-pinyin keys alone never become a key.
+        #expect(event("uijx", "施加").normalized() == nil)
+    }
+
+    /// Jianpin: abbreviated initials resolve to the full reading; a spelling that does not
+    /// abbreviate the reading is not learned.
+    @Test func abbreviatedPinyinIsLearnedUnderTheFullReading() {
+        #expect(event("nh", "女孩", preedit: "n h").normalized()?.pinyinNorm == "nv hai")
+        #expect(event("shij", "时间", preedit: "shi j").normalized()?.pinyinNorm == "shi jian")
+        #expect(event("nh", "女孩").normalized()?.pinyinNorm == "nv hai")
+        #expect(event("shij", "时间", preedit: "shij").normalized()?.pinyinNorm == "shi jian")
+        #expect(event("ax", "爱心", preedit: "a x").normalized()?.pinyinNorm == "ai xin")
+        #expect(event("xy", "你好", preedit: "x y").normalized() == nil)
+        #expect(event("xy", "你好").normalized() == nil)
+        #expect(event("yh", "银行", preedit: "y h").normalized() == nil)
+    }
+
+    @Test(arguments: [
+        ("女孩", ["nv", "hai"]), ("旅游", ["lv", "you"]), ("绿茶", ["lv", "cha"]), ("时间", ["shi", "jian"]),
+        ("施加", ["shi", "jia"]), ("略", ["lve"]), ("虐", ["nve"]), ("儿", ["er"]), ("哦", ["o"]),
+    ])
+    func mandarinReading(_ text: String, _ expected: [String]) {
+        #expect(TextNormalization.mandarinPinyinSyllables(for: text) == expected)
+    }
+
+    @Test func mandarinReadingNeedsAllHanTextAndStandardSyllables() {
+        #expect(TextNormalization.mandarinPinyinSyllables(for: "") == nil)
+        #expect(TextNormalization.mandarinPinyinSyllables(for: "你好a") == nil)
+        #expect(TextNormalization.mandarinPinyinSyllables(for: "嗯") == nil) // `ng`, a syllabic nasal
+        for syllable in ["ni", "lv", "lve", "nv", "nve", "er", "a", "zhuang", "o"] {
+            #expect(TextNormalization.isStandardMandarinSyllable(syllable), "\(syllable)")
+        }
+        for initial in ["b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x", "zh", "ch", "sh", "r", "z", "c", "s", "y", "w", "ng", "lue", "uijx"] {
+            #expect(!TextNormalization.isStandardMandarinSyllable(initial), "\(initial)")
+        }
     }
 
     @Test(arguments: [

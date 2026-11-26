@@ -190,6 +190,134 @@ extension LibrimeSerializedTests {
             #expect(learned.map(\.text) == ["你好世界"] && learned.first?.pinyinNorm == "ni hao shi jie", "\(learned)")
         }
 
+        /// Double pinyin and jianpin through real librime: 万象 runs `double_pinyin_flypy`'s
+        /// speller (`uijx` shows the preedit `shi jia`), 雾凇 adds jianpin abbreviations (`nh`
+        /// shows `n h`, `shij` shows `shi j`). `learning.sqlite` stores full pinyin, never the
+        /// raw keys or the initials, and 薄荷 (full pinyin, no Lua translator) serves the phrases
+        /// from its rebuilt userdb and TSV under full pinyin.
+        @Test func doublePinyinAndJianpinCommitsAreLearnedUnderFullPinyin() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.useDoublePinyinFlypy(in: .wanxiang, appending: "施加\tshi jia\t100000\n")
+            try workspace.useJianpinAbbreviations(in: .rimeIce, appending: "女孩\tnv hai\t100000\n")
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let writer = LearningStoreWriter(store: store)
+            engine.recordCommits(to: writer)
+            let host = SwitcherHost(workspace: workspace, engine: engine, store: store, writer: writer)
+
+            #expect(try await host.switchAndWait(.wanxiang, "wanxiang_fixture").phase == .ready)
+            let shuangpin = try commit(engine, "uijx", "施加")
+            #expect(shuangpin.preedit == "shi jia" && shuangpin.committed == "施加", "\(shuangpin)")
+            #expect(try await host.switchAndWait(.rimeIce, "rime_ice_fixture").phase == .ready)
+            let girl = try commit(engine, "nh", "女孩")
+            #expect(girl.preedit == "n h" && girl.committed == "女孩", "\(girl)")
+            let time = try commit(engine, "shij", "时间")
+            #expect(time.preedit == "shi j" && time.committed == "时间", "\(time)")
+            writer.flush()
+            let learned = Dictionary(uniqueKeysWithValues: try store.allEntries().map { ($0.text, $0.pinyinNorm) })
+            #expect(learned == ["施加": "shi jia", "女孩": "nv hai", "时间": "shi jian"], "\(learned)")
+
+            // 薄荷: no abbreviations, no double pinyin, no Lua; 施 is not in its dictionary.
+            #expect(!LexiconWorkspace.dictionary(of: .mint).contains("施"))
+            let mint = try await engine.switchSchemaSet(
+                to: .mint, sharedDataDir: workspace.schemaDir(.mint), schemaID: "mint_fixture",
+                learningStore: store, learningWriter: writer, luaFile: nil)
+            if case .recovered(let recovery) = mint.userDBOutcome { #expect(recovery.imported == 3) } else {
+                Issue.record("mint: \(String(describing: mint.userDBOutcome))")
+            }
+            #expect(candidates(engine, "shijia").contains("施加"), "the userdb lacks shi jia")
+            #expect(candidates(engine, "nvhai").first == "女孩")
+            #expect(candidates(engine, "shijian").first == "时间")
+            let tsv = try String(contentsOf: workspace.setDir(.mint).appending(path: NoemaPaths.learnedTSVFileName), encoding: .utf8)
+            #expect(Set(tsv.split(separator: "\n").map { $0.split(separator: "\t").prefix(2).joined(separator: "\t") })
+                    == ["shijia\t施加", "nvhai\t女孩", "shijian\t时间"], "\(tsv)")
+        }
+
+        /// A user `noema_pinyin.custom.yaml` that already appends `echo_translator` with
+        /// `@after last`: the real `noema-rime-deployer` exits 0 with both translators in the
+        /// compiled schema, and the engine booted on it serves the learned TSV phrase and
+        /// echoes unmatched input.
+        @Test func userAfterLastTranslatorPatchKeepsTheLearnedTranslator() throws {
+            let workspace = try LexiconWorkspace()
+            let patch = "patch:\n  \"engine/translators/@after last\": \"echo_translator\"\n"
+            let deployerUser = workspace.root.appending(path: "deployer-user", directoryHint: .isDirectory)
+            let staging = workspace.root.appending(path: "deployer-staging", directoryHint: .isDirectory)
+            for directory in [deployerUser, staging, workspace.setDir(.builtin)] {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+            for directory in [deployerUser, workspace.setDir(.builtin)] {
+                try patch.write(to: directory.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            }
+            let deployer = try #require(RimeEngine.locateDeployer())
+            let result = try Tool.run(deployer.path, [
+                "--shared-dir", LexiconWorkspace.builtin.path, "--user-dir", deployerUser.path, "--staging-dir", staging.path,
+                "--log-dir", workspace.logs.path, "--schema", "noema_pinyin", "--lua-file", LexiconWorkspace.lua.path,
+            ])
+            #expect(result.status == 0, "\(result)")
+            let compiled = try String(contentsOf: staging.appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+            #expect(compiled.contains("echo_translator") && compiled.contains("lua_translator@*noema_learned"), "\(compiled)")
+
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            try #require(!engine.isSafeMode && engine.configuration.schemaSetID == .builtin)
+            let live = try String(
+                contentsOf: workspace.setDir(.builtin).appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+            #expect(live.contains("echo_translator") && live.contains("lua_translator@*noema_learned"), "\(live)")
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            #expect(engine.refreshLearnedPhrases(from: store) == 1)
+            engine.resetSession()
+            let served = candidates(engine, "nihao")
+            #expect(served.contains("霓昊"), "\(served)")
+            // echo_translator echoes input no dictionary matches.
+            #expect(candidates(engine, "zzzz") == ["zzzz"])
+        }
+
+        /// A user patch that overwrites the appended translator (`@last` replaces the last
+        /// item after `engine/translators/+` added it): the compiled schema lacks
+        /// `lua_translator@*noema_learned`, so the real deployer exits 1 and says so.
+        @Test func deployerFailsWhenTheCompiledSchemaLacksTheLearnedTranslator() throws {
+            let workspace = try LexiconWorkspace()
+            let user = workspace.root.appending(path: "deployer-user", directoryHint: .isDirectory)
+            let staging = workspace.root.appending(path: "deployer-staging", directoryHint: .isDirectory)
+            for directory in [user, staging] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+            try "patch:\n  \"engine/translators/@last\": \"echo_translator\"\n"
+                .write(to: user.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            let deployer = try #require(RimeEngine.locateDeployer())
+            let arguments = [
+                "--shared-dir", LexiconWorkspace.builtin.path, "--user-dir", user.path, "--staging-dir", staging.path,
+                "--log-dir", workspace.logs.path, "--schema", "noema_pinyin",
+            ]
+            let result = try Tool.run(deployer.path, arguments + ["--lua-file", LexiconWorkspace.lua.path])
+            #expect(result.status == 1 && result.stderr.contains("lacks lua_translator@*noema_learned"), "\(result)")
+            #expect(!FileManager.default.fileExists(atPath: staging.appending(path: "build/\(DeployManifest.fileName)").path))
+            // Without --lua-file the same patch deploys.
+            try FileManager.default.removeItem(at: staging)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+            #expect(try Tool.run(deployer.path, arguments).status == 0)
+        }
+
+        /// `noema_learned.lua` looks input up without the schema's `speller/delimiter`: a
+        /// phrase only the TSV holds (never imported into the userdb) is served for `nihao`
+        /// and for `ni'hao` alike.
+        @Test func learnedTranslatorIgnoresSpellerDelimiters() throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            #expect(!candidates(engine, "nihao").contains("霓昊"))
+            #expect(engine.refreshLearnedPhrases(from: store) == 1)
+            engine.resetSession()
+            #expect(candidates(engine, "nihao").contains("霓昊"))
+            engine.resetSession()
+            #expect(candidates(engine, "ni'hao").contains("霓昊"), "noema_learned.lua missed ni'hao")
+        }
+
         /// An agent `switchSchemaSet` arriving mid-composition over the real IPC manager is
         /// parked (`pendingIdle`), the preedit stays, nothing compiles; the commit that ends
         /// the composition starts it (`compiling`); a composition begun meanwhile holds the
@@ -520,6 +648,103 @@ final class LexiconWorkspace {
         try text.replacingOccurrences(of: target, with: replacement).write(to: url, atomically: true, encoding: .utf8)
     }
 
+    /// Turns `set`'s fixture schema into double pinyin with `double_pinyin_flypy`'s speller
+    /// algebra and preedit format (the preedit spells full pinyin), and appends `appendix`
+    /// to its dictionary.
+    func useDoublePinyinFlypy(in set: SchemaSetID, appending appendix: String) throws {
+        let schemaID = Self.fixture(set).schemaID
+        try replace(in: set, "\(schemaID).schema.yaml", "  algebra:\n    - derive/^([nl])ve$/$1ue/\n", with: """
+              algebra:
+                - erase/^xx$/
+                - derive/^([jqxy])u$/$1v/
+                - derive/^([aoe])([ioun])$/$1$1$2/
+                - xform/^([aoe])(ng)?$/$1$1$2/
+                - xform/iu$/Q/
+                - xform/(.)ei$/$1W/
+                - xform/uan$/R/
+                - xform/[uv]e$/T/
+                - xform/un$/Y/
+                - xform/^sh/U/
+                - xform/^ch/I/
+                - xform/^zh/V/
+                - xform/uo$/O/
+                - xform/ie$/P/
+                - xform/i?ong$/S/
+                - xform/ing$|uai$/K/
+                - xform/(.)ai$/$1D/
+                - xform/(.)en$/$1F/
+                - xform/(.)eng$/$1G/
+                - xform/[iu]ang$/L/
+                - xform/(.)ang$/$1H/
+                - xform/ian$/M/
+                - xform/(.)an$/$1J/
+                - xform/(.)ou$/$1Z/
+                - xform/[iu]a$/X/
+                - xform/iao$/N/
+                - xform/(.)ao$/$1C/
+                - xform/ui$/V/
+                - xform/in$/B/
+                - xlit/QWRTYUIOPSDFGHJKLZXCVBNM/qwrtyuiopsdfghjklzxcvbnm/
+
+            """)
+        try replace(in: set, "\(schemaID).schema.yaml", "  preedit_format:\n    - xform/([nl])v/$1ü/\n", with: """
+              preedit_format:
+                - xform/([bpmfdtnljqx])n/$1iao/
+                - xform/(\\w)g/$1eng/
+                - xform/(\\w)q/$1iu/
+                - xform/(\\w)w/$1ei/
+                - xform/([dtnlgkhjqxyvuirzcs])r/$1uan/
+                - xform/(\\w)t/$1ve/
+                - xform/([gkhvuirzcs])y/$1uai/
+                - xform/(\\w)y/$1un/
+                - xform/([dtnlgkhvuirzcs])o/$1uo/
+                - xform/(\\w)p/$1ie/
+                - xform/([jqx])s/$1iong/
+                - xform/(\\w)s/$1ong/
+                - xform/(\\w)d/$1ai/
+                - xform/(\\w)f/$1en/
+                - xform/(\\w)h/$1ang/
+                - xform/(\\w)j/$1an/
+                - xform/([gkhvuirzcs])k/$1uai/
+                - xform/(\\w)k/$1ing/
+                - xform/([jqxnl])l/$1iang/
+                - xform/(\\w)l/$1uang/
+                - xform/(\\w)z/$1ou/
+                - xform/([gkhvuirzcs])x/$1ua/
+                - xform/(\\w)x/$1ia/
+                - xform/(\\w)c/$1ao/
+                - xform/([dtgkhvuirzcs])v/$1ui/
+                - xform/(\\w)b/$1in/
+                - xform/(\\w)m/$1ian/
+                - xform/([aoe])\\1(\\w)/$1$2/
+                - "xform/(^|[ '])v/$1zh/"
+                - "xform/(^|[ '])i/$1ch/"
+                - "xform/(^|[ '])u/$1sh/"
+                - xform/([jqxy])v/$1u/
+                - xform/([nl])v/$1ü/
+
+            """)
+        try appendToDictionary(of: set, appendix)
+    }
+
+    /// Adds jianpin to `set`'s fixture speller (`abbrev`: each syllable's first letter, and
+    /// `zh`/`ch`/`sh`) and appends `appendix` to its dictionary.
+    func useJianpinAbbreviations(in set: SchemaSetID, appending appendix: String) throws {
+        let schemaID = Self.fixture(set).schemaID
+        try replace(in: set, "\(schemaID).schema.yaml", "    - derive/^([nl])ve$/$1ue/\n", with: """
+                - derive/^([nl])ve$/$1ue/
+                - abbrev/^([a-z]).+$/$1/
+                - abbrev/^([zcs]h).+$/$1/
+
+            """)
+        try appendToDictionary(of: set, appendix)
+    }
+
+    func appendToDictionary(of set: SchemaSetID, _ appendix: String) throws {
+        let url = schemaDir(set).appending(path: "\(Self.fixture(set).schemaID).dict.yaml")
+        try (try String(contentsOf: url, encoding: .utf8) + appendix).write(to: url, atomically: true, encoding: .utf8)
+    }
+
     /// The input method's boot: `active-schema-set.json`, else the built-in set, with the Lua translator.
     @MainActor
     func engine(luaFile: URL? = LexiconWorkspace.lua) throws -> RimeEngine {
@@ -591,6 +816,24 @@ enum LevelDBCorruption: String, CaseIterable, Sendable, CustomTestStringConverti
         }
         return targets
     }
+}
+
+/// Types `input`, then selects `text` from up to `pages` pages: the preedit shown before
+/// the selection and what it committed.
+@MainActor
+func commit(_ engine: RimeEngine, _ input: String, _ text: String, pages: Int = 8) throws -> (preedit: String, committed: String?) {
+    engine.clearComposition()
+    for character in input { _ = engine.processKey(.text(character)) }
+    let preedit = engine.currentState.preedit
+    for _ in 0..<pages {
+        if let index = engine.currentState.candidates.firstIndex(where: { $0.text == text }) {
+            return (preedit, engine.selectCandidate(at: index).committedText)
+        }
+        engine.changePage(backward: false)
+    }
+    Issue.record("no candidate \(text) for \(input) (preedit \(preedit))")
+    engine.clearComposition()
+    throw CancellationError()
 }
 
 /// Every candidate text for `input` across up to `pages` pages; leaves no composition.

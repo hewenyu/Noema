@@ -14,10 +14,13 @@
 //      files, or `build/`), each of which must be a regular file, never a symlink, and
 //      checks each copy against the input snapshot;
 //   2. with `--lua-file`, copies it to `staging/lua/noema_learned.lua` and adds
-//      `"engine/translators/@after last": "lua_translator@*noema_learned"` to the staged
-//      `<schema>.custom.yaml` patch (creating it, or inserting the line under its block
-//      `patch:` mapping); `rime.lua` is never written;
-//   3. points librime at `--shared-dir` and the staging directory and deploys;
+//      `lua_translator@*noema_learned` to the `"engine/translators/+"` sequence of the
+//      staged `<schema>.custom.yaml` patch (`SchemaPatch`: creating the file or key, or
+//      joining the user's own `engine/translators/+` sequence, never duplicating a key);
+//      `rime.lua` is never written;
+//   3. points librime at `--shared-dir` and the staging directory and deploys; with
+//      `--lua-file`, the compiled `engine/translators` must list
+//      `lua_translator@*noema_learned`;
 //   4. requires `staging/build/default.yaml`, `<schema>.schema.yaml`, the `.table.bin` of
 //      every dictionary and the `.prism.bin` of every prism the schema names (for
 //      `translator`, `reverse_lookup`, and each `script_translator@<tag>`/
@@ -192,8 +195,11 @@ func withTraits<T>(_ options: Options, _ body: (inout RimeTraits) -> T) -> T {
 /// Every dictionary and prism the compiled schema names, each deduplicated in order: for
 /// `translator`, `reverse_lookup`, and the tag of each `script_translator@<tag>` or
 /// `table_translator@<tag>` in `engine/translators`, `<ns>/dictionary` and `<ns>/prism`
-/// (else that dictionary). Each must be a plain name.
-func requiredDictionaries(api: UnsafeMutablePointer<RimeApi>, schemaID: String) -> (dictionaries: [String], prisms: [String]) {
+/// (else that dictionary). Each must be a plain name. With `required`, `engine/translators`
+/// must list it, else the deploy fails.
+func requiredDictionaries(
+    api: UnsafeMutablePointer<RimeApi>, schemaID: String, requiringTranslator required: String?
+) -> (dictionaries: [String], prisms: [String]) {
     var config = RimeConfig()
     guard api.pointee.schema_open(schemaID, &config) != 0 else { fail("cannot open compiled schema \(schemaID)") }
     defer { _ = api.pointee.config_close(&config) }
@@ -202,8 +208,12 @@ func requiredDictionaries(api: UnsafeMutablePointer<RimeApi>, schemaID: String) 
     }
     var namespaces = ["translator", "reverse_lookup"]
     let translators = api.pointee.config_list_size(&config, "engine/translators")
-    for index in 0..<translators {
-        guard let component = string("engine/translators/@\(index)") else { continue }
+    let components = (0..<max(translators, 0)).compactMap { string("engine/translators/@\($0)") }
+    // A patch librime merged without the learned translator must never pass as a deploy.
+    if let required, !components.contains(required) {
+        fail("compiled build/\(schemaID).schema.yaml engine/translators lacks \(required): \(components)")
+    }
+    for component in components {
         for prefix in ["script_translator@", "table_translator@"] where component.hasPrefix(prefix) {
             let tag = String(component.dropFirst(prefix.count))
             guard DeployManifest.isSafeName(tag) else { fail("translator tag is not a plain name: \(component)") }
@@ -272,7 +282,8 @@ func deploy(_ options: Options) {
         api.pointee.initialize(&traits)
         defer { api.pointee.finalize() }
         guard schemaLoads(api: api, schemaID: options.schemaID) else { fail("schema \(options.schemaID) does not load") }
-        return requiredDictionaries(api: api, schemaID: options.schemaID)
+        return requiredDictionaries(
+            api: api, schemaID: options.schemaID, requiringTranslator: options.luaFile == nil ? nil : learnedTranslator)
     }
 
     for name in DeployManifest.requiredOutputPaths(schemaID: options.schemaID, dictionaries: dictionaries, prisms: prisms) {

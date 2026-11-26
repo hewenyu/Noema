@@ -34,22 +34,81 @@ public struct LearningCommitEvent: Sendable, Hashable {
 
     /// The canonical `(pinyin_norm, pinyin_compact, text)` of this event, or nil when it is
     /// not learnable: no Han character, a control character (tab, newline) in the text, an
-    /// empty or oversized spelling. Leading and trailing punctuation, symbols, and spaces are
-    /// trimmed first (`nihao,` commits `你好，`; `你好` is learned). The preedit supplies the
-    /// syllable breaks when it spells the same letters as the raw input; otherwise the raw
-    /// input is used as one run.
+    /// oversized text, or a spelling that is not verifiably full Mandarin pinyin. Leading
+    /// and trailing punctuation, symbols, and spaces are trimmed first (`nihao,` commits
+    /// `你好，`; `你好` is learned). `pinyinNorm` is always one standard Mandarin syllable
+    /// (`TextNormalization.standardMandarinSyllables`) per Han character, never abbreviated
+    /// initials or raw double-pinyin keys; see `canonicalSyllables`.
     public func normalized() -> (pinyinNorm: String, pinyinCompact: String, text: String)? {
         let text = Self.trimmingEdgePunctuation(self.text)
         guard !text.isEmpty, text.unicodeScalars.count <= Self.maximumTextScalars,
               TextNormalization.containsHanCharacters(text),
-              !text.unicodeScalars.contains(where: { $0.properties.generalCategory == .control })
+              !text.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }),
+              let syllables = Self.canonicalSyllables(text: text, preedit: preedit, rawInput: rawInput)
         else { return nil }
-        let rawKey = TextNormalization.tonelessPinyinKey(rawInput)
-        let rawCompact = TextNormalization.compactPinyinKey(rawInput)
-        let preeditKey = TextNormalization.tonelessPinyinKey(preedit)
-        let key = !preeditKey.isEmpty && TextNormalization.compactPinyinKey(preedit) == rawCompact ? preeditKey : rawKey
+        let key = syllables.joined(separator: " ")
         guard !key.isEmpty, key.unicodeScalars.count <= Self.maximumPinyinScalars else { return nil }
-        return (key, TextNormalization.compactPinyinKey(key), text)
+        return (key, syllables.joined(), text)
+    }
+
+    /// The full-pinyin syllables of the Han characters of `text`, one per character, or nil.
+    /// The preedit's syllables (`tonelessPinyinKey`; a double-pinyin schema's preedit
+    /// already spells full pinyin, `uijx` shows `shi jia`) are checked one by one against
+    /// the system's Mandarin reading of `text` (`mandarinPinyinSyllables`):
+    /// - equal to the reading, or a standard syllable the reading does not start with (the
+    ///   user's own polyphone reading, `hang` in `hang ye` for 行业): kept as typed;
+    /// - a proper prefix of the reading (jianpin: `n h` for 女孩, `shi j` for 时间): the
+    ///   reading (`nv hai`, `shi jian`);
+    /// - anything else (`x y` for 你好): nil, the commit is not learned.
+    /// Without a reading (a character the transform does not know), every preedit syllable
+    /// must be standard. When the preedit does not give one syllable per Han character (it
+    /// held Han text, or was empty), the raw input must spell the reading as consecutive
+    /// prefixes (`nihao`, `nh` for 你好 and 女孩), and the reading is used.
+    static func canonicalSyllables(text: String, preedit: String, rawInput: String) -> [String]? {
+        var han = String.UnicodeScalarView()
+        han.append(contentsOf: text.unicodeScalars.filter(TextNormalization.isHanIdeograph))
+        let count = han.count
+        let reading = TextNormalization.mandarinPinyinSyllables(for: String(han))
+        let typed = TextNormalization.tonelessPinyinKey(preedit).split(separator: " ").map { syllable in
+            // `lue`/`nue` is how many schemas spell `lve`/`nve`.
+            syllable == "lue" || syllable == "nue" ? String(syllable.prefix(1)) + "ve" : String(syllable)
+        }
+        if typed.count == count {
+            var result: [String] = []
+            for (index, observed) in typed.enumerated() {
+                if let full = reading?[index], full != observed, full.hasPrefix(observed) {
+                    result.append(full)
+                } else if reading?[index] == observed || TextNormalization.isStandardMandarinSyllable(observed) {
+                    result.append(observed)
+                } else {
+                    return nil
+                }
+            }
+            return result
+        }
+        guard let reading else { return nil }
+        let raw = Array(TextNormalization.compactPinyinKey(rawInput).utf8)
+        return spellsAsPrefixes(raw, of: reading.map { Array($0.utf8) }) ? reading : nil
+    }
+
+    /// Whether `raw` splits into `syllables.count` non-empty runs, each a prefix of its
+    /// syllable in order (`shij` of `shi jian`, `nihao` of `ni hao`).
+    static func spellsAsPrefixes(_ raw: [UInt8], of syllables: [[UInt8]]) -> Bool {
+        // reachable[i]: the first i bytes of `raw` are consumed by the syllables so far.
+        var reachable = [Bool](repeating: false, count: raw.count + 1)
+        reachable[0] = true
+        for syllable in syllables {
+            var next = [Bool](repeating: false, count: raw.count + 1)
+            for start in 0..<raw.count where reachable[start] {
+                var length = 0
+                while length < syllable.count, start + length < raw.count, raw[start + length] == syllable[length] {
+                    length += 1
+                    next[start + length] = true
+                }
+            }
+            reachable = next
+        }
+        return !raw.isEmpty && reachable[raw.count]
     }
 
     /// `text` without leading and trailing Unicode punctuation (`P*`), symbols (`S*`),

@@ -8,7 +8,8 @@
 --   <compact pinyin>\t<text>\t<frequency>\n     (most frequent first)
 --
 -- `init` loads the file into a map keyed by compact pinyin, so each lookup is one table
--- index. The file is re-read only when its size changes (checked at most every few
+-- index. Typed input is looked up with the schema's `speller/delimiter` bytes removed and
+-- ASCII lowercased, so `ni'hao` finds `nihao`. The file is re-read only when its size changes (checked at most every few
 -- seconds); a rename(2) replacing it with equal size is picked up on the next `init`
 -- (each schema switch or session start). Malformed lines are skipped; caps bound memory.
 
@@ -69,9 +70,29 @@ local function refresh(env, force)
   end
 end
 
+-- The set of bytes of `speller/delimiter` (default " '"), as table keys: matched byte by
+-- byte, so no delimiter is ever read as a Lua pattern.
+local function delimiter_set(env)
+  local config = env.engine and env.engine.schema and env.engine.schema.config
+  local delimiter = config and config:get_string("speller/delimiter") or nil
+  if not delimiter or delimiter == "" then delimiter = " '" end
+  local set = {}
+  for index = 1, #delimiter do set[delimiter:sub(index, index)] = true end
+  return set
+end
+
+-- `input` without delimiter bytes, ASCII letters lowercased.
+local function lookup_key(input, delimiters)
+  local key = input:gsub(".", function(byte)
+    if delimiters[byte] then return "" end
+  end)
+  return (key:gsub("%u", string.lower))
+end
+
 local translator = {}
 
 function translator.init(env)
+  env.delimiters = delimiter_set(env)
   env.path = tsv_path()
   env.map = {}
   env.size = nil
@@ -81,7 +102,9 @@ end
 
 function translator.func(input, seg, env)
   refresh(env, false)
-  local list = env.map[input]
+  local key = lookup_key(input, env.delimiters)
+  if key == "" then return end
+  local list = env.map[key]
   if not list then return end
   for _, text in ipairs(list) do
     yield(Candidate("noema_learned", seg.start, seg._end, text, ""))

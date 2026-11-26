@@ -1,4 +1,7 @@
-/// Text helpers shared by lexicon import and learning (pure Swift, no Foundation).
+import Foundation
+
+/// Text helpers shared by lexicon import and learning (pure Swift; Foundation only for the
+/// Han-Latin transform of `mandarinPinyinSyllables`).
 public enum TextNormalization {
     /// Collapses each run of Unicode whitespace to one ASCII space and trims both ends.
     public static func collapsingWhitespace(_ text: String) -> String {
@@ -53,7 +56,7 @@ public enum TextNormalization {
         text.unicodeScalars.contains(where: isHanIdeograph)
     }
 
-    static func isHanIdeograph(_ scalar: Unicode.Scalar) -> Bool {
+    public static func isHanIdeograph(_ scalar: Unicode.Scalar) -> Bool {
         hanIdeographRanges.contains { $0.contains(scalar.value) }
     }
 
@@ -130,5 +133,58 @@ public enum TextNormalization {
     /// The number of syllables of a `tonelessPinyinKey` result.
     public static func syllableCount(ofPinyinKey key: String) -> Int {
         key.isEmpty ? 0 : key.unicodeScalars.reduce(1) { $0 + ($1 == " " ? 1 : 0) }
+    }
+
+    /// Every toneless Standard Mandarin syllable in `tonelessPinyinKey` spelling (`ü` as
+    /// `v`: `lv`, `lve`, `nv`, `nve`), the closed set a full-pinyin learning key is made of.
+    /// Bare initials (`b`, `n`, `zh`, ...) and the syllabic nasals `m`, `n`, `ng`, `hm`,
+    /// `hng` are not in it, so an abbreviated (jianpin) spelling never passes for one.
+    public static let standardMandarinSyllables: Set<String> = Set("""
+        a ai an ang ao e ei en eng er o ou
+        ba bai ban bang bao bei ben beng bi bian biao bie bin bing bo bu
+        pa pai pan pang pao pei pen peng pi pian piao pie pin ping po pou pu
+        ma mai man mang mao me mei men meng mi mian miao mie min ming miu mo mou mu
+        fa fan fang fei fen feng fo fou fu
+        da dai dan dang dao de dei den deng di dia dian diao die ding diu dong dou du duan dui dun duo
+        ta tai tan tang tao te tei teng ti tian tiao tie ting tong tou tu tuan tui tun tuo
+        na nai nan nang nao ne nei nen neng ni nian niang niao nie nin ning niu nong nou nu nuan nun nuo nv nve
+        la lai lan lang lao le lei leng li lia lian liang liao lie lin ling liu lo long lou lu luan lun luo lv lve
+        ga gai gan gang gao ge gei gen geng gong gou gu gua guai guan guang gui gun guo
+        ka kai kan kang kao ke kei ken keng kong kou ku kua kuai kuan kuang kui kun kuo
+        ha hai han hang hao he hei hen heng hong hou hu hua huai huan huang hui hun huo
+        ji jia jian jiang jiao jie jin jing jiong jiu ju juan jue jun
+        qi qia qian qiang qiao qie qin qing qiong qiu qu quan que qun
+        xi xia xian xiang xiao xie xin xing xiong xiu xu xuan xue xun
+        zha zhai zhan zhang zhao zhe zhei zhen zheng zhi zhong zhou zhu zhua zhuai zhuan zhuang zhui zhun zhuo
+        cha chai chan chang chao che chen cheng chi chong chou chu chua chuai chuan chuang chui chun chuo
+        sha shai shan shang shao she shei shen sheng shi shou shu shua shuai shuan shuang shui shun shuo
+        ran rang rao re ren reng ri rong rou ru rua ruan rui run ruo
+        za zai zan zang zao ze zei zen zeng zi zong zou zu zuan zui zun zuo
+        ca cai can cang cao ce cen ceng ci cong cou cu cuan cui cun cuo
+        sa sai san sang sao se sen seng si song sou su suan sui sun suo
+        ya yan yang yao ye yi yin ying yo yong you yu yuan yue yun
+        wa wai wan wang wei wen weng wo wu
+        """.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init))
+
+    /// Whether `syllable` is one of `standardMandarinSyllables` (`ni`, `lv`, `er`; not `n`, `zh`).
+    public static func isStandardMandarinSyllable(_ syllable: String) -> Bool {
+        standardMandarinSyllables.contains(syllable)
+    }
+
+    /// The toneless Mandarin reading of all-Han `text`, one `standardMandarinSyllables`
+    /// entry per character, from the system's Han-Latin transform (CFStringTransform,
+    /// `kCFStringTransformMandarinLatin`): "女孩" -> ["nv", "hai"], "时间" -> ["shi", "jian"].
+    /// Nil when `text` is empty or not all Han, or the reading is not one standard syllable
+    /// per character. The Latin result goes through `tonelessPinyinKey`, which turns `ü`
+    /// (precomposed, or `u` + U+0308) into `v` before it drops other marks; stripping all
+    /// combining marks first would read `nǚ` as `nu`. A polyphone gets the transform's
+    /// reading (银行 -> `yin xing`), so callers prefer a verified typed spelling.
+    public static func mandarinPinyinSyllables(for text: String) -> [String]? {
+        guard isAllHanIdeographs(text) else { return nil }
+        let latin = NSMutableString(string: text)
+        guard CFStringTransform(latin, nil, kCFStringTransformMandarinLatin, false) else { return nil }
+        let syllables = tonelessPinyinKey(latin as String).split(separator: " ").map(String.init)
+        guard syllables.count == text.unicodeScalars.count, syllables.allSatisfy(isStandardMandarinSyllable) else { return nil }
+        return syllables
     }
 }

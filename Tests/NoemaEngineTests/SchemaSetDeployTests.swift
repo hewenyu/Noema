@@ -111,21 +111,58 @@ import Testing
     @Test func translatorPatchCreatesMergesOrRefuses() {
         defer { cleanUp() }
         let component = "lua_translator@*noema_learned"
-        let line = "\"engine/translators/@after last\": \"\(component)\""
-        #expect(SchemaPatch.appendingTranslator(component, to: nil) == "patch:\n  \(line)\n")
+        let key = "\"engine/translators/+\":"
+        let item = "- \"\(component)\""
+        #expect(SchemaPatch.appendingTranslator(component, to: nil) == "patch:\n  \(key)\n    \(item)\n")
         #expect(SchemaPatch.appendingTranslator(component, to: "# mine\npatch:\n    \"menu/page_size\": 9\nfoo: 1") ==
-                "# mine\npatch:\n    \(line)\n    \"menu/page_size\": 9\nfoo: 1\n")
+                "# mine\npatch:\n    \(key)\n      \(item)\n    \"menu/page_size\": 9\nfoo: 1\n")
         #expect(SchemaPatch.appendingTranslator(component, to: "patch: # c\n\n  # note\n  a: 1\n") ==
-                "patch: # c\n  \(line)\n\n  # note\n  a: 1\n")
-        #expect(SchemaPatch.appendingTranslator(component, to: "# only a comment\n") == "# only a comment\npatch:\n  \(line)\n")
-        let already = "patch:\n  \(line)\n"
+                "patch: # c\n  \(key)\n    \(item)\n\n  # note\n  a: 1\n")
+        #expect(SchemaPatch.appendingTranslator(component, to: "# only a comment\n") == "# only a comment\npatch:\n  \(key)\n    \(item)\n")
+        let already = "patch:\n  \(key)\n    \(item)\n"
         #expect(SchemaPatch.appendingTranslator(component, to: already) == already)
+        #expect(SchemaPatch.appendingTranslator(component, to: "# \"\(component)\"\npatch:\n  a: 1\n") ==
+                "# \"\(component)\"\npatch:\n  \(key)\n    \(item)\n  a: 1\n", "a comment names nothing")
         #expect(SchemaPatch.appendingTranslator(component, to: "patch: {a: 1}\n") == nil, "flow style is refused")
         #expect(SchemaPatch.appendingTranslator(component, to: "patch:\n\ta: 1\n") == nil, "tab indentation is refused")
+        #expect(SchemaPatch.appendingTranslator(component, to: "patch:\n  a: 1\n\tb: 2\n") == nil, "tab indentation is refused")
         // CRLF files (written on Windows) are merged, not refused, and keep their line endings.
         #expect(SchemaPatch.appendingTranslator(component, to: "# mine\r\npatch:\r\n  a: 1\r\n") ==
-                "# mine\r\npatch:\r\n  \(line)\r\n  a: 1\r\n")
+                "# mine\r\npatch:\r\n  \(key)\r\n    \(item)\r\n  a: 1\r\n")
         #expect(SchemaPatch.isTopLevelPatchKey("patch:\r") && SchemaPatch.isTopLevelPatchKey("patch: # c\r"))
+    }
+
+    /// A user patch that already appends translators keeps its own keys: `@after last` stays
+    /// beside the new `engine/translators/+` key, an existing `engine/translators/+` block
+    /// sequence (quoted or not, items indented or not) gets the item, and no key is ever
+    /// written twice. An inline value of that key is refused.
+    @Test func translatorPatchNeverDuplicatesAUserKey() {
+        defer { cleanUp() }
+        let component = "lua_translator@*noema_learned"
+        let item = "- \"\(component)\""
+        let afterLast = "patch:\n  \"engine/translators/@after last\": \"echo_translator\"\n"
+        #expect(SchemaPatch.appendingTranslator(component, to: afterLast) ==
+                "patch:\n  \"engine/translators/+\":\n    \(item)\n  \"engine/translators/@after last\": \"echo_translator\"\n")
+        let quoted = "patch:\n  \"engine/translators/+\":\n    - echo_translator\n  a: 1\n"
+        #expect(SchemaPatch.appendingTranslator(component, to: quoted) ==
+                "patch:\n  \"engine/translators/+\":\n    \(item)\n    - echo_translator\n  a: 1\n")
+        let plain = "patch:\n  engine/translators/+: # mine\n  # first\n  - echo_translator\n"
+        #expect(SchemaPatch.appendingTranslator(component, to: plain) ==
+                "patch:\n  engine/translators/+: # mine\n  \(item)\n  # first\n  - echo_translator\n")
+        let single = "patch:\n  'engine/translators/+':\n"
+        #expect(SchemaPatch.appendingTranslator(component, to: single) == "patch:\n  'engine/translators/+':\n    \(item)\n")
+        for keyCount in [afterLast, quoted, plain, single].compactMap({ SchemaPatch.appendingTranslator(component, to: $0) })
+            .map({ $0.components(separatedBy: "engine/translators/+").count - 1 }) {
+            #expect(keyCount == 1, "a patch key was duplicated")
+        }
+        #expect(SchemaPatch.appendingTranslator(component, to: "patch:\n  \"engine/translators/+\": [echo_translator]\n") == nil)
+        #expect(SchemaPatch.appendingTranslator(component, to: "patch:\n  engine/translators/+: echo_translator\n") == nil)
+        #expect(SchemaPatch.appendingTranslator(component, to: "patch:\n  engine/translators/+:\n    a: 1\n") == nil)
+        // Idempotent: patching the result again changes nothing.
+        for text in [afterLast, quoted, plain, single] {
+            let once = SchemaPatch.appendingTranslator(component, to: text)
+            #expect(once != nil && SchemaPatch.appendingTranslator(component, to: once) == once)
+        }
     }
 
     // MARK: Staging locks and the build switch
