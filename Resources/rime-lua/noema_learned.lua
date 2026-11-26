@@ -17,8 +17,8 @@
 -- `init` enables the translator only when the schema demonstrably is one (fail-closed,
 -- see `is_full_pinyin_schema`); elsewhere (double pinyin: Xiaohe `shui` is `sang shi`;
 -- Wubi, Cangjie, Zhuyin, Jyutping) it loads nothing and yields nothing, and the schema's
--- own userdb, which the guardian fills under full pinyin and the speller projects onto
--- the schema's keys, still serves the learned phrases.
+-- own userdb, which the guardian fills in the dictionary's spelling (`ni hao`, or 万象's
+-- toned `ní hào`) and the speller projects onto the schema's keys, still serves them.
 
 local MAX_FILE_BYTES = 32 * 1024 * 1024
 local MAX_PER_KEY = 8
@@ -108,11 +108,23 @@ local NON_FULL_PINYIN_NAMES = {
 }
 
 -- Standard Mandarin syllables whose initials and finals every double-pinyin layout (and
--- every Zhuyin or other key remapping) rewrites.
+-- every Zhuyin or other key remapping) rewrites, each with a Unicode-toned reading: a toned
+-- dictionary (万象, 薄荷: `ní hào`) feeds the speller toned syllables, a toneless one plain.
 local PROBE_SYLLABLES = {
-  "ni", "hao", "shui", "zhong", "sang", "shi", "jian", "chuan", "guang", "zhuang",
-  "chang", "sheng", "qiong", "huang", "ang", "er", "ai", "ou",
+  { "ni", "ní" }, { "hao", "hǎo" }, { "shui", "shuǐ" }, { "zhong", "zhōng" }, { "sang", "sāng" },
+  { "shi", "shì" }, { "jian", "jiàn" }, { "chuan", "chuān" }, { "guang", "guāng" },
+  { "zhuang", "zhuàng" }, { "chang", "cháng" }, { "sheng", "shēng" }, { "qiong", "qióng" },
+  { "huang", "huáng" }, { "ang", "áng" }, { "er", "ér" }, { "ai", "ài" }, { "ou", "ōu" },
 }
+
+-- Spellings kept per probe syllable while replaying `speller/algebra`: bounds a pathological
+-- algebra; 万象's full-pinyin algebra keeps well under it.
+local MAX_FORMS = 64
+
+-- `speller_keeps_full_pinyin` results by algebra text: the replay (a few ms on 万象's ~95
+-- rules) runs once per algebra, not on every session `init`. Bounded; cleared when full.
+local MAX_CACHED_ALGEBRAS = 16
+local algebra_cache, cached_algebras = {}, 0
 
 -- Whether the primary translator is an untagged `script_translator`: one is listed and no
 -- untagged `table_translator` is (the primary translator of Wubi, Cangjie, Stroke, and
@@ -147,38 +159,84 @@ local function has_non_full_pinyin_name(env, config)
 end
 
 -- Whether every probe syllable, typed as is, is still a spelling after `speller/algebra`.
--- `derive`, `fuzz`, and `abbrev` keep the original spelling, so only the rules that
--- replace or drop it (`xform`, `xlit`, `erase`) are replayed, in order, through
--- librime's own `Projection` (Xiaohe: `shui` becomes `uv`, `sang` becomes `sh`). Without
--- `Projection` any such rule disables the translator.
+-- Replays the algebra as librime builds a syllabary's spellings: rule by rule, in order, over
+-- the set of spellings of each probe (its toneless and toned forms), each rule through its own
+-- librime `Projection`. `xform` and `xlit` replace a spelling, `erase` drops the ones it
+-- matches, and `derive`, `fuzz`, and `abbrev` add their result beside the original. So 万象's
+-- `xform/^([a-z]+)$/$1④/` + `xlit/①②③④/7890` (`ni` becomes `ni0`) and its later
+-- `derive/(.+)(\d)/$1/` (`ni` again) keep full pinyin, while Xiaohe's `xform/^sh/…/` (`shui`
+-- becomes `uv`) does not. An unknown operator, or no `Projection`, disables the translator.
 local function speller_keeps_full_pinyin(config)
   local algebra = config:get_list("speller/algebra")
   if not algebra or algebra.size == 0 then return true end
-  local replacing = {}
+  local rules = {}
   for index = 0, algebra.size - 1 do
     local item = algebra:get_value_at(index)
     local rule = item and item.value
     if not rule then return false end
     local operator = rule:match("^(%a+)[^%w%s]")
-    if operator == "xform" or operator == "xlit" or operator == "erase" then
-      replacing[#replacing + 1] = rule
-    elseif operator ~= "derive" and operator ~= "fuzz" and operator ~= "abbrev" then
+    if operator ~= "xform" and operator ~= "xlit" and operator ~= "erase"
+      and operator ~= "derive" and operator ~= "fuzz" and operator ~= "abbrev" then
       return false
     end
+    rules[#rules + 1] = { operator = operator, rule = rule }
   end
-  if #replacing == 0 then return true end
   if not (Projection and ConfigList and ConfigValue) then return false end
+  local texts = {}
+  for index, entry in ipairs(rules) do texts[index] = entry.rule end
+  local key = table.concat(texts, "\n")
+  if algebra_cache[key] ~= nil then return algebra_cache[key] end
   local ok, keeps = pcall(function()
-    local list = ConfigList()
-    for _, rule in ipairs(replacing) do list:append(ConfigValue(rule).element) end
-    local projection = Projection()
-    if not projection:load(list) then return false end
-    for _, syllable in ipairs(PROBE_SYLLABLES) do
-      if projection:apply(syllable, true) ~= syllable then return false end
+    for _, entry in ipairs(rules) do
+      local list = ConfigList()
+      list:append(ConfigValue(entry.rule).element)
+      local projection = Projection()
+      if not projection:load(list) then return false end
+      entry.projection = projection
+    end
+    for _, probe in ipairs(PROBE_SYLLABLES) do
+      local forms, seen = {}, {}
+      for _, form in ipairs(probe) do
+        if not seen[form] then
+          seen[form] = true
+          forms[#forms + 1] = form
+        end
+      end
+      for _, entry in ipairs(rules) do
+        local operator, projection = entry.operator, entry.projection
+        local next_forms, next_seen = {}, {}
+        local function keep(form)
+          if form ~= "" and not next_seen[form] and #next_forms < MAX_FORMS then
+            next_seen[form] = true
+            next_forms[#next_forms + 1] = form
+          end
+        end
+        for _, form in ipairs(forms) do
+          local result = projection:apply(form, true)
+          if operator == "xform" or operator == "xlit" then
+            keep(result)
+          elseif operator == "erase" then
+            if result ~= "" then keep(form) end
+          else
+            keep(form)
+            keep(result)
+          end
+        end
+        forms = next_forms
+      end
+      local found = false
+      for _, form in ipairs(forms) do
+        if form == probe[1] then found = true end
+      end
+      if not found then return false end
     end
     return true
   end)
-  return ok and keeps == true
+  local result = ok and keeps == true
+  if cached_algebras >= MAX_CACHED_ALGEBRAS then algebra_cache, cached_algebras = {}, 0 end
+  algebra_cache[key] = result
+  cached_algebras = cached_algebras + 1
+  return result
 end
 
 -- True only for a schema whose raw input spells full pinyin: an untagged `script_translator`

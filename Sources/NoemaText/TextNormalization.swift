@@ -187,4 +187,96 @@ public enum TextNormalization {
         guard syllables.count == text.unicodeScalars.count, syllables.allSatisfy(isStandardMandarinSyllable) else { return nil }
         return syllables
     }
+
+    // MARK: Unicode-toned pinyin
+
+    /// The Unicode-toned Mandarin reading of all-Han `text`, one syllable per character, as
+    /// the system's Han-Latin transform spells it: NFC, precomposed tone marks, `ü` kept
+    /// (`ǖǘǚǜ`, `lüè`), `u` after j/q/x/y (`xué`), the neutral tone unmarked (`de`).
+    /// "霓昊" -> ["ní", "hào"], "女孩" -> ["nǚ", "hái"]. Nil under the same conditions as
+    /// `mandarinPinyinSyllables`; a polyphone gets the transform's reading (银行 -> `yín xíng`).
+    public static func unicodeTonedMandarinPinyinSyllables(for text: String) -> [String]? {
+        guard isAllHanIdeographs(text) else { return nil }
+        let latin = NSMutableString(string: text)
+        guard CFStringTransform(latin, nil, kCFStringTransformMandarinLatin, false) else { return nil }
+        let syllables = (latin as String).precomposedStringWithCanonicalMapping.lowercased()
+            .split(separator: " ").map(String.init)
+        guard syllables.count == text.unicodeScalars.count,
+              syllables.allSatisfy({ isStandardMandarinSyllable(tonelessPinyinKey($0)) })
+        else { return nil }
+        return syllables
+    }
+
+    /// `pinyinNorm` (toneless, `ü` as `v`) spelled with Unicode tone marks for a dictionary
+    /// whose codes carry them (万象, 薄荷): "ni hao" + "霓昊" -> "ní hào", "nv hai" + "女孩"
+    /// -> "nǚ hái", "lve" + "略" -> "lüè". Each syllable takes the transform's toned reading
+    /// of its character when that reading is the typed one; otherwise (a polyphone read the
+    /// other way, 银行 typed `yin hang`; text that does not align one Han character per
+    /// syllable) it takes `defaultTonedSyllable`, a tone the syllable is read with, so the
+    /// code is one the dictionary's syllabary holds and its speller maps back to the typed
+    /// toneless spelling. Syllables that are not standard Mandarin are kept as they are.
+    public static func unicodeTonedPinyinKey(pinyinNorm: String, text: String) -> String {
+        let bases = pinyinNorm.split(separator: " ").map { canonicalUmlaut(String($0)) }
+        let han = String(String.UnicodeScalarView(text.unicodeScalars.filter(isHanIdeograph)))
+        let readings = han.unicodeScalars.count == bases.count ? unicodeTonedMandarinPinyinSyllables(for: han) : nil
+        return bases.enumerated().map { index, base in
+            if let reading = readings?[index], canonicalUmlaut(tonelessPinyinKey(reading)) == base { return reading }
+            return isStandardMandarinSyllable(base) ? defaultTonedSyllable(base) : base
+        }.joined(separator: " ")
+    }
+
+    /// `lue`/`nue` (a typed `ü` written `u`) as `lve`/`nve`; other syllables unchanged.
+    static func canonicalUmlaut(_ syllable: String) -> String {
+        switch syllable {
+        case "lue": "lve"
+        case "nue": "nve"
+        default: syllable
+        }
+    }
+
+    /// The tone (5: neutral) of each standard syllable with no first-tone reading, the first
+    /// of tones 2, 3, 4, neutral it is read with (CJK Unified Ideographs and Extension A
+    /// through the Han-Latin transform); `zhei` (这) is read `zhèi`. Every other standard
+    /// syllable defaults to the first tone. Each result is a syllable of the 万象 v18.2.1
+    /// dictionaries.
+    static let defaultTones: [String: Int] = [
+        "ce": 4, "cou": 4, "den": 4, "dia": 3, "ei": 2, "er": 2, "fo": 2, "fou": 2, "gei": 3, "gun": 3,
+        "hen": 2, "huai": 2, "ken": 3, "kuai": 3, "kuo": 4, "lai": 2, "lan": 2, "le": 4, "lia": 3, "lian": 2,
+        "liang": 2, "lie": 3, "ling": 2, "lo": 5, "long": 2, "luan": 2, "lv": 2, "lve": 4, "mai": 2, "mei": 2,
+        "mian": 2, "min": 2, "ming": 2, "miu": 4, "mu": 2, "na": 2, "nai": 2, "ne": 4, "nei": 3, "nen": 4,
+        "neng": 2, "niang": 2, "niao": 3, "nin": 2, "ning": 2, "nong": 2, "nou": 2, "nu": 2, "nuan": 2, "nun": 2,
+        "nuo": 2, "nv": 3, "nve": 4, "qiong": 2, "ran": 2, "rang": 2, "rao": 2, "re": 3, "ren": 2, "ri": 4,
+        "rong": 2, "rou": 2, "ru": 2, "rua": 2, "ruan": 2, "rui": 2, "run": 2, "ruo": 2, "shei": 2, "shui": 2,
+        "shun": 3, "te": 4, "ze": 2, "zei": 2, "zhei": 4, "zhuai": 3,
+    ]
+
+    /// A Unicode-toned reading of the toneless standard syllable `syllable`: tone
+    /// `defaultTones[syllable]`, else the first ("hang" -> "hāng", "lve" -> "lüè").
+    public static func defaultTonedSyllable(_ syllable: String) -> String {
+        applyToneMark(to: syllable, tone: defaultTones[syllable] ?? 1)
+    }
+
+    /// `syllable` (toneless, `ü` as `v`) with the standard pinyin tone mark for `tone` 1–4
+    /// (any other tone: none), NFC: the mark goes on `a` or `e`, else on the `o` of `ou`,
+    /// else on the last of `i`, `o`, `u`, `ü`. `v` after `n`/`l` is written `ü`
+    /// ("nv", 3 -> "nǚ"; "lve", 4 -> "lüè"; "gui", 4 -> "guì"; "liu", 2 -> "liú").
+    public static func applyToneMark(to syllable: String, tone: Int) -> String {
+        var letters = Array(syllable)
+        for index in letters.indices where letters[index] == "v" && index > 0 && "nl".contains(letters[index - 1]) {
+            letters[index] = "ü"
+        }
+        guard (1...4).contains(tone) else { return String(letters) }
+        var target = letters.firstIndex(of: "a") ?? letters.firstIndex(of: "e")
+        if target == nil, let o = letters.firstIndex(of: "o"), o + 1 < letters.count, letters[o + 1] == "u" { target = o }
+        if target == nil { target = letters.lastIndex { "iouü".contains($0) } }
+        guard let target, let marked = toneMarks[letters[target]] else { return String(letters) }
+        letters[target] = marked[tone - 1]
+        return String(letters)
+    }
+
+    /// Each vowel's precomposed (NFC) forms for tones 1–4.
+    static let toneMarks: [Character: [Character]] = [
+        "a": ["ā", "á", "ǎ", "à"], "e": ["ē", "é", "ě", "è"], "i": ["ī", "í", "ǐ", "ì"],
+        "o": ["ō", "ó", "ǒ", "ò"], "u": ["ū", "ú", "ǔ", "ù"], "ü": ["ǖ", "ǘ", "ǚ", "ǜ"],
+    ]
 }

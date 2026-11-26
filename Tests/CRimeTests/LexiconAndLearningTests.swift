@@ -266,7 +266,7 @@ extension LibrimeSerializedTests {
             let report = try await engine.switchSchemaSet(
                 to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: schemaID,
                 learningStore: store, luaFile: LexiconWorkspace.lua)
-            #expect(engine.currentState.schemaID == schemaID && report.learnedLines == 2)
+            #expect(engine.currentState.schemaID == schemaID && report.learnedLines == 2 && report.userDictCodeFormat == .toneless)
             let live = try String(
                 contentsOf: workspace.setDir(.wanxiang).appending(path: "build/\(schemaID).schema.yaml"), encoding: .utf8)
             #expect(live.contains("lua_translator@*noema_learned"), "the deployer dropped the translator")
@@ -315,6 +315,136 @@ extension LibrimeSerializedTests {
             engine.resetSession()
             #expect(candidates(engine, "nihao").contains("霓昊"), "noema_learned.lua is off on a full-pinyin schema")
             #expect(candidates(engine, "ni'hao").contains("霓昊"))
+        }
+
+        /// A schema whose dictionary spells codes with Unicode tone marks, as 万象 v18.2.1's
+        /// does (Codex #4709690149): the guardian detects `.unicodeToned` from the compiled
+        /// `speller/algebra` and imports `learning.sqlite`'s toneless `pinyin_norm` spelled
+        /// that way (`ni hao` + 霓昊 -> `ní hào`; the polyphone 昊行 typed `hao hang` ->
+        /// `hào hāng`; `lve`/`nv` -> `lüè`/`nǚ`), so with no Lua translator real librime
+        /// serves each phrase on page 1, again after the userdb is corrupted and rebuilt from
+        /// the store. A toneless code (`ni hao`) is imported but never found.
+        @Test func tonedDictionaryUserDBServesLearnedPhrasesWithoutLua() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addTonedWanxiangSchema("wanxiang_toned", in: .wanxiang)
+            let engine = try workspace.engine(luaFile: nil)
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let learned = [("ni hao", "霓昊"), ("ni nv", "霓女"), ("hao hang", "昊行"), ("lve hao", "略昊"), ("chong hao", "重昊")]
+            #expect(try store.recordBatch(learned.map { pinyin, text in
+                LearningCommitEvent(rawInput: pinyin.replacingOccurrences(of: " ", with: ""), preedit: pinyin, text: text)
+            }) == learned.count)
+            func switchToToned() async throws -> SchemaSetSwitchReport {
+                try await engine.switchSchemaSet(
+                    to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: "wanxiang_toned",
+                    learningStore: store, luaFile: nil)
+            }
+            func expectPageOne(_ label: String) {
+                for (pinyin, text) in learned {
+                    let page = candidates(engine, pinyin.replacingOccurrences(of: " ", with: ""), pages: 1)
+                    #expect(page.contains(text), "\(label): \(text) is not on page 1 of \(pinyin): \(page)")
+                }
+            }
+
+            let report = try await switchToToned()
+            #expect(report.userDictCodeFormat == .unicodeToned && report.userDictName == "wanxiang_toned")
+            guard case .recovered(let rebuilt) = report.userDBOutcome else {
+                Issue.record("\(String(describing: report.userDBOutcome)), \(String(describing: report.userDBFailure))")
+                return
+            }
+            #expect(rebuilt.imported == learned.count)
+            #expect(try store.watermark(for: .wanxiang, dictName: "wanxiang_toned")?.codeFormat == "unicodeToned")
+            expectPageOne("projected")
+            let snapshot = try String(contentsOf: UserDBGuardian.snapshotURL(
+                "wanxiang_toned", in: NoemaPaths.userDBSnapshotsDir(.wanxiang, root: workspace.user)), encoding: .utf8)
+            for line in ["霓昊\tní hào\t", "霓女\tní nǚ\t", "昊行\thào hāng\t", "略昊\tlüè hào\t", "重昊\tchōng hào\t"] {
+                #expect(snapshot.contains(line), "\(line) is not in the userdb: \(snapshot)")
+            }
+
+            // Corrupt the userdb (and drop its snapshot): the rebuild from the store serves them again.
+            try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store)
+            try FileManager.default.removeItem(at: NoemaPaths.userDBSnapshotsDir(.wanxiang, root: workspace.user))
+            try #require(!LevelDBCorruption.current.apply(to: workspace.setDir(.wanxiang).appending(path: "wanxiang_toned.userdb")).isEmpty)
+            let again = try await switchToToned()
+            guard case .recovered(let recovery) = again.userDBOutcome else {
+                Issue.record("\(String(describing: again.userDBOutcome)), \(String(describing: again.userDBFailure))")
+                return
+            }
+            #expect(recovery.method == .fullRebuild && recovery.quarantined != nil && recovery.imported == learned.count)
+            expectPageOne("rebuilt")
+
+            // The toneless fixtures of the other sets keep toneless codes.
+            let ice = try await engine.switchSchemaSet(
+                to: .rimeIce, sharedDataDir: workspace.schemaDir(.rimeIce), schemaID: "rime_ice_fixture", learningStore: store, luaFile: nil)
+            #expect(ice.userDictCodeFormat == .toneless && candidates(engine, "nihao", pages: 1).contains("霓昊"))
+        }
+
+        /// A healthy userdb projected with toneless codes, as before Noema matched the
+        /// dictionary's spelling (its watermark `toneless` at the latest revision; 万象 never
+        /// finds `ni hao`), is replayed in full, toned, once the schema's speller shows a toned
+        /// dictionary, though the store has not changed since.
+        @Test func userDBProjectedTonelessIsReprojectedToned() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addTonedWanxiangSchema("wanxiang_toned", algebra: nil, in: .wanxiang)
+            let engine = try workspace.engine(luaFile: nil)
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            func switchToToned() async throws -> SchemaSetSwitchReport {
+                try await engine.switchSchemaSet(
+                    to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: "wanxiang_toned",
+                    learningStore: store, luaFile: nil)
+            }
+            let toneless = try await switchToToned()
+            #expect(toneless.userDictCodeFormat == .toneless)
+            let mark = try #require(try store.watermark(for: .wanxiang, dictName: "wanxiang_toned"))
+            let latest = try store.latestRevision()
+            #expect(mark.codeFormat == "toneless" && mark.lastRevision == latest)
+            try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store)
+
+            try workspace.useAlgebra(LexiconWorkspace.wanxiangFullPinyinAlgebra, in: .wanxiang, schema: "wanxiang_toned")
+            let report = try await switchToToned()
+            #expect(report.userDictCodeFormat == .unicodeToned)
+            #expect(report.userDBOutcome == .healthy(projected: 1), "\(String(describing: report.userDBOutcome))")
+            #expect(try store.watermark(for: .wanxiang, dictName: "wanxiang_toned")?.codeFormat == "unicodeToned")
+            #expect(candidates(engine, "nihao", pages: 1).contains("霓昊"))
+        }
+
+        /// `noema_learned.lua` on 万象's toned full-pinyin algebra, where `ni` passes through
+        /// `ni0` and only a later `derive` restores it, stays on and serves a phrase only the
+        /// TSV holds for `nihao` and `ni'hao`; the same toned dictionary under 万象's 小鹤双拼
+        /// rules (a schema name with no double-pinyin marker) keeps it off: `shui` (`sang shi`)
+        /// offers 丧失 and never the TSV's 水, while `uv` offers 水 from the dictionary.
+        @Test func learnedTranslatorFollowsTonedSpellerAlgebra() async throws {
+            let workspace = try LexiconWorkspace()
+            try workspace.addTonedWanxiangSchema("wanxiang_toned", in: .wanxiang)
+            try workspace.addTonedWanxiangSchema("wanxiang_toned_custom", algebra: LexiconWorkspace.wanxiangXiaoheAlgebra, in: .wanxiang)
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            let full = try await engine.switchSchemaSet(
+                to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: "wanxiang_toned", luaFile: LexiconWorkspace.lua)
+            #expect(full.userDictCodeFormat == .unicodeToned)
+            #expect(try store.recordBatch([
+                LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊"),
+                LearningCommitEvent(rawInput: "shui", preedit: "shui", text: "水"),
+            ]) == 2)
+            #expect(!candidates(engine, "nihao").contains("霓昊"))
+            #expect(engine.refreshLearnedPhrases(from: store) == 2)
+            engine.resetSession()
+            #expect(candidates(engine, "nihao", pages: 1).contains("霓昊"), "noema_learned.lua is off on toned full pinyin")
+            #expect(candidates(engine, "ni'hao", pages: 1).contains("霓昊"))
+
+            let xiaohe = try await engine.switchSchemaSet(
+                to: .wanxiang, sharedDataDir: workspace.schemaDir(.wanxiang), schemaID: "wanxiang_toned_custom", luaFile: LexiconWorkspace.lua)
+            #expect(xiaohe.userDictCodeFormat == .unicodeToned)
+            let sangShi = candidates(engine, "shui")
+            #expect(sangShi.contains("丧失") && !sangShi.contains("水"), "noema_learned.lua served a full-pinyin key: \(sangShi)")
+            #expect(candidates(engine, "uv").contains("水"))
+            #expect(!candidates(engine, "nihao").contains("霓昊"))
         }
 
         /// Double pinyin and jianpin through real librime: 万象 runs `double_pinyin_flypy`'s
@@ -1050,6 +1180,130 @@ final class LexiconWorkspace {
             .replacingOccurrences(of: "  dictionary: \(fixture)", with: "  dictionary: jyutping_fixture"), "jyutping_fixture.schema.yaml", in: set)
         try write(dictionary("jyutping_fixture"), "jyutping_fixture.dict.yaml", in: set)
         try listSchema("jyutping_fixture", in: set)
+    }
+
+    /// 万象 v18.2.1's full-pinyin `speller/algebra` rules for its toned codes.
+    static let wanxiangFullPinyinAlgebra = #"""
+        - xform/^([a-z]+)$/$1④/
+        - xform/(ā|ē|ī|ō|ū|ǖ)([a-z]*)$/$1$2①/
+        - xform/(á|é|í|ó|ú|ǘ|ń|ḿ)([a-z]*)$/$1$2②/
+        - xform/(ǎ|ě|ǐ|ǒ|ǔ|ǚ|ň)([a-z]*)$/$1$2③/
+        - xform/(à|è|ì|ò|ù|ǜ|ǹ)([a-z]*)$/$1$2④/
+        - xlit/āáǎàēéěèīíǐìōóǒòūúǔùüǖǘǚǜńňǹḿ/aaaaeeeeiiiioooouuuuvvvvvnnnm/
+        - xlit/①②③④/7890
+        - derive/([nl])ve(\d)/$1ue$2/
+        - abbrev/^([qwrtypsdfghjklzxcbnm]).+$/$1/
+        - derive/(.+)(\d)/$1/
+        - derive/([zcs])h(a|e|i|u|ai|ei|an|en|ou|uo|ua|un|ui|uan|uai|uang|ang|eng|ong)$/h$1$2/
+        - derive/ong$/on/
+    """#
+    /// 万象 v18.2.1's 小鹤双拼 `speller/algebra`, verbatim.
+    static let wanxiangXiaoheAlgebra = #"""
+        - xform/Ⅲ//
+        - xform/^([a-z]+)$/$1④/
+        - xform/(ā|ē|ī|ō|ū|ǖ)([a-z]*)$/$1$2①/
+        - xform/(á|é|í|ó|ú|ǘ|ń|ḿ)([a-z]*)$/$1$2②/
+        - xform/(ǎ|ě|ǐ|ǒ|ǔ|ǚ|ň)([a-z]*)$/$1$2③/
+        - xform/(à|è|ì|ò|ù|ǜ|ǹ)([a-z]*)$/$1$2④/
+        - xform/m̄([a-z]*)$/m$1①/
+        - xform/m̀([a-z]*)$/m$1④/
+        - xlit/āáǎàēéěèīíǐìōóǒòūúǔùüǖǘǚǜńňǹḿ/aaaaeeeeiiiioooouuuuvvvvvnnnm/
+        - xlit/①②③④/7890
+        - xform/^ng(\d)/eng$1/
+        - xform/^n(\d)/en$1/
+        - xform/^m(\d)/me$1/
+        - derive/^([jqxy])u(\d)$/$1v$2/
+        - derive/^([aoe])([ioun])(\d)$/$1$1$2$3/
+        - xform/^([aoe])(ng)?(\d)$/$1$1$2$3/
+        - xform/iu(\d)$/Ⓠ$1/
+        - xform/(.)ei(\d)$/$1Ⓦ$2/
+        - xform/uan(\d)$/Ⓡ$1/
+        - xform/[uv]e(\d)$/Ⓣ$1/
+        - xform/un(\d)$/Ⓨ$1/
+        - xform/^sh/Ⓤ/
+        - xform/^ch/Ⓘ/
+        - xform/^zh/Ⓥ/
+        - xform/uo(\d)$/Ⓞ$1/
+        - xform/ie(\d)$/Ⓟ$1/
+        - xform/(.)i?ong(\d)$/$1Ⓢ$2/
+        - xform/(ing|uai)(\d)$/Ⓚ$2/
+        - xform/(.)ai(\d)$/$1Ⓓ$2/
+        - xform/(.)eng(\d)$/$1Ⓖ$2/
+        - xform/(.)en(\d)$/$1Ⓕ$2/
+        - xform/[iu]ang(\d)$/Ⓛ$1/
+        - xform/(.)ang(\d)$/$1Ⓗ$2/
+        - xform/ian(\d)$/Ⓜ$1/
+        - xform/(.)an(\d)$/$1Ⓙ$2/
+        - xform/(.)ou(\d)$/$1Ⓩ$2/
+        - xform/[iu]a(\d)$/Ⓧ$1/
+        - xform/iao(\d)$/Ⓝ$1/
+        - xform/(.)ao(\d)$/$1Ⓒ$2/
+        - xform/ui(\d)$/Ⓥ$1/
+        - xform/in(\d)$/Ⓑ$1/
+        - xlit/ⓆⓌⓇⓉⓎⓊⒾⓄⓅⓈⒹⒻⒼⒽⒿⓀⓁⓏⓍⒸⓋⒷⓃⓂ/qwrtyuiopsdfghjklzxcvbnm/
+        - xform/^(aj|ac|ad|ew|ef|oz)(\d?)$//
+        - derive/^(..)(\d)$/$1/
+        - derive/^(.).+(\d)$/$1$2/
+    """#
+
+    /// A 万象-shaped schema `schemaID` in `set` over `wanxiang_toned`, a dictionary whose
+    /// codes are spelled as 万象 v18.2.1's (`ní hào`, `nǚ hái`, `lüè`, the neutral tone
+    /// unmarked), with 万象 v18.2.1's full-pinyin `speller/algebra` rules for the spelling
+    /// (tone marks become digits, a toneless syllable becomes tone `0`, and only a later
+    /// `derive` restores the toneless spelling: `ni` is `ni0` in between) or, with `xiaohe`,
+    /// its 小鹤双拼 rules verbatim (`shuǐ` becomes `uv`); `algebra` nil keeps the fixture's
+    /// toneless speller.
+    func addTonedWanxiangSchema(
+        _ schemaID: String, algebra: String? = LexiconWorkspace.wanxiangFullPinyinAlgebra, in set: SchemaSetID
+    ) throws {
+        let dictionary = schemaDir(set).appending(path: "wanxiang_toned.dict.yaml")
+        if !FileManager.default.fileExists(atPath: dictionary.path) {
+            try write("""
+                ---
+                name: wanxiang_toned
+                version: "1"
+                sort: by_weight
+                use_preset_vocabulary: false
+                ...
+                你	nǐ	1000
+                好	hǎo	1000
+                霓	ní	100
+                昊	hào	100
+                泥	ní	500
+                你好	nǐ hǎo	100000
+                女	nǚ	1000
+                孩	hái	1000
+                女孩	nǚ hái	50000
+                绿	lǜ	1000
+                色	sè	1000
+                绿色	lǜ sè	50000
+                略	lüè	1000
+                行	xíng	1000
+                行	háng	800
+                夯	hāng	100
+                重	zhòng	1000
+                重	chóng	800
+                冲	chōng	1000
+                庆	qìng	1000
+                重庆	chóng qìng	50000
+                水	shuǐ	1000
+                丧	sāng	500
+                失	shī	500
+                丧失	sāng shī	100000
+                的	de	100000
+
+                """, "wanxiang_toned.dict.yaml", in: set)
+        }
+        try addSchema(schemaID, dictionary: "wanxiang_toned", in: set)
+        // Its own prism: schemas sharing a dictionary would otherwise share one speller's spellings.
+        try replace(in: set, "\(schemaID).schema.yaml", "  dictionary: wanxiang_toned\n",
+                    with: "  dictionary: wanxiang_toned\n  prism: \(schemaID)\n")
+        if let algebra { try useAlgebra(algebra, in: set, schema: schemaID) }
+    }
+
+    /// Replaces the fixture speller algebra of `schemaID` (`addTonedWanxiangSchema`) with `algebra`.
+    func useAlgebra(_ algebra: String, in set: SchemaSetID, schema schemaID: String) throws {
+        try replace(in: set, "\(schemaID).schema.yaml", "  algebra:\n    - derive/^([nl])ve$/$1ue/\n", with: "  algebra:\n" + algebra + "\n")
     }
 
     func appendToDictionary(of set: SchemaSetID, _ appendix: String) throws {

@@ -330,6 +330,40 @@ func permissions(_ url: URL) -> mode_t {
         let reread = try LearningStore(url: directory.store, mode: .readOnly)
         #expect(try reread.watermark(for: .mint, dictName: "dict_b")?.lastRevision == 1)
     }
+
+    /// A pre-release per-userdb `projection_watermarks` without `code_format`: a read-only
+    /// connection reads its rows as `toneless`; a read-write open adds the column, keeping
+    /// every row (all projected toneless), and records the spelling of later projections.
+    @Test func watermarksWithoutCodeFormatReadAsToneless() throws {
+        let directory = try TemporaryDirectory()
+        do {
+            let store = try LearningStore(url: directory.store)
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "你好")]) == 1)
+            store.close()
+        }
+        var db: OpaquePointer?
+        try #require(sqlite3_open(directory.store.path, &db) == SQLITE_OK)
+        let legacy = """
+            DROP TABLE projection_watermarks;
+            CREATE TABLE projection_watermarks(
+              schema_set TEXT NOT NULL, dict_name TEXT NOT NULL, last_revision INTEGER NOT NULL,
+              projected_count INTEGER NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY (schema_set, dict_name));
+            INSERT INTO projection_watermarks VALUES('wanxiang', 'wanxiang', 1, 1, 12);
+            """
+        #expect(sqlite3_exec(db, legacy, nil, nil, nil) == SQLITE_OK, "\(String(cString: sqlite3_errmsg(db)))")
+        sqlite3_close(db)
+
+        let reader = try LearningStore(url: directory.store, mode: .readOnly)
+        #expect(try reader.watermark(for: .wanxiang, dictName: "wanxiang")?.codeFormat == "toneless")
+        reader.close()
+        let store = try LearningStore(url: directory.store)
+        let mark = try #require(try store.watermark(for: .wanxiang, dictName: "wanxiang"))
+        #expect(mark.codeFormat == "toneless" && mark.lastRevision == 1)
+        try store.setWatermark(for: .wanxiang, dictName: "wanxiang", lastRevision: 1, projectedCount: 1, codeFormat: "unicodeToned")
+        store.close()
+        let again = try LearningStore(url: directory.store)
+        #expect(try again.watermark(for: .wanxiang, dictName: "wanxiang")?.codeFormat == "unicodeToned")
+    }
 }
 
 @Suite struct LearningStoreWriterTests {

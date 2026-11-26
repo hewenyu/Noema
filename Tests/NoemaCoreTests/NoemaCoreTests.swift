@@ -166,4 +166,51 @@ import Testing
         let scalar = try #require(Unicode.Scalar(value))
         #expect(!TextNormalization.isAllHanIdeographs(String(scalar)), "U+\(String(value, radix: 16, uppercase: true))")
     }
+
+    /// The transform's toned readings, NFC as 万象 v18.2.1's dictionaries spell them: `ü`
+    /// kept (`nǚ`, `lüè`), `u` after `x`, the neutral tone unmarked.
+    @Test func unicodeTonedReadings() {
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "霓昊") == ["ní", "hào"])
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "女孩") == ["nǚ", "hái"])
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "略") == ["lüè"])
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "学的") == ["xué", "de"])
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "你好a") == nil)
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "嗯") == nil)
+        #expect(TextNormalization.unicodeTonedMandarinPinyinSyllables(for: "") == nil)
+    }
+
+    /// Regular phrases, `ü`, polyphones (the typed reading wins: `hang` for 行, `chong` for
+    /// 重), and text that does not align one Han character per syllable. Every result is NFC.
+    @Test(arguments: [
+        ("ni hao", "霓昊", "ní hào"), ("ni hao", "你好", "nǐ hǎo"), ("shi jie", "世界", "shì jiè"),
+        ("nv hai", "女孩", "nǚ hái"), ("lv se", "绿色", "lǜ sè"), ("lve", "略", "lüè"), ("lue", "略", "lüè"),
+        ("nve dai", "虐待", "nüè dài"), ("xue", "学", "xué"), ("de", "的", "de"),
+        ("yin hang", "银行", "yín hāng"), ("hang ye", "行业", "hāng yè"), ("chong qing", "重庆", "chóng qìng"),
+        ("chong hao", "重昊", "chōng hào"), ("zhong yao", "重要", "zhòng yào"), ("ren hao", "人昊", "rén hào"),
+        ("lan hao", "蓝昊", "lán hào"), ("ni hao", "你好!", "nǐ hǎo"), ("ni hao", "你", "nī hāo"),
+        ("shui", "睡", "shuì"), ("shui", "谁", "shuí"),
+    ])
+    func unicodeTonedPinyinKey(_ norm: String, _ text: String, _ expected: String) {
+        let key = TextNormalization.unicodeTonedPinyinKey(pinyinNorm: norm, text: text)
+        #expect(Array(key.unicodeScalars) == Array(expected.precomposedStringWithCanonicalMapping.unicodeScalars), "\(key)")
+        #expect(TextNormalization.tonelessPinyinKey(key) == TextNormalization.tonelessPinyinKey(norm == "lue" ? "lve" : norm))
+    }
+
+    /// Every standard syllable gets a toned reading that maps back to it, with the standard
+    /// mark placement; one with no first-tone reading takes another tone.
+    @Test func defaultTonedSyllables() {
+        for syllable in TextNormalization.standardMandarinSyllables {
+            let toned = TextNormalization.defaultTonedSyllable(syllable)
+            #expect(TextNormalization.tonelessPinyinKey(toned) == syllable, "\(syllable) -> \(toned)")
+            #expect(toned == toned.precomposedStringWithCanonicalMapping)
+        }
+        for (syllable, expected) in [
+            ("hang", "hāng"), ("lan", "lán"), ("shui", "shuí"), ("lve", "lüè"), ("nv", "nǚ"), ("lv", "lǘ"),
+            ("zhei", "zhèi"), ("lo", "lo"), ("gui", "guī"), ("liu", "liū"), ("ou", "ōu"), ("er", "ér"),
+        ] {
+            #expect(TextNormalization.defaultTonedSyllable(syllable) == expected)
+        }
+        #expect(TextNormalization.applyToneMark(to: "xiong", tone: 2) == "xióng")
+        #expect(TextNormalization.applyToneMark(to: "nve", tone: 5) == "nüe")
+    }
 }

@@ -9,7 +9,7 @@ Noema is a Chinese input method for macOS 26+ on Apple Silicon (arm64), built fr
 | `librime.1.dylib` | Vendored C++ library | Rime with the `lua` and `octagram` plugins, dependencies static; `install_name` `@rpath/librime.1.dylib`. |
 | `CRime` | C target | Bridge to `rime_api.h`; `noema_rime_engine_api_available()` checks every member `RimeEngine` calls. |
 | `NoemaCore` | Swift library | Domain types (`KeyEvent`, `TypingEngine`, `SchemaSetID`); `NoemaPaths` (identifiers, directories); `NoemaLog` (never logs user text). |
-| `NoemaText` | Swift library | Text and toneless-pinyin normalization. |
+| `NoemaText` | Swift library | Text and pinyin normalization. |
 | `NoemaLearning` | Swift library | `learning.sqlite` (`LearningStore`, system SQLite, WAL), the non-blocking `LearningStoreWriter`, and the `noema_learned.tsv` exporter. Zero networking. |
 | `NoemaLexiconAdmin` | Swift library | `dictionaries.lock.json` validation, verified downloads, safe ZIP extraction, `LexiconInventory`. Agent and `noema-cli` only. |
 | `NoemaIPC` | Swift library | IME ⇄ agent IPC (see [Companion agent and IPC](#companion-agent-and-ipc)). Zero TCC. |
@@ -54,7 +54,7 @@ Rationale: [process model note](../.agents/notes/proposed/architecture/2026-11-2
 One root, `~/Library/Application Support/Noema/rime/`, holds the `.noema-rime.lock`, `learning.sqlite`, and `active-schema-set.json`. Each `SchemaSetID` (`builtin`, `wanxiang`, `rime-ice`, `mint`) runs with its own librime `user_data_dir` `sets/<set>/` (`build/`, userdbs, `lua/noema_learned.lua`, `noema_learned.tsv`); downloads extract to `schemas/<set>/`, models to `models/`. `EngineHost` boots the recorded set when installed, else `builtin`, and falls back once to `builtin` when the recorded set fails to boot.
 
 - **Learning** — `RimeEngine.recordCommits` queues Han commits to `LearningStoreWriter`, never under secure input; it writes off the main actor and flushes before shutdown and switches. Keys are full pinyin, one standard syllable per Han character (jianpin expanded from the system reading); unverifiable spellings and shape or non-Mandarin schemas (Wubi, Jyutping) are never learned.
-- **Switch** — `SchemaSetSwitcher` parks a request while composing (`pendingIdle`), deploys off the main actor (`compiling`), waits for idle again, then swaps librime (`ready` or `failed`). `UserDBGuardian` then probes the userdb with `export_user_dict`, restores a corrupt one from a SHA-256-verified snapshot or the store, and imports entries past that userdb's watermark, skipping non-Mandarin schemas; `noema_learned.tsv` is re-exported.
+- **Switch** — `SchemaSetSwitcher` parks a request while composing (`pendingIdle`), deploys off the main actor (`compiling`), waits for idle, then swaps librime (`ready` or `failed`). `UserDBGuardian` then probes the userdb, restores a corrupt one from a verified snapshot or the store, and imports entries past its watermark in the dictionary's spelling (toned for 万象), skipping non-Mandarin schemas; `noema_learned.tsv` is re-exported.
 - **Agent** — Settings › 词库 (`LexiconController`) reads the inventory and the store read-only, installs from the bundled lockfile, and sends `switchSchemaSet`.
 
 Rationale: [lexicon note](../.agents/notes/implemented/architecture/2026-11-23-lexicon-canonical-and-userdb-isolation.md).

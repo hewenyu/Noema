@@ -15,6 +15,9 @@ public struct SchemaSetSwitchReport: Sendable {
     /// Whether the target schema spells Mandarin pinyin. When false the guardian still checks
     /// the userdb but never projects `learning.sqlite` (full-pinyin keys) into it.
     public var isMandarinPinyinSchema: Bool
+    /// How the target schema's dictionary spells codes, the spelling the guardian projects
+    /// `learning.sqlite` in (`userDictCodeFormat(schemaID:)`).
+    public var userDictCodeFormat: UserDictCodeFormat
     /// The guardian's outcome; nil when it did not run (no levers API, no user dict).
     public var userDBOutcome: UserDBGuardian.MaintenanceOutcome?
     /// Why the guardian failed, if it did; the switch still completes.
@@ -46,7 +49,8 @@ extension RimeEngine {
     ///    until no composition is open, so the user's preedit is never destroyed.
     /// 2. `learningWriter.flush()`, arm the boot sentinel, destroy the session, finalize.
     /// 3. Initialize librime on the target; with no session open, `UserDBGuardian` checks
-    ///    the userdb and projects `learningStore` into it; export `noema_learned.tsv`.
+    ///    the userdb and projects `learningStore` into it, spelled as the schema's dictionary
+    ///    spells codes (`userDictCodeFormat`); export `noema_learned.tsv`.
     /// 4. Open a session on `schemaID`, disarm, save `active-schema-set.json`. If the target
     ///    will not open, the previous set is restored (or, failing that, Safe Mode) and this throws.
     @discardableResult
@@ -118,14 +122,17 @@ extension RimeEngine {
         // A shape or non-Mandarin schema's userdb is keyed by its own codes: the guardian
         // keeps it healthy but never fills it with full-pinyin entries or a watermark.
         let isPinyin = isMandarinPinyinSchema(schemaID: targetSchema)
+        let codeFormat = userDictCodeFormat(schemaID: targetSchema)
         var report = SchemaSetSwitchReport(
             schemaSetID: set, schemaID: targetSchema, userDictName: nil, isMandarinPinyinSchema: isPinyin,
-            userDBOutcome: nil, userDBFailure: nil, learnedLines: nil, linkedGram: linkedGram, savedActiveRecord: false)
+            userDictCodeFormat: codeFormat, userDBOutcome: nil, userDBFailure: nil, learnedLines: nil,
+            linkedGram: linkedGram, savedActiveRecord: false)
         if let dictName = userDictName(schemaID: targetSchema), let levers = RimeUserDictLevers() {
             report.userDictName = dictName
             let guardian = UserDBGuardian(
                 schemaSet: set, userDataDir: target.rimeUserDataDir,
-                snapshotsDir: NoemaPaths.userDBSnapshotsDir(set, root: target.userDataDir), levers: levers)
+                snapshotsDir: NoemaPaths.userDBSnapshotsDir(set, root: target.userDataDir), levers: levers,
+                codeFormat: codeFormat)
             do {
                 report.userDBOutcome = try guardian.maintain(dictName, store: isPinyin ? learningStore : nil)
             } catch {
@@ -192,6 +199,31 @@ extension RimeEngine {
             }
         }
         return nil
+    }
+
+    /// The NFC precomposed Mandarin tone-marked vowels (tones 1–4) a toned dictionary's
+    /// `speller/algebra` rewrites; a plain `ü` is not one.
+    nonisolated static let mandarinToneMarkedVowels: Set<Unicode.Scalar> = Set("āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜ".unicodeScalars)
+
+    /// How the compiled schema `schemaID`'s dictionary spells codes: `.unicodeToned` when a
+    /// `speller/algebra` rule names a Mandarin tone-marked vowel (万象's `xform/(ā|ē|…)…①/`,
+    /// 薄荷's `xlit/āáǎà…/aaaa…/`, both over 万象's `ní hào` dictionaries), else `.toneless`
+    /// (雾凇, `noema_pinyin`, `double_pinyin_flypy`, and a schema that will not open).
+    func userDictCodeFormat(schemaID: String) -> UserDictCodeFormat {
+        guard !schemaID.isEmpty, let schemaOpen = api.pointee.schema_open, let configClose = api.pointee.config_close,
+              let getCString = api.pointee.config_get_cstring, let listSize = api.pointee.config_list_size
+        else { return .toneless }
+        var config = RimeConfig()
+        guard schemaOpen(schemaID, &config) != 0 else { return .toneless }
+        defer { _ = configClose(&config) }
+        for index in 0..<listSize(&config, "speller/algebra") {
+            guard let rule = getCString(&config, "speller/algebra/@\(index)") else { continue }
+            if String(cString: rule).precomposedStringWithCanonicalMapping.unicodeScalars
+                .contains(where: Self.mandarinToneMarkedVowels.contains) {
+                return .unicodeToned
+            }
+        }
+        return .toneless
     }
 
     /// Lowercase substrings of a schema ID, `translator/dictionary`, or `translator/prism`

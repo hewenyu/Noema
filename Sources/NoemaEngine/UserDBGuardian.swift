@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import NoemaCore
 import NoemaLearning
+import NoemaText
 
 /// The librime levers calls `UserDBGuardian` makes. `RimeUserDictLevers` is the real one; it
 /// is valid only between `initialize` and `finalize`, with no session open, so no userdb is
@@ -44,6 +45,25 @@ struct RimeUserDictLevers: UserDictLevers {
     }
 }
 
+/// How a schema's dictionary spells its codes, and so how `learning.sqlite`'s toneless
+/// `pinyin_norm` must be spelled to land in that schema's userdb: a userdb code is found only
+/// when each of its syllables is one of the dictionary's syllables.
+public enum UserDictCodeFormat: String, Sendable, Hashable, Codable {
+    /// `ni hao`: 雾凇, the built-in `noema_pinyin`, double pinyin over toneless dictionaries.
+    case toneless
+    /// `ní hào`, NFC tone marks, `ü` kept (`nǚ`, `lüè`), the neutral tone unmarked: 万象 and
+    /// 薄荷 (which imports 万象's dictionaries), whose `speller/algebra` rewrites the marks.
+    case unicodeToned
+
+    /// The code `entry` is imported under.
+    public func code(for entry: LearnedEntry) -> String {
+        switch self {
+        case .toneless: entry.pinyinNorm
+        case .unicodeToned: TextNormalization.unicodeTonedPinyinKey(pinyinNorm: entry.pinyinNorm, text: entry.text)
+        }
+    }
+}
+
 /// Keeps one schema set's LevelDB userdbs healthy and in step with `learning.sqlite`.
 /// Runs only in a quiescent window (librime initialized, no session), on the one process
 /// that holds the root lock.
@@ -60,6 +80,10 @@ struct RimeUserDictLevers: UserDictLevers {
 ///   latest snapshot whose SHA-256 verifies and replay store entries newer than its
 ///   `learningRevision`; or else rebuild from every store entry. Then the export must succeed
 ///   again, and the watermark records what the userdb now holds.
+/// - **Code format**: entries are imported spelled `codeFormat` (the schema's dictionary
+///   spelling). The watermark and snapshot metadata record it; a userdb last projected in
+///   another spelling replays every store entry, so a userdb filled with toneless codes a
+///   toned dictionary never finds is repaired on the next maintenance.
 public struct UserDBGuardian {
     public enum Corruption: String, Sendable, Hashable, Codable {
         case notADirectory
@@ -120,6 +144,9 @@ public struct UserDBGuardian {
         /// The store revision the userdb (and so this snapshot) holds every entry up to.
         public var learningRevision: Int64
         public var createdAt: Date
+        /// The code spelling of the store entries in the snapshot; nil (older snapshots) is
+        /// `toneless`.
+        public var codeFormat: UserDictCodeFormat?
     }
 
     public let schemaSet: SchemaSetID
@@ -128,14 +155,20 @@ public struct UserDBGuardian {
     /// `snapshots/<set>/`.
     public let snapshotsDir: URL
     public let levers: any UserDictLevers
+    /// How the schema's dictionary spells codes; entries are imported in that spelling.
+    public let codeFormat: UserDictCodeFormat
 
     public static let quarantineDirectoryName = ".quarantine"
 
-    public init(schemaSet: SchemaSetID, userDataDir: URL, snapshotsDir: URL, levers: any UserDictLevers) {
+    public init(
+        schemaSet: SchemaSetID, userDataDir: URL, snapshotsDir: URL, levers: any UserDictLevers,
+        codeFormat: UserDictCodeFormat = .toneless
+    ) {
         self.schemaSet = schemaSet
         self.userDataDir = userDataDir
         self.snapshotsDir = snapshotsDir
         self.levers = levers
+        self.codeFormat = codeFormat
     }
 
     public func userDBURL(_ dictName: String) -> URL { userDataDir.appending(path: "\(dictName).userdb") }
@@ -169,21 +202,18 @@ public struct UserDBGuardian {
 
     /// Imports the store entries changed after the watermark of `(schemaSet, dictName)` and
     /// advances it; other userdbs of the set keep their own. A watermark ahead of the store
-    /// (a replaced store) replays everything. Returns how many entries were imported.
+    /// (a replaced store) or of another `codeFormat` replays everything. Returns how many
+    /// entries were imported.
     @discardableResult
     public func project(_ dictName: String, store: LearningStore) throws(Failure) -> Int {
         try requirePlainName(dictName)
         let latest = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
-        var since = try storeCall { () throws(LearningStoreError) in
-            try store.watermark(for: schemaSet, dictName: dictName)
-        }?.lastRevision ?? 0
+        let mark = try storeCall { () throws(LearningStoreError) in try store.watermark(for: schemaSet, dictName: dictName) }
+        var since = mark?.codeFormat == codeFormat.rawValue ? mark?.lastRevision ?? 0 : 0
         if since > latest { since = 0 }
         let entries = try storeCall { () throws(LearningStoreError) in try store.entriesSince(revision: since) }
         let imported = entries.isEmpty ? 0 : try importEntries(entries, into: dictName)
-        let count = try storeCall { () throws(LearningStoreError) in try store.stats() }.entryCount
-        try storeCall { () throws(LearningStoreError) in
-            try store.setWatermark(for: schemaSet, dictName: dictName, lastRevision: latest, projectedCount: count)
-        }
+        try setWatermark(dictName, store: store, lastRevision: latest)
         return imported
     }
 
@@ -202,7 +232,9 @@ public struct UserDBGuardian {
             if count >= 0 {
                 method = .snapshotAndReplay
                 imported = count
-                revision = metadata.learningRevision
+                // A snapshot of another spelling keeps the schema's own learning; every store
+                // entry is replayed in this spelling.
+                revision = (metadata.codeFormat ?? .toneless) == codeFormat ? metadata.learningRevision : 0
             } else if let again = try quarantine(dictName) {
                 quarantined = quarantined ?? again
             }
@@ -214,10 +246,7 @@ public struct UserDBGuardian {
                 method == .snapshotAndReplay ? try store.entriesSince(revision: revision) : try store.allEntries()
             }
             if !entries.isEmpty { imported += try importEntries(entries, into: dictName) }
-            let count = try storeCall { () throws(LearningStoreError) in try store.stats() }.entryCount
-            try storeCall { () throws(LearningStoreError) in
-                try store.setWatermark(for: schemaSet, dictName: dictName, lastRevision: latest, projectedCount: count)
-            }
+            try setWatermark(dictName, store: store, lastRevision: latest)
             revision = latest
         }
         let exported = try withProbe { probe in levers.exportUserDict(dictName, to: probe) }
@@ -235,7 +264,7 @@ public struct UserDBGuardian {
             guard let store else { return .healthy(projected: 0) }
             let projected = try project(dictName, store: store)
             let revision = try storeCall { () throws(LearningStoreError) in try store.latestRevision() }
-            if projected > 0 || Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir) == nil {
+            if projected > 0 || Self.verifiedSnapshot(dictName, schemaSet: schemaSet, in: snapshotsDir)?.1.codeFormat != codeFormat {
                 _ = try? writeSnapshot(dictName, learningRevision: revision)
             }
             return .healthy(projected: projected)
@@ -289,7 +318,8 @@ public struct UserDBGuardian {
             version: SnapshotMetadata.currentVersion, schemaSetID: schemaSet.rawValue, dictName: dictName,
             sha256: DeployManifest.sha256(of: data) ?? "", size: UInt64(data.count), entryCount: count,
             // Whole seconds: the ISO 8601 sidecar keeps no fraction, so a reread compares equal.
-            learningRevision: learningRevision, createdAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)))
+            learningRevision: learningRevision, createdAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
+            codeFormat: codeFormat)
         do {
             try FileSafety.writeAtomically(data, to: Self.snapshotURL(dictName, in: snapshotsDir))
             try FileSafety.writeAtomically(
@@ -316,11 +346,16 @@ public struct UserDBGuardian {
         return (snapshot, metadata)
     }
 
-    /// `<text>\t<pinyin_norm>\t<frequency>` lines, the levers import format. Entries that
-    /// could inject a line or a comment (`LearnedEntry.isSafeForTSV`) are skipped.
-    public static func importTSV(_ entries: [LearnedEntry]) -> Data {
+    /// `<text>\t<code>\t<frequency>` lines, the levers import format, each code
+    /// `pinyin_norm` spelled `codeFormat`. Entries that could inject a line or a comment
+    /// (`LearnedEntry.isSafeForTSV`, and a code with a control character) are skipped.
+    public static func importTSV(_ entries: [LearnedEntry], codeFormat: UserDictCodeFormat = .toneless) -> Data {
         var text = ""
-        for entry in entries where entry.isSafeForTSV { text += "\(entry.text)\t\(entry.pinyinNorm)\t\(max(entry.frequency, 1))\n" }
+        for entry in entries where entry.isSafeForTSV {
+            let code = codeFormat.code(for: entry)
+            guard !code.isEmpty, !code.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { continue }
+            text += "\(entry.text)\t\(code)\t\(max(entry.frequency, 1))\n"
+        }
         return Data(text.utf8)
     }
 
@@ -329,7 +364,7 @@ public struct UserDBGuardian {
     private func importEntries(_ entries: [LearnedEntry], into dictName: String) throws(Failure) -> Int {
         let count = try withProbe { probe throws(Failure) -> Int in
             do {
-                try FileSafety.writeAtomically(Self.importTSV(entries), to: probe)
+                try FileSafety.writeAtomically(Self.importTSV(entries, codeFormat: codeFormat), to: probe)
             } catch {
                 throw .io("writing the import of \(dictName): \(error)")
             }
@@ -341,6 +376,16 @@ public struct UserDBGuardian {
 
     /// Runs `body` with a fresh `0600` file in a private temporary directory under
     /// `snapshotsDir`, removed afterwards.
+    /// Records that the userdb holds every store entry up to `lastRevision`, in `codeFormat`.
+    private func setWatermark(_ dictName: String, store: LearningStore, lastRevision: Int64) throws(Failure) {
+        let count = try storeCall { () throws(LearningStoreError) in try store.stats() }.entryCount
+        try storeCall { () throws(LearningStoreError) in
+            try store.setWatermark(
+                for: schemaSet, dictName: dictName, lastRevision: lastRevision, projectedCount: count,
+                codeFormat: codeFormat.rawValue)
+        }
+    }
+
     private func withProbe<T>(_ body: (URL) throws(Failure) -> T) throws(Failure) -> T {
         try makePrivateDirectory(snapshotsDir)
         let directory = snapshotsDir.appending(path: ".probe.\(getpid()).\(UUID().uuidString)", directoryHint: .isDirectory)

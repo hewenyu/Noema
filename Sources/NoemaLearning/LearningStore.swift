@@ -201,6 +201,10 @@ public struct ProjectionWatermark: Sendable, Hashable, Codable {
     public var lastRevision: Int64
     public var projectedCount: Int64
     public var updatedAt: Date
+    /// How the projected codes are spelled (`NoemaEngine.UserDictCodeFormat`: `toneless`
+    /// `ni hao`, `unicodeToned` `ní hào`). A guardian projecting another spelling replays
+    /// every entry instead of trusting `lastRevision`.
+    public var codeFormat: String
 }
 
 public struct LearningStoreStats: Sendable, Hashable, Codable {
@@ -331,16 +335,23 @@ public final class LearningStore: @unchecked Sendable {
         }
     }
 
-    /// Records that `<dictName>.userdb` of `schemaSet` holds every entry up to `lastRevision`.
+    /// The `codeFormat` of a watermark written without one, and of every row that predates
+    /// the `code_format` column (Noema projected only toneless codes then).
+    public static let defaultCodeFormat = "toneless"
+
+    /// Records that `<dictName>.userdb` of `schemaSet` holds every entry up to `lastRevision`,
+    /// its codes spelled `codeFormat`.
     public func setWatermark(
-        for schemaSet: SchemaSetID, dictName: String, lastRevision: Int64, projectedCount: Int64, at date: Date = Date()
+        for schemaSet: SchemaSetID, dictName: String, lastRevision: Int64, projectedCount: Int64,
+        codeFormat: String = LearningStore.defaultCodeFormat, at date: Date = Date()
     ) throws(LearningStoreError) {
         try withWriteTransaction { db throws(LearningStoreError) in
             let statement = try Self.prepare(db, """
-                INSERT INTO projection_watermarks(schema_set, dict_name, last_revision, projected_count, updated_at)
-                VALUES(?1, ?2, ?3, ?4, ?5)
+                INSERT INTO projection_watermarks(schema_set, dict_name, last_revision, projected_count, updated_at, code_format)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(schema_set, dict_name) DO UPDATE SET last_revision = excluded.last_revision,
-                  projected_count = excluded.projected_count, updated_at = excluded.updated_at
+                  projected_count = excluded.projected_count, updated_at = excluded.updated_at,
+                  code_format = excluded.code_format
                 """)
             defer { sqlite3_finalize(statement) }
             Self.bind(statement, 1, schemaSet.rawValue)
@@ -348,6 +359,7 @@ public final class LearningStore: @unchecked Sendable {
             sqlite3_bind_int64(statement, 3, lastRevision)
             sqlite3_bind_int64(statement, 4, projectedCount)
             sqlite3_bind_double(statement, 5, date.timeIntervalSince1970)
+            Self.bind(statement, 6, codeFormat)
             try Self.stepDone(db, statement)
         }
     }
@@ -419,8 +431,10 @@ public final class LearningStore: @unchecked Sendable {
     private func watermarks() throws(LearningStoreError) -> [ProjectionWatermark] {
         try withConnection { db throws(LearningStoreError) in
             guard try Self.hasPerDictWatermarks(db) else { return [] }
+            // A `.readOnly` connection may see a table that predates `code_format`.
+            let format = try Self.hasWatermarkColumn(db, "code_format") ? "code_format" : "'\(Self.defaultCodeFormat)'"
             let statement = try Self.prepare(db, """
-                SELECT schema_set, dict_name, last_revision, projected_count, updated_at
+                SELECT schema_set, dict_name, last_revision, projected_count, updated_at, \(format)
                 FROM projection_watermarks ORDER BY schema_set, dict_name
                 """)
             defer { sqlite3_finalize(statement) }
@@ -434,7 +448,8 @@ public final class LearningStore: @unchecked Sendable {
                     dictName: Self.columnString(statement, 1),
                     lastRevision: sqlite3_column_int64(statement, 2),
                     projectedCount: sqlite3_column_int64(statement, 3),
-                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))))
+                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
+                    codeFormat: Self.columnString(statement, 5)))
             }
         }
     }
@@ -482,6 +497,7 @@ public final class LearningStore: @unchecked Sendable {
             switch (version, mode) {
             case (Self.schemaVersion, .readWrite):
                 try Self.migrateWatermarksToPerDict(db)
+                try Self.addWatermarkCodeFormat(db)
             case (Self.schemaVersion, .readOnly):
                 return
             case (0, .readWrite):
@@ -518,15 +534,38 @@ public final class LearningStore: @unchecked Sendable {
           last_revision INTEGER NOT NULL,
           projected_count INTEGER NOT NULL,
           updated_at REAL NOT NULL,
+          code_format TEXT NOT NULL DEFAULT '\(defaultCodeFormat)',
           PRIMARY KEY (schema_set, dict_name));
         """
 
     /// Whether `projection_watermarks` has its `dict_name` column.
     static func hasPerDictWatermarks(_ db: OpaquePointer) throws(LearningStoreError) -> Bool {
-        let statement = try prepare(db, "SELECT count(*) FROM pragma_table_info('projection_watermarks') WHERE name = 'dict_name'")
+        try hasWatermarkColumn(db, "dict_name")
+    }
+
+    /// Whether `projection_watermarks` has the column `name` (a fixed identifier).
+    static func hasWatermarkColumn(_ db: OpaquePointer, _ name: String) throws(LearningStoreError) -> Bool {
+        let statement = try prepare(db, "SELECT count(*) FROM pragma_table_info('projection_watermarks') WHERE name = ?1")
         defer { sqlite3_finalize(statement) }
+        bind(statement, 1, name)
         guard sqlite3_step(statement) == SQLITE_ROW else { throw error(db, "table_info") }
         return sqlite3_column_int64(statement, 0) > 0
+    }
+
+    /// Adds `code_format` to a pre-release per-userdb `projection_watermarks`. Its rows keep
+    /// their revisions as `toneless`, the only spelling Noema projected before the column.
+    static func addWatermarkCodeFormat(_ db: OpaquePointer) throws(LearningStoreError) {
+        guard try !hasWatermarkColumn(db, "code_format") else { return }
+        try exec(db, "BEGIN IMMEDIATE")
+        do throws(LearningStoreError) {
+            if try !hasWatermarkColumn(db, "code_format") {
+                try exec(db, "ALTER TABLE projection_watermarks ADD COLUMN code_format TEXT NOT NULL DEFAULT '\(defaultCodeFormat)'")
+            }
+            try exec(db, "COMMIT")
+        } catch {
+            _ = sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
     }
 
     /// Replaces a pre-release `projection_watermarks` keyed by set alone (no `dict_name`)

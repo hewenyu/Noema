@@ -109,6 +109,52 @@ final class FakeLevers: UserDictLevers {
         #expect(String(decoding: data, as: UTF8.self) == "世界\tshi jie\t2\n")
     }
 
+    /// `.unicodeToned` spells each code as a toned dictionary does; `.toneless` keeps
+    /// `pinyin_norm`; a hostile entry is still skipped.
+    @Test func importTSVSpellsCodesInTheDictionaryFormat() {
+        defer { cleanUp() }
+        func entry(_ norm: String, _ text: String) -> LearnedEntry {
+            LearnedEntry(id: 1, pinyinNorm: norm, pinyinCompact: norm.replacingOccurrences(of: " ", with: ""), text: text,
+                         frequency: 3, isUserPhrase: false, updatedAt: Date(), revision: 1)
+        }
+        let entries = [entry("ni hao", "霓昊"), entry("nv hai", "女孩"), entry("yin hang", "银行"), entry("ni hao", "你好\n坏")]
+        #expect(String(decoding: UserDBGuardian.importTSV(entries, codeFormat: .unicodeToned), as: UTF8.self)
+                == "霓昊\tní hào\t3\n女孩\tnǚ hái\t3\n银行\tyín hāng\t3\n")
+        #expect(String(decoding: UserDBGuardian.importTSV(entries), as: UTF8.self)
+                == "霓昊\tni hao\t3\n女孩\tnv hai\t3\n银行\tyin hang\t3\n")
+    }
+
+    /// A userdb last projected in another spelling (a toneless watermark at the latest
+    /// revision, a toneless snapshot) replays every store entry in the guardian's spelling,
+    /// both on the healthy path and from the snapshot, which keeps the native rows.
+    @Test func anotherCodeFormatReplaysEveryEntry() throws {
+        defer { cleanUp() }
+        try learn([("ni hao", "霓昊"), ("nv hai", "女孩")])
+        #expect(try guardian.maintain("wanxiang", store: store) == .recovered(.init(
+            method: .fullRebuild, quarantined: nil, imported: 2, exported: 2)))
+        #expect(try store.watermark(for: .rimeIce, dictName: "wanxiang")?.codeFormat == "toneless")
+        _ = levers.importUserDict("wanxiang", from: try tsv("原生\tyuán shēng\t5\n"))
+        try guardian.writeSnapshot("wanxiang", learningRevision: 2)
+        let toned = UserDBGuardian(schemaSet: .rimeIce, userDataDir: setDir, snapshotsDir: snapshots, levers: levers, codeFormat: .unicodeToned)
+
+        #expect(try toned.maintain("wanxiang", store: store) == .healthy(projected: 2))
+        #expect(levers.imports.last?.1 == "霓昊\tní hào\t1\n女孩\tnǚ hái\t1\n")
+        #expect(try store.watermark(for: .rimeIce, dictName: "wanxiang")?.codeFormat == "unicodeToned")
+        #expect(UserDBGuardian.verifiedSnapshot("wanxiang", schemaSet: .rimeIce, in: snapshots)?.1.codeFormat == .unicodeToned)
+        #expect(try toned.maintain("wanxiang", store: store) == .healthy(projected: 0), "replayed only once")
+
+        // A toneless snapshot restored by a toned guardian: its rows come back, every entry is replayed toned.
+        try guardian.writeSnapshot("wanxiang", learningRevision: 2)
+        try FileManager.default.createDirectory(at: setDir.appending(path: "wanxiang.userdb/lost"), withIntermediateDirectories: true)
+        guard case .recovered(let report) = try toned.maintain("wanxiang", store: store) else {
+            Issue.record("expected recovery")
+            return
+        }
+        #expect(report.method == .snapshotAndReplay)
+        #expect(levers.imports.last?.1 == "霓昊\tní hào\t1\n女孩\tnǚ hái\t1\n")
+        #expect(levers.rows("wanxiang")["原生\tyuán shēng"] == 5)
+    }
+
     // MARK: Snapshots
 
     @Test func snapshotIsWrittenOnlyFromASuccessfulExportAndVerifiedBySHA256() throws {
