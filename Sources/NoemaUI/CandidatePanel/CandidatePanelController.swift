@@ -58,6 +58,11 @@ public final class CandidatePanelController: CandidatePresenting {
         let windowLevel: Int?
     }
     private var presentation: Presentation?
+    /// The mouse location a composition with no valid or cached caret is anchored to,
+    /// sampled once per client and session so paging, scrolling, or expanding with the
+    /// pointer over the panel never re-anchors it under that pointer. Cleared when a valid
+    /// caret arrives or the panel hides.
+    private var mouseFallbackAnchor: (clientKey: String, sessionToken: UUID?, location: CGPoint)?
 
     // MARK: Test hooks (internal; `@testable import NoemaUI`)
 
@@ -67,6 +72,8 @@ public final class CandidatePanelController: CandidatePresenting {
     }
     /// `false` keeps the real panel off screen (headless tests); everything else still runs.
     var shouldOrderFront = true
+    /// The pointer location sampled for the mouse fallback anchor.
+    var mouseLocationProvider: @MainActor () -> CGPoint = { NSEvent.mouseLocation }
     var panelViewForTesting: CandidatePanelView { candidateView }
     var panelForTesting: NSPanel { panel }
 
@@ -139,6 +146,7 @@ public final class CandidatePanelController: CandidatePresenting {
         hysteresis.reset()
         lastAppliedFrame = nil
         presentation = nil
+        mouseFallbackAnchor = nil
         currentLayout = nil
         candidateView.reset()
     }
@@ -152,7 +160,14 @@ public final class CandidatePanelController: CandidatePresenting {
     private func rerender(ensureHighlightVisible: Bool = true) {
         guard let presentation else { return }
         let screens = screensProvider()
-        let mouseLocation = NSEvent.mouseLocation
+        let mouseLocation: CGPoint
+        if let saved = mouseFallbackAnchor, saved.clientKey == presentation.clientKey,
+            saved.sessionToken == presentation.options.sessionToken
+        {
+            mouseLocation = saved.location
+        } else {
+            mouseLocation = mouseLocationProvider()
+        }
         guard let screen = resolver.targetScreen(
             caretRect: presentation.caretRect, clientKey: presentation.clientKey, screens: screens,
             fallbackMouseLocation: mouseLocation)
@@ -177,6 +192,8 @@ public final class CandidatePanelController: CandidatePresenting {
             hide()
             return
         }
+        mouseFallbackAnchor = resolution.usedMouseFallback
+            ? (presentation.clientKey, presentation.options.sessionToken, mouseLocation) : nil
         currentLayout = layout
         let target = CGRect(origin: resolution.origin, size: layout.panelSize)
 

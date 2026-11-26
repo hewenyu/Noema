@@ -912,6 +912,112 @@ extension LibrimeSerializedTests {
             try expectInside(narrow, "moved to the narrow screen")
         }
 
+        /// Real Rime, a client reporting no caret, and no cached caret on a 1440×900 screen
+        /// (Codex review of PR #19): the panel falls back to the mouse once per composition.
+        /// With the pointer then on the panel, real scroll-wheel events page Rime and a real
+        /// click expands the page, and the panel never re-anchors under the pointer. A new
+        /// composition after Escape samples the mouse again, and a valid caret mid-composition
+        /// takes over at once.
+        @Test func mouseFallbackAnchorStaysPutWhileThePointerIsOnThePanel() throws {
+            let controller = CandidatePanelController(style: CandidatePanelStyle())
+            controller.screensProvider = {
+                [ScreenFrame(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                             visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 875))]
+            }
+            controller.shouldOrderFront = false
+            var mouse = CGPoint(x: 400, y: 600)
+            controller.mouseLocationProvider = { mouse }
+            let recorder = RecordingPresenter()
+            let harness = try Harness(candidatePresenter: TeePresenter([recorder, controller]))
+            defer { harness.shutdown(); controller.hide() }
+            // Wired as `EngineHost` wires the shipped panel.
+            controller.onSelectCandidate = { [coordinator = harness.coordinator] index, generation in
+                _ = coordinator.selectCandidate(at: index, expectedGenerationID: generation)
+            }
+            controller.onChangePage = { [coordinator = harness.coordinator] backward, generation in
+                _ = coordinator.changePage(backward: backward, expectedGenerationID: generation)
+            }
+            let client = RecordingClient()
+            client.caretRect = nil
+            let token = UUID()
+            let view = controller.panelViewForTesting
+            let panel = controller.panelForTesting
+            func press(_ character: String, _ code: UInt16) throws {
+                let event = try #require(NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                    characters: character, charactersIgnoringModifiers: character, isARepeat: false, keyCode: code))
+                #expect(harness.coordinator.handleNSEvent(event, token: token, client: client))
+            }
+            func typeShi() throws {
+                for (character, code) in [("s", UInt16(0x01)), ("h", UInt16(0x04)), ("i", UInt16(0x22))] {
+                    try press(character, code)
+                }
+            }
+            func scroll(_ deltaY: Int32) throws {
+                let cgEvent = try #require(CGEvent(
+                    scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: deltaY, wheel2: 0, wheel3: 0))
+                view.scrollWheel(with: try #require(NSEvent(cgEvent: cgEvent)))
+            }
+            /// The panel kept its left edge and top edge, and the pointer is still on it.
+            func expectPinned(to before: CGRect, _ step: String) {
+                let frame = panel.frame
+                #expect(frame.origin.x == before.origin.x && frame.maxY == before.maxY,
+                        "\(step): anchor shifted by (\(frame.origin.x - before.origin.x), \(frame.maxY - before.maxY)) to \(frame)")
+                #expect(frame.contains(mouse), "\(step): pointer \(mouse) left the panel \(frame)")
+            }
+
+            try typeShi()
+            let first = try #require(recorder.lastState)
+            #expect(first.pageIndex == 0 && !first.isLastPage)
+            let anchored = panel.frame
+            #expect(anchored.origin.x == 400 && anchored.maxY == 600 - 18 - 6, "below the mouse: \(anchored)")
+            #expect(anchored.origin.y == 540, "\(anchored)")
+
+            // The pointer moves onto the panel; two real wheel events page Rime twice.
+            mouse = CGPoint(x: anchored.midX, y: anchored.midY)
+            try scroll(-60)
+            let second = try #require(recorder.lastState)
+            #expect(harness.engine.currentState.pageIndex == 1 && second.pageIndex == 1)
+            #expect(second.candidates != first.candidates, "Rime paged")
+            expectPinned(to: anchored, "page 1")
+            try scroll(-60)
+            let third = try #require(recorder.lastState)
+            #expect(third.pageIndex == 2 && third.candidates != second.candidates, "Rime paged again")
+            expectPinned(to: anchored, "page 2")
+
+            // The pointer moves onto the chevron; a real click expands the page in place.
+            let collapsed = try #require(controller.currentLayout)
+            let button = try #require(collapsed.expandButtonFrame)
+            let point = view.convert(button.center, to: nil)
+            mouse = panel.convertPoint(toScreen: point)
+            let beforeExpand = panel.frame
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = try #require(NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: 0,
+                    windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                    pressure: type == .leftMouseDown ? 1 : 0))
+                type == .leftMouseDown ? view.mouseDown(with: event) : view.mouseUp(with: event)
+            }
+            #expect(controller.isExpanded && controller.currentLayout?.isExpanded == true)
+            #expect(panel.frame.height > beforeExpand.height, "expanded: \(panel.frame)")
+            #expect(panel.frame.origin.x == beforeExpand.origin.x && panel.frame.maxY == beforeExpand.maxY,
+                    "expand kept the anchor: \(beforeExpand) → \(panel.frame)")
+            #expect(client.inserts.isEmpty, "paging and the chevron commit nothing")
+
+            // Escape hides the panel; the next composition samples the mouse again.
+            try press("\u{1B}", 0x35)
+            #expect(!controller.isVisible && !harness.engine.currentState.isComposing)
+            mouse = CGPoint(x: 800, y: 500)
+            try typeShi()
+            #expect(panel.frame.origin.x == 800 && panel.frame.maxY == 500 - 18 - 6, "new composition: \(panel.frame)")
+
+            // A valid caret mid-composition replaces the mouse anchor at once.
+            client.caretRect = CGRect(x: 150, y: 700, width: 1, height: 18)
+            _ = harness.coordinator.handleKey(.key(VirtualKeyCode.downArrow, "", .function), token: token, client: client)
+            #expect(recorder.lastState?.highlightedIndex == 1, "the same composition re-rendered")
+            #expect(panel.frame.origin.x == 150 && panel.frame.maxY == 700 - 6, "real caret: \(panel.frame)")
+        }
+
         @Test func pagingFromThePanelRefreshesCandidates() throws {
             let harness = try Harness()
             defer { harness.shutdown() }
