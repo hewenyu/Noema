@@ -17,11 +17,17 @@ public final class CandidatePanelView: NSView {
     public var onToggleExpand: (@MainActor () -> Void)?
     /// The panel was scrolled: `true` pages backward, with the layout's generation.
     public var onChangePage: (@MainActor (Bool, UInt64) -> Void)?
+    /// A scrolling list was scrolled within the page: the requested
+    /// `verticalScrollOffset`, with the layout's generation.
+    public var onScrollCandidates: (@MainActor (CGFloat, UInt64) -> Void)?
 
     public private(set) var panelLayout: CandidatePanelLayout?
     private let style: CandidatePanelStyle
     private let highlightHost = FlippedView()
     private let highlightLayer = CAShapeLayer()
+    /// Clips the highlight to `candidatesViewport`, so a capsule scrolled partly out never
+    /// bleeds over the preedit strip or the panel edge.
+    private let highlightClipMask = CALayer()
     private let contentView: CandidateContentView
     /// The target under `mouseDown` and the generation it was laid out for. A refresh to
     /// another generation before `mouseUp` cancels the click, so a press on an old panel
@@ -42,6 +48,8 @@ public final class CandidatePanelView: NSView {
         highlightLayer.actions = ["path": NSNull(), "fillColor": NSNull(), "hidden": NSNull(), "bounds": NSNull(), "position": NSNull()]
         highlightLayer.isHidden = true
         highlightHost.layer?.addSublayer(highlightLayer)
+        highlightClipMask.backgroundColor = CGColor(gray: 1, alpha: 1)
+        highlightClipMask.actions = ["frame": NSNull(), "bounds": NSNull(), "position": NSNull()]
         addSubview(highlightHost)
 
         addSubview(contentView)
@@ -78,6 +86,12 @@ public final class CandidatePanelView: NSView {
         highlightHost.frame = bounds
         contentView.frame = bounds
         highlightLayer.frame = bounds
+        if let viewport = panelLayout?.candidatesViewport {
+            highlightClipMask.frame = viewport
+            if highlightHost.layer?.mask !== highlightClipMask { highlightHost.layer?.mask = highlightClipMask }
+        } else if highlightHost.layer?.mask != nil {
+            highlightHost.layer?.mask = nil
+        }
         CATransaction.commit()
     }
 
@@ -88,6 +102,7 @@ public final class CandidatePanelView: NSView {
         guard layout != self.panelLayout else { return }
         if self.panelLayout?.generationID != layout.generationID { pressed = nil }
         self.panelLayout = layout
+        syncSubviewFrames()
         contentView.layout = layout
         if let pill = layout.highlightedPillFrame {
             let radius = layout.isExpanded
@@ -145,9 +160,19 @@ public final class CandidatePanelView: NSView {
         }
     }
 
+    /// Scrolls a list taller than the screen within the page first (positive deltas toward
+    /// candidate 0); only at either end does the accumulated scroll turn the Rime page.
     override public func scrollWheel(with event: NSEvent) {
         guard let layout = panelLayout, event.momentumPhase.isEmpty else { return }
         let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 10
+        if layout.maxVerticalScrollOffset > 0 {
+            let target = min(max(layout.verticalScrollOffset - delta, 0), layout.maxVerticalScrollOffset)
+            if abs(target - layout.verticalScrollOffset) > 0.5 {
+                scrollAccumulator = 0
+                onScrollCandidates?(target, layout.generationID)
+                return
+            }
+        }
         scrollAccumulator += delta
         guard abs(scrollAccumulator) >= 30 else { return }
         let backward = scrollAccumulator > 0
@@ -209,13 +234,24 @@ private final class CandidateContentView: NSView {
             }
         }
 
-        for item in layout.items {
+        let viewport = layout.candidatesViewport
+        if let viewport {
+            ctx.saveGState()
+            ctx.clip(to: viewport)
+        }
+        for item in layout.items where viewport.map({ item.pillFrame.intersects($0) }) ?? true {
             let primary = item.isHighlighted ? palette.selectedText : palette.text
             let secondary = item.isHighlighted ? palette.selectedSecondary : palette.secondary
             drawLine(CandidateTypesetter.line(item.displayLabel, font: fonts.label.font, color: secondary), at: item.labelOrigin, in: ctx)
             drawLine(CandidateTypesetter.line(item.displayText, font: fonts.candidate.font, color: primary), at: item.textOrigin, in: ctx)
             if let comment = item.displayComment, let origin = item.commentOrigin {
                 drawLine(CandidateTypesetter.line(comment, font: fonts.comment.font, color: secondary), at: origin, in: ctx)
+            }
+        }
+        if let viewport {
+            ctx.restoreGState()
+            if layout.maxVerticalScrollOffset > 0 {
+                drawScrollThumb(in: viewport, layout: layout, color: palette.chevron, ctx: ctx)
             }
         }
 
@@ -233,6 +269,22 @@ private final class CandidateContentView: NSView {
         ctx.textMatrix = .identity
         ctx.textPosition = CGPoint(x: origin.x, y: 0)
         CTLineDraw(line, ctx)
+        ctx.restoreGState()
+    }
+
+    /// A 3-point thumb on the viewport's trailing edge: its length is the visible share of
+    /// the list, its position the scroll offset.
+    private func drawScrollThumb(in viewport: CGRect, layout: CandidatePanelLayout, color: CGColor, ctx: CGContext) {
+        let total = viewport.height + layout.maxVerticalScrollOffset
+        guard total > 0, viewport.height > 4 else { return }
+        let track = viewport.insetBy(dx: 0, dy: 2)
+        let length = max(track.height * viewport.height / total, min(16, track.height))
+        let progress = layout.verticalScrollOffset / layout.maxVerticalScrollOffset
+        let thumb = CGRect(x: viewport.maxX - 2 - 3, y: track.minY + (track.height - length) * progress, width: 3, height: length)
+        ctx.saveGState()
+        ctx.setFillColor(color.copy(alpha: 0.45) ?? color)
+        ctx.addPath(CGPath(roundedRect: thumb, cornerWidth: 1.5, cornerHeight: 1.5, transform: nil))
+        ctx.fillPath()
         ctx.restoreGState()
     }
 

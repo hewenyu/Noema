@@ -60,10 +60,20 @@ public struct CandidatePanelLayout: Sendable, Hashable {
     public let expandButtonFrame: CGRect?
     /// The `CompositionState.generationID` laid out; clicks carry it to reject stale panels.
     public let generationID: UInt64
+    /// The visible band of an expanded list taller than `maxHeight`, full panel width, in
+    /// flipped panel coordinates; nil when every candidate fits. Items are shifted up by
+    /// `verticalScrollOffset`; drawing, the highlight, and hit testing are clipped to it.
+    public let candidatesViewport: CGRect?
+    /// How far the expanded list is scrolled, in `0...maxVerticalScrollOffset`.
+    public let verticalScrollOffset: CGFloat
+    /// The list height hidden below the viewport at offset 0; 0 when nothing scrolls.
+    public let maxVerticalScrollOffset: CGFloat
 
-    /// What a click at `point` (flipped panel coordinates) hits.
+    /// What a click at `point` (flipped panel coordinates) hits. Candidates scrolled out of
+    /// `candidatesViewport` are never hit, even where their shifted frames lie.
     public func hitTest(_ point: CGPoint) -> CandidateHitTarget {
         if let button = expandButtonFrame, button.insetBy(dx: -2, dy: -2).contains(point) { return .expandButton }
+        if let viewport = candidatesViewport, !viewport.contains(point) { return .none }
         if let item = items.first(where: { $0.frame.contains(point) }) { return .candidate(item.index) }
         return .none
     }
@@ -75,6 +85,8 @@ public struct CandidatePanelLayout: Sendable, Hashable {
 /// The expand button is pinned to the trailing edge of the hysteresis width, so the slack
 /// sits between the last candidate and the button. A page whose single row cannot fit in
 /// `maxPanelWidth` even after truncation is always laid out expanded, without the button.
+/// An expanded list taller than `maxHeight` (the screen's visible height) shows a scrolled
+/// viewport instead, which by default follows the highlighted candidate.
 public struct CandidateLayoutEngine: Sendable {
     public let style: CandidatePanelStyle
 
@@ -83,16 +95,31 @@ public struct CandidateLayoutEngine: Sendable {
     }
 
     /// Lays out `state` without hysteresis (a fresh state machine): for tests and previews.
-    public func layout(state: CompositionState, options: CandidatePresentationOptions, expanded: Bool) -> CandidatePanelLayout {
-        var hysteresis = WidthHysteresis(style: style)
-        return layout(state: state, options: options, expanded: expanded, hysteresis: &hysteresis)
-    }
-
     public func layout(
         state: CompositionState,
         options: CandidatePresentationOptions,
         expanded: Bool,
-        hysteresis: inout WidthHysteresis
+        maxHeight: CGFloat? = nil,
+        verticalScrollOffset: CGFloat = 0,
+        ensureHighlightVisible: Bool = true
+    ) -> CandidatePanelLayout {
+        var hysteresis = WidthHysteresis(style: style)
+        return layout(
+            state: state, options: options, expanded: expanded, hysteresis: &hysteresis, maxHeight: maxHeight,
+            verticalScrollOffset: verticalScrollOffset, ensureHighlightVisible: ensureHighlightVisible)
+    }
+
+    /// `maxHeight` bounds an expanded panel's height (nil: unbounded). When the list does
+    /// not fit, it scrolls by `verticalScrollOffset` (clamped); `ensureHighlightVisible`
+    /// then scrolls the least amount that shows the whole highlighted candidate.
+    public func layout(
+        state: CompositionState,
+        options: CandidatePresentationOptions,
+        expanded: Bool,
+        hysteresis: inout WidthHysteresis,
+        maxHeight: CGFloat? = nil,
+        verticalScrollOffset: CGFloat = 0,
+        ensureHighlightVisible: Bool = true
     ) -> CandidatePanelLayout {
         let fonts = CandidateTypesetter.Fonts(style: style)
         let s = style
@@ -196,13 +223,45 @@ public struct CandidateLayoutEngine: Sendable {
         }
 
         let firstRowY = y
+        // An expanded list taller than `maxHeight` scrolls inside a viewport.
+        var viewport: CGRect?
+        var scrollY: CGFloat = 0
+        var maxScrollY: CGFloat = 0
+        var viewportHeight: CGFloat?
+        let rowStride = pillHeight + s.itemSpacing
+        if effectiveExpanded && hasCandidates, let maxHeight, maxHeight.isFinite {
+            let totalListHeight = CGFloat(measured.count) * pillHeight + CGFloat(max(measured.count - 1, 0)) * s.itemSpacing
+            if ceil(firstRowY + totalListHeight + s.verticalPadding) > maxHeight {
+                let available = floor(maxHeight - firstRowY - s.verticalPadding)
+                let visible = max(min(totalListHeight, available), min(totalListHeight, pillHeight))
+                maxScrollY = max(totalListHeight - visible, 0)
+                scrollY = min(max(verticalScrollOffset.isFinite ? verticalScrollOffset : 0, 0), maxScrollY)
+                if ensureHighlightVisible, let highlightedIndex = state.highlightedIndex,
+                   measured.indices.contains(highlightedIndex) {
+                    let itemTop = CGFloat(highlightedIndex) * rowStride
+                    let itemBottom = itemTop + pillHeight
+                    if itemTop < scrollY {
+                        scrollY = itemTop
+                    } else if itemBottom > scrollY + visible {
+                        scrollY = itemBottom - visible
+                    }
+                    scrollY = min(max(scrollY, 0), maxScrollY)
+                }
+                viewportHeight = visible
+                if maxScrollY > 0 {
+                    viewport = CGRect(x: 0, y: firstRowY, width: width, height: visible)
+                } else {
+                    scrollY = 0
+                }
+            }
+        }
         var items: [CandidateItemLayout] = []
         var x = s.horizontalPadding
         let expandedPillWidth = width - fixed
         for (position, item) in measured.enumerated() {
             let pill: CGRect
             if effectiveExpanded {
-                pill = CGRect(x: s.horizontalPadding, y: y, width: expandedPillWidth, height: pillHeight)
+                pill = CGRect(x: s.horizontalPadding, y: y - scrollY, width: expandedPillWidth, height: pillHeight)
                 y += pillHeight + (position == measured.count - 1 ? 0 : s.itemSpacing)
             } else {
                 pill = CGRect(x: x, y: y, width: item.width, height: pillHeight)
@@ -213,6 +272,7 @@ public struct CandidateLayoutEngine: Sendable {
                 highlighted: state.highlightedIndex == item.index))
         }
         if hasCandidates && !effectiveExpanded { y += pillHeight }
+        if let viewportHeight { y = firstRowY + viewportHeight }
 
         let height = ceil(y + s.verticalPadding)
         let isCapsule = !effectiveExpanded && stripLayout == nil
@@ -224,7 +284,8 @@ public struct CandidateLayoutEngine: Sendable {
         return CandidatePanelLayout(
             panelSize: CGSize(width: width, height: height), contentWidth: contentWidth, cornerRadius: radius,
             isExpanded: effectiveExpanded, preeditStrip: stripLayout, items: items, highlightedPillFrame: highlighted,
-            expandButtonFrame: button, generationID: state.generationID)
+            expandButtonFrame: button, generationID: state.generationID, candidatesViewport: viewport,
+            verticalScrollOffset: scrollY, maxVerticalScrollOffset: maxScrollY)
     }
 
     /// How far to scroll a floating preedit of `textWidth` so the caret at `caretX` stays in

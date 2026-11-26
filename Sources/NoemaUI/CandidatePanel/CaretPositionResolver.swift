@@ -80,22 +80,15 @@ public struct CaretPositionResolver: Sendable {
         screens: [ScreenFrame],
         fallbackMouseLocation: CGPoint?
     ) -> CaretResolution? {
-        guard !screens.isEmpty else { return nil }
-        var usedCache = false
-        var usedMouse = false
-        let caret: CGRect
-        if let valid = Self.normalizeCaretRect(caretRect, screens: screens, fallbackLineHeight: fallbackLineHeight) {
-            caret = valid
-            remember(valid, for: clientKey)
-        } else if let cached = cache[clientKey] {
-            caret = cached
-            usedCache = true
-            touch(clientKey)
-        } else if let mouse = fallbackMouseLocation, mouse.x.isFinite, mouse.y.isFinite {
-            caret = CGRect(x: mouse.x, y: mouse.y - fallbackLineHeight, width: 0, height: fallbackLineHeight)
-            usedMouse = true
-        } else {
-            return nil
+        guard let anchor = anchor(caretRect: caretRect, clientKey: clientKey, screens: screens, fallbackMouseLocation: fallbackMouseLocation)
+        else { return nil }
+        let caret = anchor.caret
+        let usedCache = anchor.source == .cache
+        let usedMouse = anchor.source == .mouse
+        switch anchor.source {
+        case .valid: remember(caret, for: clientKey)
+        case .cache: touch(clientKey)
+        case .mouse: break
         }
 
         let visible = Self.screen(for: caret, in: screens).visibleFrame
@@ -117,6 +110,21 @@ public struct CaretPositionResolver: Sendable {
         return CaretResolution(origin: CGPoint(x: x, y: y), flippedAbove: flipped, usedCache: usedCache, usedMouseFallback: usedMouse)
     }
 
+    /// The screen `resolve` would place the panel on, by the same priority (valid caret,
+    /// this client's cached caret, then the mouse), without touching the cache; nil when
+    /// there is no screen or nothing to anchor to. The panel controller bounds the panel
+    /// height to this screen's visible frame before resolving the origin.
+    public func targetScreen(
+        caretRect: CGRect?,
+        clientKey: String,
+        screens: [ScreenFrame],
+        fallbackMouseLocation: CGPoint?
+    ) -> ScreenFrame? {
+        guard let anchor = anchor(caretRect: caretRect, clientKey: clientKey, screens: screens, fallbackMouseLocation: fallbackMouseLocation)
+        else { return nil }
+        return Self.screen(for: anchor.caret, in: screens)
+    }
+
     /// Forgets every cached caret.
     public mutating func removeAll() {
         cache.removeAll()
@@ -124,6 +132,24 @@ public struct CaretPositionResolver: Sendable {
     }
 
     // MARK: - Private
+
+    private enum AnchorSource { case valid, cache, mouse }
+
+    /// The caret rectangle to place against, and where it came from; nil when `screens` is
+    /// empty or there is no valid caret, cached caret, or finite mouse location.
+    private func anchor(
+        caretRect: CGRect?, clientKey: String, screens: [ScreenFrame], fallbackMouseLocation: CGPoint?
+    ) -> (caret: CGRect, source: AnchorSource)? {
+        guard !screens.isEmpty else { return nil }
+        if let valid = Self.normalizeCaretRect(caretRect, screens: screens, fallbackLineHeight: fallbackLineHeight) {
+            return (valid, .valid)
+        }
+        if let cached = cache[clientKey] { return (cached, .cache) }
+        if let mouse = fallbackMouseLocation, mouse.x.isFinite, mouse.y.isFinite {
+            return (CGRect(x: mouse.x, y: mouse.y - fallbackLineHeight, width: 0, height: fallbackLineHeight), .mouse)
+        }
+        return nil
+    }
 
     private static func probe(_ r: CGRect) -> CGRect {
         CGRect(x: r.minX, y: r.minY, width: max(r.width, 1), height: max(r.height, 1)).insetBy(dx: -2, dy: -2)

@@ -721,6 +721,126 @@ extension LibrimeSerializedTests {
             #expect(!harness.engine.currentState.isComposing && !controller.isVisible)
         }
 
+        /// Real Rime with `menu/page_size: 50` and 60 more `shi` entries on a 1440×900 screen
+        /// (Codex review of PR #19): the 50-row page is taller than the 875-point visible
+        /// frame. The shipped controller keeps the panel inside the visible frame with the
+        /// list scrolling in a viewport: candidate 0 starts visible and clickable, arrow keys
+        /// keep the highlight in view, real scroll-wheel events reach candidate 49 without
+        /// paging Rime, and a real click on it commits it. Only at the bottom does the wheel
+        /// turn the page, which resets the scroll.
+        @Test func fiftyCandidatePageScrollsInsideTheVisibleFrame() throws {
+            let style = CandidatePanelStyle()
+            let controller = CandidatePanelController(style: style)
+            let visible = CGRect(x: 0, y: 0, width: 1440, height: 875)
+            controller.screensProvider = {
+                [ScreenFrame(frame: CGRect(x: 0, y: 0, width: 1440, height: 900), visibleFrame: visible)]
+            }
+            controller.shouldOrderFront = false
+            let recorder = RecordingPresenter()
+            let extra = (0..<60).map { i in
+                "\(Character(UnicodeScalar(0x4E00 + 7 * i)!))\tshi\t\(60 - i)\n"
+            }.joined()
+            let harness = try Harness(
+                pageSize: 50, dictionaryAppendix: extra, candidatePresenter: TeePresenter([recorder, controller]))
+            defer { harness.shutdown(); controller.hide() }
+            // Wired as `EngineHost` wires the shipped panel.
+            controller.onSelectCandidate = { [coordinator = harness.coordinator] index, generation in
+                _ = coordinator.selectCandidate(at: index, expectedGenerationID: generation)
+            }
+            controller.onChangePage = { [coordinator = harness.coordinator] backward, generation in
+                _ = coordinator.changePage(backward: backward, expectedGenerationID: generation)
+            }
+            let client = RecordingClient()
+            client.caretRect = CGRect(x: 400, y: 600, width: 1, height: 18)
+            let token = UUID()
+            for key in "shi" { #expect(harness.coordinator.handleKey(.text(key), token: token, client: client)) }
+
+            let state = try #require(recorder.lastState)
+            #expect(state.candidates.count == 50, "page_size 50 took effect: \(state.candidates.count)")
+            #expect(state.pageIndex == 0 && state.highlightedIndex == 0)
+            let view = controller.panelViewForTesting
+            let panel = controller.panelForTesting
+
+            /// `index` is whole inside the viewport, on screen, and a real click there hits it.
+            func expectReachable(_ index: Int, _ step: String) throws {
+                let layout = try #require(controller.currentLayout, "\(step)")
+                #expect(panel.frame.size == layout.panelSize && view.bounds.size == layout.panelSize, "\(step)")
+                #expect(panel.frame.height <= visible.height && visible.contains(panel.frame), "\(step): panel \(panel.frame)")
+                let viewport = try #require(layout.candidatesViewport, "\(step): the list scrolls")
+                let pill = layout.items[index].pillFrame
+                #expect(viewport.contains(pill), "\(step): \(index) at \(pill) outside \(viewport)")
+                let onScreen = panel.convertToScreen(view.convert(pill, to: nil))
+                #expect(visible.contains(onScreen), "\(step): \(index) at \(onScreen) off screen")
+                let event = try #require(NSEvent.mouseEvent(
+                    with: .leftMouseDown, location: view.convert(pill.center, to: nil), modifierFlags: [], timestamp: 0,
+                    windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+                #expect(layout.hitTest(view.convert(event.locationInWindow, from: nil)) == .candidate(index), "\(step)")
+            }
+            func scroll(_ deltaY: Int32) throws {
+                let cgEvent = try #require(CGEvent(
+                    scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: deltaY, wheel2: 0, wheel3: 0))
+                view.scrollWheel(with: try #require(NSEvent(cgEvent: cgEvent)))
+            }
+
+            let top = try #require(controller.currentLayout)
+            #expect(top.maxVerticalScrollOffset > 0 && top.verticalScrollOffset == 0)
+            #expect(top.highlightedPillFrame == top.items[0].pillFrame)
+            try expectReachable(0, "initial highlight")
+
+            // Arrow keys on the same page scroll just enough to keep the highlight in view.
+            for _ in 0..<30 {
+                _ = harness.coordinator.handleKey(.key(VirtualKeyCode.downArrow, "", .function), token: token, client: client)
+            }
+            let arrowed = try #require(recorder.lastState)
+            #expect(arrowed.candidates == state.candidates && arrowed.highlightedIndex == 30, "\(String(describing: arrowed.highlightedIndex))")
+            let tracked = try #require(controller.currentLayout)
+            #expect(tracked.verticalScrollOffset > 0 && tracked.highlightedPillFrame == tracked.items[30].pillFrame)
+            try expectReachable(30, "highlight after 30 × Down")
+
+            // The wheel scrolls within the page down to candidate 49; Rime never pages.
+            let generation = harness.engine.currentState.generationID
+            let updates = recorder.updateCount
+            var steps = 0
+            while let layout = controller.currentLayout, layout.verticalScrollOffset < layout.maxVerticalScrollOffset, steps < 100 {
+                try scroll(-60)
+                steps += 1
+            }
+            let bottom = try #require(controller.currentLayout)
+            #expect(steps > 1 && bottom.verticalScrollOffset == bottom.maxVerticalScrollOffset)
+            #expect(harness.engine.currentState.generationID == generation && recorder.updateCount == updates, "no Rime paging")
+            #expect(harness.engine.currentState.pageIndex == 0)
+            #expect(visible.contains(panel.frame))
+            try expectReachable(49, "scrolled to the bottom")
+            #expect(bottom.highlightedPillFrame == bottom.items[30].pillFrame, "scrolling never moves the highlight")
+
+            // A real click on candidate 49 commits it.
+            let last = view.convert(bottom.items[49].pillFrame.center, to: nil)
+            client.calls.removeAll()
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = try #require(NSEvent.mouseEvent(
+                    with: type, location: last, modifierFlags: [], timestamp: 0,
+                    windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                    pressure: type == .leftMouseDown ? 1 : 0))
+                type == .leftMouseDown ? view.mouseDown(with: event) : view.mouseUp(with: event)
+            }
+            #expect(client.inserts == [state.candidates[49].text])
+            #expect(!harness.engine.currentState.isComposing && !controller.isVisible)
+
+            // Retyped: the list starts at the top again; at the bottom, the wheel pages Rime
+            // and the next page starts scrolled to its top.
+            for key in "shi" { _ = harness.coordinator.handleKey(.text(key), token: token, client: client) }
+            #expect(controller.currentLayout?.verticalScrollOffset == 0)
+            try scroll(-100_000)
+            let end = try #require(controller.currentLayout)
+            #expect(end.verticalScrollOffset == end.maxVerticalScrollOffset && harness.engine.currentState.pageIndex == 0)
+            try scroll(-60)
+            #expect(harness.engine.currentState.pageIndex == 1, "past the bottom the wheel pages Rime")
+            let next = try #require(recorder.lastState)
+            #expect(next.pageIndex == 1 && next.candidates != state.candidates)
+            #expect(controller.currentLayout?.verticalScrollOffset == 0)
+            #expect(visible.contains(panel.frame))
+        }
+
         @Test func pagingFromThePanelRefreshesCandidates() throws {
             let harness = try Harness()
             defer { harness.shutdown() }
@@ -856,21 +976,26 @@ final class Harness {
     let coordinator: InputSessionCoordinator
     private var isUp = true
 
-    /// `pageSize` overrides the shipped `menu/page_size: 5` in a copied `default.yaml`.
+    /// `pageSize` overrides the shipped `menu/page_size: 5` in a copied `default.yaml`;
+    /// `dictionaryAppendix` adds entry lines to a copied `noema_pinyin.dict.yaml`.
     init(
         withoutPunctuator: Bool = false,
         pageSize: Int? = nil,
+        dictionaryAppendix: String? = nil,
         isSecureInputEnabled: @escaping @MainActor () -> Bool = { false },
         inlinePreeditDisabledBundleIDs: Set<String> = [],
         candidatePresenter: (any CandidatePresenting)? = nil
     ) throws {
-        if withoutPunctuator || pageSize != nil {
+        if withoutPunctuator || pageSize != nil || dictionaryAppendix != nil {
             workspace = try EngineWorkspace(sharedFiles: EngineWorkspace.shippedFiles)
             if withoutPunctuator {
                 try workspace.replaceInSharedFile("noema_pinyin.schema.yaml", "    - punctuator\n", with: "")
             }
             if let pageSize {
                 try workspace.replaceInSharedFile("default.yaml", "page_size: 5", with: "page_size: \(pageSize)")
+            }
+            if let dictionaryAppendix {
+                try workspace.appendToSharedFile("noema_pinyin.dict.yaml", dictionaryAppendix)
             }
         } else {
             workspace = try EngineWorkspace()

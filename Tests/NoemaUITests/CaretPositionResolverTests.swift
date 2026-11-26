@@ -30,6 +30,22 @@ import Testing
         #expect(normalize(CGRect(x: 0, y: 0, width: 2, height: 18)) != nil, "origin .zero with a size is a real caret")
     }
 
+    /// `targetScreen` picks the screen `resolve` places on (valid caret, then this client's
+    /// cache, then the mouse) without touching the cache.
+    @Test func targetScreenFollowsTheResolvePriorityWithoutCaching() throws {
+        var resolver = CaretPositionResolver()
+        let screens = [Self.main, Self.left]
+        let onLeft = CGRect(x: -800, y: 300, width: 1, height: 18)
+        #expect(resolver.targetScreen(caretRect: onLeft, clientKey: "a", screens: screens, fallbackMouseLocation: nil) == Self.left)
+        #expect(resolver.cachedClientCount == 0, "the query never caches")
+        #expect(resolver.targetScreen(caretRect: .zero, clientKey: "a", screens: screens, fallbackMouseLocation: CGPoint(x: 700, y: 400)) == Self.main)
+        _ = resolver.resolve(caretRect: onLeft, clientKey: "a", panelSize: Self.panel, screens: screens, fallbackMouseLocation: nil)
+        #expect(resolver.targetScreen(caretRect: .zero, clientKey: "a", screens: screens, fallbackMouseLocation: CGPoint(x: 700, y: 400)) == Self.left,
+                "the cached caret wins over the mouse")
+        #expect(resolver.targetScreen(caretRect: .zero, clientKey: "b", screens: screens, fallbackMouseLocation: nil) == nil)
+        #expect(resolver.targetScreen(caretRect: onLeft, clientKey: "a", screens: [], fallbackMouseLocation: nil) == nil)
+    }
+
     /// A 0-width vertical caret: `CGRect.intersects` treats it as empty and would reject it.
     @Test func acceptsZeroWidthCaretsIncludingOnScreenEdges() {
         let caret = CGRect(x: 300, y: 500, width: 0, height: 18)

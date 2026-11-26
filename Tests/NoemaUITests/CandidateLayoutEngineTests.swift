@@ -160,6 +160,75 @@ import Testing
         #expect(requested.items.map(\.pillFrame) == layout.items.map(\.pillFrame))
     }
 
+    /// A 50-candidate page (Rime `menu/page_size: 50`) is taller than `maxHeight`: the
+    /// panel stays within it and the list scrolls inside a viewport that follows the
+    /// highlight; scrolled-out candidates are never hit (Codex review of PR #19).
+    @Test func listTallerThanMaxHeightScrollsInsideABoundedViewport() throws {
+        let texts = (0..<50).map { "候选\($0)" }
+        let natural = engine.layout(state: state(texts, preedit: "shi"), options: floating, expanded: false)
+        #expect(natural.isExpanded && natural.panelSize.height > 400)
+        #expect(natural.candidatesViewport == nil && natural.maxVerticalScrollOffset == 0 && natural.verticalScrollOffset == 0)
+        #expect(engine.layout(state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 10_000) == natural,
+                "a list that fits is laid out unchanged")
+
+        func expectInside(_ rect: CGRect?, _ layout: CandidatePanelLayout, _ step: String) throws {
+            let rect = try #require(rect, "\(step)")
+            let viewport = try #require(layout.candidatesViewport, "\(step)")
+            #expect(viewport.contains(rect), "\(step): \(rect) outside \(viewport)")
+            #expect(rect.minY >= 0 && rect.maxY <= layout.panelSize.height, "\(step)")
+        }
+
+        let top = engine.layout(state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 400)
+        let viewport = try #require(top.candidatesViewport)
+        #expect(top.panelSize.height <= 400 && top.maxVerticalScrollOffset > 0 && top.verticalScrollOffset == 0)
+        #expect(top.panelSize.width == natural.panelSize.width)
+        #expect(viewport.minY == natural.items[0].pillFrame.minY && viewport.maxY <= top.panelSize.height)
+        try expectInside(top.highlightedPillFrame, top, "highlight 0")
+        #expect(top.highlightedPillFrame == top.items[0].pillFrame)
+
+        // Hit testing is confined to the viewport.
+        let strip = try #require(top.preeditStrip)
+        #expect(top.hitTest(CGPoint(x: strip.frame.midX, y: strip.frame.midY)) == .none)
+        let firstVisible = top.items[0].pillFrame
+        #expect(top.hitTest(CGPoint(x: firstVisible.midX, y: firstVisible.midY)) == .candidate(0))
+        let hidden = try #require(top.items.first { $0.pillFrame.minY > viewport.maxY })
+        #expect(top.hitTest(CGPoint(x: hidden.pillFrame.midX, y: hidden.pillFrame.midY)) == .none)
+
+        // Highlighting the last candidate scrolls just far enough to show it whole.
+        let bottom = engine.layout(state: state(texts, preedit: "shi", highlighted: 49), options: floating, expanded: false, maxHeight: 400)
+        #expect(bottom.verticalScrollOffset == bottom.maxVerticalScrollOffset)
+        try expectInside(bottom.highlightedPillFrame, bottom, "highlight 49")
+        #expect(bottom.highlightedPillFrame == bottom.items[49].pillFrame)
+        let last = bottom.items[49].pillFrame
+        #expect(bottom.hitTest(CGPoint(x: last.midX, y: last.midY)) == .candidate(49))
+        // Scrolled down, a candidate's shifted frame sits just above the viewport, over the
+        // preedit strip's divider: still no hit.
+        let above = CGPoint(x: viewport.midX, y: viewport.minY - 1)
+        #expect(bottom.items.contains { $0.frame.contains(above) }, "an item is shifted under the strip")
+        #expect(bottom.hitTest(above) == .none)
+
+        // A free scroll position is kept (clamped) without highlight tracking.
+        let free = engine.layout(
+            state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 400,
+            verticalScrollOffset: 100, ensureHighlightVisible: false)
+        #expect(free.verticalScrollOffset == 100 && free.items[0].pillFrame.minY == viewport.minY - 100)
+        let clamped = engine.layout(
+            state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 400,
+            verticalScrollOffset: .infinity, ensureHighlightVisible: false)
+        #expect(clamped.verticalScrollOffset == 0)
+        let past = engine.layout(
+            state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 400,
+            verticalScrollOffset: 1e6, ensureHighlightVisible: false)
+        #expect(past.verticalScrollOffset == past.maxVerticalScrollOffset)
+        // With tracking, a free offset that hides the highlight scrolls back to it.
+        let tracked = engine.layout(
+            state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 400, verticalScrollOffset: 300)
+        #expect(tracked.verticalScrollOffset == 0)
+        // Even a tiny maxHeight shows one whole row.
+        let tiny = engine.layout(state: state(texts, preedit: "shi"), options: floating, expanded: false, maxHeight: 20)
+        #expect(try #require(tiny.candidatesViewport).height == tiny.items[0].pillFrame.height)
+    }
+
     @Test func emojiCandidatesAreDetectedAndNeverSplit() throws {
         #expect(CandidateLayoutEngine.isEmoji("😀") && CandidateLayoutEngine.isEmoji("❤️"))
         #expect(CandidateLayoutEngine.isEmoji("👨‍👩‍👧‍👦") && !CandidateLayoutEngine.isEmoji("你好") && !CandidateLayoutEngine.isEmoji("1"))

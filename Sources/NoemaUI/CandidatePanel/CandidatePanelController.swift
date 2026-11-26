@@ -46,6 +46,8 @@ public final class CandidatePanelController: CandidatePresenting {
     private var glassView: NSGlassEffectView?
     private var effectView: NSVisualEffectView?
     private var lastAppliedFrame: CGRect?
+    /// The in-page scroll of a list taller than the screen; 0 on every new candidate list.
+    private var verticalScrollOffset: CGFloat = 0
 
     /// What the panel shows, kept so the expand button can re-render it in place.
     private struct Presentation {
@@ -96,9 +98,15 @@ public final class CandidatePanelController: CandidatePresenting {
         candidateView.onChangePage = { [weak self] backward, generation in
             self?.onChangePage?(backward, generation)
         }
+        candidateView.onScrollCandidates = { [weak self] offset, generation in
+            guard let self, generation == currentLayout?.generationID else { return }
+            verticalScrollOffset = offset
+            rerender(ensureHighlightVisible: false)
+        }
         candidateView.onToggleExpand = { [weak self] in
             guard let self else { return }
             isExpanded.toggle()
+            verticalScrollOffset = 0
             rerender()
         }
         installBackdrop()
@@ -115,6 +123,8 @@ public final class CandidatePanelController: CandidatePresenting {
         // Index 0 of the marked text: the panel stays put while the caret moves inside it.
         let clientKey = client.uniqueClientIdentifier.flatMap { $0.isEmpty ? nil : $0 }
             ?? options.sessionToken?.uuidString ?? "default"
+        // Arrow keys on the same page keep the scroll; the highlight tracking moves it.
+        if presentation?.state.candidates != state.candidates { verticalScrollOffset = 0 }
         presentation = Presentation(
             state: state, options: options, caretRect: client.caretScreenRect(atUTF16Offset: 0),
             clientKey: clientKey, windowLevel: client.windowLevel)
@@ -125,6 +135,7 @@ public final class CandidatePanelController: CandidatePresenting {
         if isVisible { panel.orderOut(nil) }
         isVisible = false
         isExpanded = false
+        verticalScrollOffset = 0
         hysteresis.reset()
         lastAppliedFrame = nil
         presentation = nil
@@ -134,11 +145,26 @@ public final class CandidatePanelController: CandidatePresenting {
 
     // MARK: - Rendering
 
-    private func rerender() {
+    /// Lays out the presentation bounded to its target screen's visible height (minus the
+    /// screen margins when there is room), so the panel always fits inside the visible frame
+    /// and a list taller than that scrolls; then places it at the caret.
+    private func rerender(ensureHighlightVisible: Bool = true) {
         guard let presentation else { return }
-        let layout = layoutEngine.layout(
-            state: presentation.state, options: presentation.options, expanded: isExpanded, hysteresis: &hysteresis)
         let screens = screensProvider()
+        guard let screen = resolver.targetScreen(
+            caretRect: presentation.caretRect, clientKey: presentation.clientKey, screens: screens,
+            fallbackMouseLocation: NSEvent.mouseLocation)
+        else {
+            hide()
+            return
+        }
+        let visibleHeight = screen.visibleFrame.height
+        let margins = 2 * style.screenMargin
+        let maxHeight = visibleHeight > margins + 80 ? visibleHeight - margins : visibleHeight
+        let layout = layoutEngine.layout(
+            state: presentation.state, options: presentation.options, expanded: isExpanded, hysteresis: &hysteresis,
+            maxHeight: maxHeight, verticalScrollOffset: verticalScrollOffset, ensureHighlightVisible: ensureHighlightVisible)
+        verticalScrollOffset = layout.verticalScrollOffset
         guard let resolution = resolver.resolve(
             caretRect: presentation.caretRect, clientKey: presentation.clientKey, panelSize: layout.panelSize,
             screens: screens, fallbackMouseLocation: NSEvent.mouseLocation)
