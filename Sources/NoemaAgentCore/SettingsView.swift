@@ -67,7 +67,7 @@ public struct SettingsRootView: View {
         } detail: {
             switch model.selectedSection ?? .general {
             case .general: GeneralSettingsView(model: model)
-            case .quickActions: QuickActionsSettingsView()
+            case .quickActions: QuickActionsSettingsView(model: model)
             case .other: OtherSettingsView(model: model)
             case .lexicon: LexiconSettingsView(model: model)
             }
@@ -110,33 +110,45 @@ struct GeneralSettingsView: View {
     }
 }
 
+/// "快速操作": the v-mode shortcuts and the emoji candidate switch.
 struct QuickActionsSettingsView: View {
-    private struct Item: Identifiable {
-        let id: String
-        let title: String
-        let symbol: String
-        let status: String
-    }
+    @Bindable var model: AgentStatusModel
 
-    private let items = [
-        Item(id: "v-mode", title: "v 模式", symbol: "character.cursor.ibeam", status: "计划中（M2）"),
-        Item(id: "clipboard", title: "剪贴板面板", symbol: "doc.on.clipboard", status: "计划中（M2）"),
-        Item(id: "voice", title: "语音输入", symbol: "mic", status: "计划中（M3）"),
-        Item(id: "rewrite", title: "AI 改写", symbol: "sparkles", status: "计划中（M3）"),
-    ]
+    /// What each `v` shortcut does; agent actions show whether they are available yet.
+    static func status(of item: VMenuItem) -> String {
+        guard let action = item.quickAction else { return "离线可用" }
+        if action.isImplemented { return "可用" }
+        return "计划中（\(action.plannedMilestone ?? "")）"
+    }
 
     var body: some View {
         Form {
             Section {
-                ForEach(items) { item in
+                ForEach(VMenuItem.allCases, id: \.self) { item in
                     LabeledContent {
-                        Text(item.status).foregroundStyle(.secondary)
+                        Text(Self.status(of: item)).foregroundStyle(.secondary)
                     } label: {
-                        Label(item.title, systemImage: item.symbol)
+                        Text("v\(item.rawValue)  \(item.title)").monospacedDigit()
                     }
                 }
+            } header: {
+                Text("v 模式")
             } footer: {
-                Text("这些操作由 Noema Agent 承载，所需权限只授予 Noema.app；输入法本身不申请任何权限。")
+                Text("空闲时按 v 打开九宫格菜单：方向键或 Tab 移动，回车或空格选择，Esc 或退格退出。v1+2 直接计算（空格上屏 3），v= 开始一个算式，vv 输入字母 v，v 后接其他字母（如 vim）按回车原样上屏。正在拼音输入时 v 照常参与拼写（lv → 绿）。")
+            }
+            Section {
+                Toggle("候选中显示 Emoji", isOn: Binding(
+                    get: { model.service.settings.emojiCandidatesEnabled },
+                    set: { model.setEmojiCandidatesEnabled($0) }))
+            } header: {
+                Text("Emoji")
+            } footer: {
+                Text("在“你好”“开心”等词后追加 👋、😊 等候选；首选候选不变，Emoji 上屏不会写入学习库。只影响内置方案，万象、雾凇、薄荷使用各自的 Emoji 设置。")
+            }
+            Section {
+                EmptyView()
+            } footer: {
+                Text("这些操作由 Noema Agent 承载，所需权限只授予 Noema.app；输入法本身不申请任何权限。安全输入（密码框）期间 v 模式不会启动。")
             }
         }
         .formStyle(.grouped)

@@ -60,6 +60,19 @@ public final class CompositionIPCReporter {
             candidateCount: state.candidates.count, isASCIIMode: state.isASCIIMode)))
     }
 
+    /// Asks the agent to run a v-mode quick action. Sends nothing under secure input (the
+    /// shell never dispatches one then; this is the second of three barriers, the manager's
+    /// `sendFireAndForget` and `send` the third), counting it in `suppressedForSecureInput`.
+    /// The manager stamps the connection epoch when it sends.
+    public func requestQuickAction(_ action: QuickActionID) {
+        guard !isSecureInputEnabled() else {
+            suppressedForSecureInput += 1
+            return
+        }
+        reportedCount += 1
+        sink(.quickActionRequested(sessionEpoch: IPCConnectionManager.unstampedEpoch, action: action))
+    }
+
     /// Asks the agent to open its Settings window; suppressed under secure input too.
     public func requestOpenSettings(section: SettingsSectionID? = nil) {
         guard !isSecureInputEnabled() else {

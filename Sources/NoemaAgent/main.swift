@@ -57,9 +57,12 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
         let transport = XPCListenerServerTransport(machService: NoemaPaths.agentMachServiceName, policy: policy)
         let model = model
         let coordinator = AgentServiceCoordinator(
-            transport: transport, agentVersion: bundleVersion(),
+            transport: transport, agentVersion: bundleVersion(), settings: Self.savedSettings(),
             onOpenSettings: { section in
                 DispatchQueue.main.async { MainActor.assumeIsolated { AgentAppDelegate.current?.showSettings(section: section) } }
+            },
+            onQuickAction: { action in
+                DispatchQueue.main.async { MainActor.assumeIsolated { AgentAppDelegate.current?.runQuickAction(action) } }
             },
             onChange: { snapshot in
                 DispatchQueue.main.async {
@@ -71,6 +74,10 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
             })
         self.coordinator = coordinator
         model.lexicon = LexiconController(requestSwitch: coordinator.schemaSwitchRequester)
+        model.settingsUpdater = { settings in
+            UserDefaults.standard.set(settings.emojiCandidatesEnabled, forKey: Self.emojiCandidatesEnabledKey)
+            coordinator.updateSettings(settings)
+        }
 
         switch coordinator.start() {
         case .listening:
@@ -189,6 +196,33 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openSettingsFromMenu(_ sender: Any?) {
         showSettings(section: nil)
     }
+
+    // MARK: - Quick actions and settings
+
+    static let emojiCandidatesEnabledKey = "EmojiCandidatesEnabled"
+
+    /// The settings saved by the Settings window (`UserDefaults`), defaults otherwise.
+    static func savedSettings() -> AgentSettingsSnapshot {
+        var settings = AgentSettingsSnapshot.defaults
+        if let enabled = UserDefaults.standard.object(forKey: emojiCandidatesEnabledKey) as? Bool {
+            settings.emojiCandidatesEnabled = enabled
+        }
+        return settings
+    }
+
+    /// A v-mode quick action from the IME: `v9` opens Settings; an action that ships in a
+    /// later milestone shows a non-activating toast, so focus stays in the user's editor.
+    func runQuickAction(_ action: QuickActionID) {
+        log.info("quick action \(action.rawValue, privacy: .public)")
+        if action == .settings {
+            showSettings(section: .general)
+            return
+        }
+        guard !action.isImplemented else { return }
+        toast.show(action)
+    }
+
+    private lazy var toast = QuickActionToastController()
 
     // MARK: - Settings window
 

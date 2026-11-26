@@ -23,11 +23,30 @@ public struct AgentSettingsSnapshot: Codable, Sendable, Hashable {
     /// `CandidatePanelBackdrop` raw value (`glass` or `visualEffect`).
     public var panelBackdropPreference: String
     public var aiSuggestionsEnabled: Bool
+    /// Emoji candidates after matching words (librime option `emoji_suggestion`). Appended
+    /// to v1: absent decodes as true, the schema's default.
+    public var emojiCandidatesEnabled: Bool
 
-    public init(inlinePreeditDisabledBundleIDs: [String] = [], panelBackdropPreference: String = "glass", aiSuggestionsEnabled: Bool = false) {
+    public init(
+        inlinePreeditDisabledBundleIDs: [String] = [], panelBackdropPreference: String = "glass", aiSuggestionsEnabled: Bool = false,
+        emojiCandidatesEnabled: Bool = true
+    ) {
         self.inlinePreeditDisabledBundleIDs = inlinePreeditDisabledBundleIDs
         self.panelBackdropPreference = panelBackdropPreference
         self.aiSuggestionsEnabled = aiSuggestionsEnabled
+        self.emojiCandidatesEnabled = emojiCandidatesEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inlinePreeditDisabledBundleIDs, panelBackdropPreference, aiSuggestionsEnabled, emojiCandidatesEnabled
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        inlinePreeditDisabledBundleIDs = try container.decode([String].self, forKey: .inlinePreeditDisabledBundleIDs)
+        panelBackdropPreference = try container.decode(String.self, forKey: .panelBackdropPreference)
+        aiSuggestionsEnabled = try container.decode(Bool.self, forKey: .aiSuggestionsEnabled)
+        emojiCandidatesEnabled = try container.decodeIfPresent(Bool.self, forKey: .emojiCandidatesEnabled) ?? true
     }
 
     public static let defaults = AgentSettingsSnapshot()
@@ -154,6 +173,9 @@ public enum IMEToAgent: IPCMessage {
     case engineModeChanged(sessionEpoch: UUID, engineMode: String)
     /// Progress of an `AgentToIME.switchSchemaSet` (appended to v1).
     case schemaSwitchStatus(sessionEpoch: UUID, status: SchemaSetSwitchStatus)
+    /// The user picked a v-mode quick action (`v2`, `v4`, `v6`, `v7`, `v9`; appended to v1).
+    /// Names the action only, never user text; never sent under secure input.
+    case quickActionRequested(sessionEpoch: UUID, action: QuickActionID)
 
     public static let helloKind = "ime.hello"
     public static let heartbeatKind = "ime.heartbeat"
@@ -161,6 +183,7 @@ public enum IMEToAgent: IPCMessage {
     public static let openSettingsRequestedKind = "ime.openSettingsRequested"
     public static let engineModeChangedKind = "ime.engineModeChanged"
     public static let schemaSwitchStatusKind = "ime.schemaSwitchStatus"
+    public static let quickActionRequestedKind = "ime.quickActionRequested"
 
     public var kind: String {
         switch self {
@@ -170,6 +193,7 @@ public enum IMEToAgent: IPCMessage {
         case .openSettingsRequested: Self.openSettingsRequestedKind
         case .engineModeChanged: Self.engineModeChangedKind
         case .schemaSwitchStatus: Self.schemaSwitchStatusKind
+        case .quickActionRequested: Self.quickActionRequestedKind
         }
     }
 
@@ -182,10 +206,11 @@ public enum IMEToAgent: IPCMessage {
         case .openSettingsRequested: nil
         case .engineModeChanged(let epoch, _): epoch
         case .schemaSwitchStatus(let epoch, _): epoch
+        case .quickActionRequested(let epoch, _): epoch
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case kind, hello, sessionEpoch, snapshot, section, engineMode, status }
+    private enum CodingKeys: String, CodingKey { case kind, hello, sessionEpoch, snapshot, section, engineMode, status, action }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -204,6 +229,10 @@ public enum IMEToAgent: IPCMessage {
             self = .schemaSwitchStatus(
                 sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
                 status: try container.decode(SchemaSetSwitchStatus.self, forKey: .status))
+        case Self.quickActionRequestedKind:
+            self = .quickActionRequested(
+                sessionEpoch: try container.decode(UUID.self, forKey: .sessionEpoch),
+                action: try container.decode(QuickActionID.self, forKey: .action))
         default:
             throw IPCError.malformedFrame
         }
@@ -223,6 +252,9 @@ public enum IMEToAgent: IPCMessage {
         case .schemaSwitchStatus(let epoch, let status):
             try container.encode(epoch, forKey: .sessionEpoch)
             try container.encode(status, forKey: .status)
+        case .quickActionRequested(let epoch, let action):
+            try container.encode(epoch, forKey: .sessionEpoch)
+            try container.encode(action, forKey: .action)
         }
     }
 }

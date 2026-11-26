@@ -49,6 +49,7 @@ final class EngineHost {
                 return nil
             },
             candidatePresenter: panel,
+            vModePresenter: panel,
             inlinePreeditDisabledBundleIDs: Self.inlinePreeditDisabledBundleIDs())
         panel.onSelectCandidate = { [weak coordinator] index, generation in
             coordinator?.selectCandidate(at: index, expectedGenerationID: generation)
@@ -56,10 +57,17 @@ final class EngineHost {
         panel.onChangePage = { [weak coordinator] backward, generation in
             coordinator?.changePage(backward: backward, expectedGenerationID: generation)
         }
+        panel.onSelectVModeItem = { [weak coordinator] index, generation in
+            coordinator?.selectVModeItem(at: index, expectedGenerationID: generation)
+        }
         candidatePanel = panel
         coordinator.onCompositionChange = { [unowned self] state in
             self.reporter?.report(state)
             self.switcher?.compositionDidChange(state)
+        }
+        // A v-mode agent cell (`v2` … `v9`): fire-and-forget, nothing under secure input.
+        coordinator.onQuickAction = { [unowned self] action in
+            self.reporter?.requestQuickAction(action)
         }
         return coordinator
     }()
@@ -79,6 +87,8 @@ final class EngineHost {
     private var logDir = NoemaPaths.logDir()
     /// Set once a boot of a non-built-in set fell back to the built-in one.
     private var triedBuiltinFallback = false
+    /// The agent's emoji candidate setting, applied to every engine that becomes ready.
+    private(set) var emojiCandidatesEnabled = AgentSettingsSnapshot.defaults.emojiCandidatesEnabled
 
     private init() {}
 
@@ -161,6 +171,7 @@ final class EngineHost {
                 log.error("RimeEngine is in Safe Mode: \(reason.rawValue, privacy: .public)")
             } else {
                 log.info("RimeEngine ready")
+                engine.setOption(Self.emojiOptionName, enabled: emojiCandidatesEnabled)
                 attachLearning(to: engine)
             }
         case .failure(let error):
@@ -221,7 +232,7 @@ final class EngineHost {
     /// (AppKit `terminate(_:)`, a signal source), where no main-actor continuation could run
     /// before the process exits. Idempotent.
     func shutdown(deployerGrace: Duration = .milliseconds(500)) {
-        candidatePanel?.hide()
+        candidatePanel?.hideAll()
         stopAgentConnection()
         switch state {
         case .unavailable:
@@ -331,16 +342,39 @@ final class EngineHost {
         // Called on the manager's queue for every message the gate admitted (epoch and
         // generation checked); a switch hops to the main queue, never blocking the manager's.
         // `DispatchQueue.main` keeps the requests in arrival order (one Task each would not).
-        manager.setMessageHandler { [weak self] message in
-            guard case .switchSchemaSet(_, let request) = message else { return }
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.handleSchemaSwitchRequest(request) }
+        manager.setMessageHandler { [weak self, weak manager] message in
+            switch message {
+            case .switchSchemaSet(_, let request):
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.handleSchemaSwitchRequest(request) }
+                }
+            case .helloAck, .settingsSnapshot:
+                // The settings the manager applied (a stale revision never reaches here, and
+                // an ack overtaken by a newer snapshot keeps the newer settings).
+                guard let settings = manager?.agentSettings else { return }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.applyAgentSettings(settings) }
+                }
+            case .heartbeatAck, .aiSuggestion:
+                break
             }
         }
         switch state {
         case .ready(let engine): manager.setEngineMode(engine.safeModeReason == nil ? "rime" : "safeMode")
         case .unavailable: manager.setEngineMode("unavailable")
         case .uninitialized, .booting: manager.setEngineMode("booting")
+        }
+    }
+
+    /// The librime option behind `AgentSettingsSnapshot.emojiCandidatesEnabled`.
+    static let emojiOptionName = "emoji_suggestion"
+
+    /// Applies the agent's settings that the IME honors: emoji candidates, on the ready
+    /// engine now and on every later one.
+    func applyAgentSettings(_ settings: AgentSettingsSnapshot) {
+        emojiCandidatesEnabled = settings.emojiCandidatesEnabled
+        if case .ready(let engine) = state, engine.safeModeReason == nil {
+            engine.setOption(Self.emojiOptionName, enabled: settings.emojiCandidatesEnabled)
         }
     }
 
