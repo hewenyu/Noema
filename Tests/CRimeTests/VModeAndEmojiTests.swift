@@ -83,6 +83,65 @@ extension LibrimeSerializedTests {
             #expect(!candidates(engine, "nihao").contains("👋"))
         }
 
+        /// Codex PR #22 round 1: an asynchronous `emoji_suggestion` change mid-composition
+        /// refreshes `CompositionState`, advances `generationID`, updates the panel, and
+        /// rejects any click carrying the pre-update generation (preventing a click on the old
+        /// `👋` slot from selecting `你`). A no-op option echo leaves `generationID` untouched,
+        /// and `refreshPresentation()` touches nothing under secure input.
+        @Test func asyncEmojiOptionChangeMidCompositionRefreshesPanelAndRejectsStaleClick() throws {
+            let secure = SecureFlag()
+            let controller = Self.panel()
+            let harness = try Self.harness(controller, secure: secure)
+            defer { harness.shutdown(); controller.hideAll() }
+            var reportedGenerations: [UInt64] = []
+            harness.coordinator.onCompositionChange = { reportedGenerations.append($0.generationID) }
+            let client = RecordingClient()
+            client.caretRect = CGRect(x: 400, y: 600, width: 1, height: 18)
+            let token = UUID()
+
+            Self.type("nihao", harness, token, client)
+            let before = harness.engine.currentState
+            let shownBefore = try #require(controller.currentLayout?.items.map(\.displayText))
+            #expect(Array(shownBefore.prefix(2)) == ["你好", "👋"], "\(shownBefore)")
+            let staleGeneration = before.generationID
+            let emojiIndex = try #require(shownBefore.firstIndex(of: "👋"))
+
+            // Agent pushes `emojiCandidatesEnabled = false` asynchronously mid-composition.
+            let after = harness.engine.setOption(EngineHostEmojiOption.name, enabled: false)
+            #expect(after.generationID > staleGeneration, "option flip must advance generationID")
+            #expect(!after.candidates.map(\.text).contains("👋"))
+            harness.coordinator.refreshPresentation()
+
+            let shownAfter = try #require(controller.currentLayout?.items.map(\.displayText))
+            #expect(!shownAfter.contains("👋"), "panel still showed stale emoji: \(shownAfter)")
+            #expect(controller.currentLayout?.generationID == after.generationID)
+            #expect(reportedGenerations.last == after.generationID)
+
+            // Clicking the old `👋` index with the stale generation is rejected and mutates nothing.
+            client.calls.removeAll()
+            #expect(!harness.coordinator.selectCandidate(at: emojiIndex, expectedGenerationID: staleGeneration))
+            #expect(client.calls.isEmpty && client.inserts.isEmpty)
+            #expect(harness.engine.currentState.preedit == after.preedit)
+
+            // Re-applying the same option value is a no-op and does not invalidate clicks.
+            let echoed = harness.engine.setOption(EngineHostEmojiOption.name, enabled: false)
+            #expect(echoed.generationID == after.generationID)
+
+            // Under secure input, `refreshPresentation()` touches neither client nor listeners.
+            let reportedBeforeSecure = reportedGenerations.count
+            secure.isOn = true
+            _ = harness.engine.setOption(EngineHostEmojiOption.name, enabled: true)
+            harness.coordinator.refreshPresentation()
+            #expect(client.calls.isEmpty && reportedGenerations.count == reportedBeforeSecure)
+            secure.isOn = false
+
+            // After syncing to the latest generation, selecting index 0 commits `你好`.
+            harness.coordinator.refreshPresentation()
+            let currentGen = harness.engine.currentState.generationID
+            #expect(harness.coordinator.selectCandidate(at: 0, expectedGenerationID: currentGen))
+            #expect(client.inserts == ["你好"])
+        }
+
         // MARK: - Deployer: upstream `v` recognizers
 
         /// An upstream schema (万象 and 雾凇 ship one) with `recognizer/patterns/v` and

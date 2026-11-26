@@ -406,6 +406,19 @@ public final class InputSessionCoordinator {
         vModePresenter.hideVMode()
     }
 
+    /// Re-syncs marked text, candidate panel, and composition listeners with the engine's
+    /// current state (e.g. after an out-of-band option change such as `emoji_suggestion`
+    /// arrives from the agent mid-composition). A no-op under secure input, while v-mode is
+    /// active, in Safe Mode, or without an active owner.
+    public func refreshPresentation() {
+        guard !isSecureInputEnabled(), !vModeState.isActive, activeToken != nil, let client = activeClient,
+              let engine = engineProvider()
+        else { return }
+        let state = engine.currentState
+        guard !state.isSafeMode else { return }
+        applyResult(KeyHandlingResult(handled: false, state: state), to: client)
+    }
+
     // MARK: - Panel clicks
 
     /// The user clicked candidate `index` of the panel showing `expectedGenerationID`.

@@ -342,11 +342,17 @@ public final class RimeEngine: TypingEngine {
     public private(set) var optionOverrides: [String: Bool] = [:]
 
     /// Sets librime session option `name` (`emoji_suggestion`, …) now and on every later
-    /// session. An option the schema does not declare is stored and set, and changes nothing.
-    public func setOption(_ name: String, enabled: Bool) {
+    /// session. When the live session's option value changes, refreshes `currentState` (bumping
+    /// `generationID` and updating candidates) so any panel showing the previous candidates
+    /// cannot accept a stale click against librime's refreshed candidate list.
+    @discardableResult
+    public func setOption(_ name: String, enabled: Bool) -> CompositionState {
         optionOverrides[name] = enabled
-        guard isServing, resources.session != 0 else { return }
+        guard isServing, resources.session != 0 else { return currentState }
+        let previous = api.pointee.get_option(resources.session, name) != 0
         api.pointee.set_option(resources.session, name, enabled ? 1 : 0)
+        guard previous != enabled else { return currentState }
+        return refreshState()
     }
 
     /// librime's current value of session option `name`; nil without a live session.

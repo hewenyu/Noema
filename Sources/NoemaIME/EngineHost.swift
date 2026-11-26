@@ -370,11 +370,17 @@ final class EngineHost {
     static let emojiOptionName = "emoji_suggestion"
 
     /// Applies the agent's settings that the IME honors: emoji candidates, on the ready
-    /// engine now and on every later one.
+    /// engine now and on every later one. When an option flip changes an active composition,
+    /// refreshes the coordinator's presentation so the panel and `generationID` stay in sync
+    /// with librime's candidate list.
     func applyAgentSettings(_ settings: AgentSettingsSnapshot) {
         emojiCandidatesEnabled = settings.emojiCandidatesEnabled
-        if case .ready(let engine) = state, engine.safeModeReason == nil {
-            engine.setOption(Self.emojiOptionName, enabled: settings.emojiCandidatesEnabled)
+        if case .ready(let engine) = state {
+            let before = engine.currentState
+            let after = engine.setOption(Self.emojiOptionName, enabled: settings.emojiCandidatesEnabled)
+            if candidatePanel != nil, after.generationID != before.generationID, before.isComposing || after.isComposing {
+                coordinator.refreshPresentation()
+            }
         }
     }
 
