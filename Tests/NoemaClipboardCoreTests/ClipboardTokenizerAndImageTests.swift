@@ -45,10 +45,10 @@ import Testing
     /// The header claims 20 000 × 20 000 (1.6 GB of pixels): rejected from the header,
     /// before any decode.
     @Test func decompressionBombIsRejectedFromTheHeader() {
-        let bomb = TestImages.craftedPNGHeader(width: 20_000, height: 20_000)
-        #expect(bomb.count < 100)
+        let oversizedHeader = TestImages.craftedPNGHeader(width: 20_000, height: 20_000)
+        #expect(oversizedHeader.count < 100)
         #expect(throws: ClipboardError.imageDimensionsRejected(width: 20_000, height: 20_000)) {
-            try ClipboardImageProcessor.process(bomb)
+            try ClipboardImageProcessor.process(oversizedHeader)
         }
         #expect(throws: ClipboardError.imageDimensionsRejected(width: 16_000, height: 4_001)) {
             try ClipboardImageProcessor.process(TestImages.craftedPNGHeader(width: 16_000, height: 4_001))

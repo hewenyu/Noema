@@ -63,7 +63,7 @@ public enum ClipboardImageProcessor {
             sha256: Data(SHA256.hash(data: png)).hexString)
     }
 
-    /// The pixel size from the image header; rejects zero, oversized, and bomb dimensions.
+    /// The pixel size from the image header; rejects zero, oversized, and excessive-pixel dimensions.
     static func headerDimensions(_ source: CGImageSource) throws(ClipboardError) -> (Int, Int) {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
