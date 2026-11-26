@@ -335,6 +335,52 @@ public final class LearningStore: @unchecked Sendable {
         }
     }
 
+    /// Merges entries carried over from another store (a legacy userdb) in one `BEGIN
+    /// IMMEDIATE` transaction: a new phrase is inserted with `frequency` (at least 1), a known
+    /// one keeps the larger of its own and `frequency`. Only a changed row gets the next store
+    /// revision, so importing the same entries again changes nothing. Events that do not
+    /// normalize are skipped. Returns how many rows were inserted or raised.
+    @discardableResult
+    public func importMigratedEntries(_ entries: [(event: LearningCommitEvent, frequency: Int64)]) throws(LearningStoreError) -> Int {
+        let rows = entries.compactMap { entry -> (String, String, String, Int64, Bool, Date)? in
+            guard let key = entry.event.normalized() else { return nil }
+            return (key.pinyinNorm, key.pinyinCompact, key.text, max(entry.frequency, 1), entry.event.isUserPhrase, entry.event.timestamp)
+        }
+        guard !rows.isEmpty else { return 0 }
+        return try withWriteTransaction { db throws(LearningStoreError) in
+            var revision = try Self.metaValue(db, "revision") ?? 0
+            let sql = """
+                INSERT INTO entries(pinyin_norm, pinyin_compact, text, frequency, is_user_phrase, updated_at, revision)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(pinyin_norm, text) DO UPDATE SET
+                  frequency = excluded.frequency,
+                  updated_at = max(updated_at, excluded.updated_at),
+                  revision = excluded.revision
+                WHERE excluded.frequency > entries.frequency
+                """
+            let statement = try Self.prepare(db, sql)
+            defer { sqlite3_finalize(statement) }
+            var changed = 0
+            for (norm, compact, text, frequency, isUserPhrase, timestamp) in rows {
+                sqlite3_reset(statement)
+                Self.bind(statement, 1, norm)
+                Self.bind(statement, 2, compact)
+                Self.bind(statement, 3, text)
+                sqlite3_bind_int64(statement, 4, frequency)
+                sqlite3_bind_int64(statement, 5, isUserPhrase ? 1 : 0)
+                sqlite3_bind_double(statement, 6, timestamp.timeIntervalSince1970)
+                sqlite3_bind_int64(statement, 7, revision + 1)
+                try Self.stepDone(db, statement)
+                if sqlite3_changes(db) > 0 {
+                    revision += 1
+                    changed += 1
+                }
+            }
+            try Self.setMetaValue(db, "revision", revision)
+            return changed
+        }
+    }
+
     /// The `codeFormat` of a watermark written without one, and of every row that predates
     /// the `code_format` column (Noema projected only toneless codes then).
     public static let defaultCodeFormat = "toneless"

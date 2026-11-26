@@ -1,3 +1,4 @@
+import CRime
 import Darwin
 import Foundation
 import NoemaAgentCore
@@ -1047,6 +1048,138 @@ extension LibrimeSerializedTests {
             #expect(fallback.schemaSetID == .builtin && fallback.schemaID == "noema_pinyin" && fallback.sharedDataDir == LexiconWorkspace.builtin)
         }
 
+        /// The built-in schema lists `uniquifier` (Codex #4711467996): a phrase both the
+        /// projected `noema_pinyin.userdb` and `lua_translator@*noema_learned` offer appears
+        /// once. A user `noema_pinyin.custom.yaml` appending a translator keeps the filter.
+        @Test func builtinSchemaDeduplicatesUserDBAndLuaLearnedCandidates() async throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            let store = try workspace.openStore()
+            defer { store.close() }
+            #expect(try store.recordBatch([LearningCommitEvent(rawInput: "nihao", preedit: "ni hao", text: "霓昊")]) == 1)
+            let report = try await engine.switchSchemaSet(
+                to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store, luaFile: LexiconWorkspace.lua)
+            #expect(report.userDBFailure == nil && report.learnedLines == 1)
+            let tsv = try String(contentsOf: workspace.setDir(.builtin).appending(path: NoemaPaths.learnedTSVFileName), encoding: .utf8)
+            #expect(tsv == "nihao\t霓昊\t1\n")
+            let served = candidates(engine, "nihao")
+            #expect(served.filter { $0 == "霓昊" }.count == 1, "\(served)")
+
+            // A user patch appending a translator never touches `engine/filters`.
+            try "patch:\n  \"engine/translators/+\":\n    - table_translator@custom_phrase\n"
+                .write(to: workspace.setDir(.builtin).appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+            try await engine.switchSchemaSet(
+                to: .builtin, sharedDataDir: LexiconWorkspace.builtin, learningStore: store, luaFile: LexiconWorkspace.lua)
+            let compiled = try String(
+                contentsOf: workspace.setDir(.builtin).appending(path: "build/noema_pinyin.schema.yaml"), encoding: .utf8)
+            #expect(compiled.contains("uniquifier") && compiled.contains("table_translator@custom_phrase"), "\(compiled)")
+            let patched = candidates(engine, "nihao")
+            #expect(patched.filter { $0 == "霓昊" }.count == 1, "\(patched)")
+        }
+
+        /// A pre-schema-set install upgrades in place (Codex #4711467981): the legacy root's
+        /// `noema_pinyin.custom.yaml` and `noema_pinyin.userdb` move into `sets/builtin/` on
+        /// the first `EngineHost` boot (`activeSchemaSet`, no `active-schema-set.json`), the
+        /// userdb's phrases enter `learning.sqlite` with their frequency, and other sets see
+        /// them. A second boot (and a retry after a crash before the marker) never doubles a
+        /// frequency, and a symlinked legacy entry is never copied.
+        @Test func legacyRootUserDataMigratesIntoTheBuiltinSet() async throws {
+            let workspace = try LexiconWorkspace()
+            let root = workspace.user
+            let builtinDir = workspace.setDir(.builtin)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try "patch:\n  menu/page_size: 9\n".write(
+                to: root.appending(path: "noema_pinyin.custom.yaml"), atomically: true, encoding: .utf8)
+
+            // The legacy install: librime's user_data_dir is the root itself.
+            let legacyConfiguration = RimeEngineConfiguration(
+                sharedDataDir: LexiconWorkspace.builtin, userDataDir: root, logDir: workspace.logs, luaFile: nil)
+            var legacy = try RimeEngine(configuration: legacyConfiguration)
+            try #require(!legacy.isSafeMode)
+            #expect(!candidates(legacy, "nihao").contains("霓昊"))
+            legacy.shutdown()
+            try importIntoLegacyUserDB(root: root, logs: workspace.logs, "霓昊\tni hao\t100\n")
+            legacy = try RimeEngine(configuration: legacyConfiguration)
+            legacy.type("nihao")
+            #expect(legacy.currentState.pageSize == 9)
+            #expect(candidates(legacy, "nihao").contains("霓昊"))
+            legacy.shutdown()
+            try #require(FileSafety.isRealDirectory(root.appending(path: "noema_pinyin.userdb")))
+            #expect(!FileManager.default.fileExists(atPath: NoemaPaths.learningStoreURL(root: root).path))
+
+            // Symlinked legacy entries, and an interrupted earlier copy, in the root.
+            let outside = workspace.root.appending(path: "outside", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            try "patch:\n  menu/page_size: 2\n".write(to: outside.appending(path: "evil.yaml"), atomically: true, encoding: .utf8)
+            try FileManager.default.createSymbolicLink(
+                at: root.appending(path: "evil.custom.yaml"), withDestinationURL: outside.appending(path: "evil.yaml"))
+            try FileManager.default.createSymbolicLink(at: root.appending(path: "evil.userdb"), withDestinationURL: outside)
+            try FileManager.default.createDirectory(at: builtinDir, withIntermediateDirectories: true)
+            let leftover = builtinDir.appending(path: ".migrate.noema_pinyin.userdb.1.stale", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+
+            // The upgraded EngineHost boot path.
+            func boot() async throws -> RimeEngine {
+                try await RimeEngine.start(configuration: .activeSchemaSet(
+                    root: root, builtinSharedDataDir: LexiconWorkspace.builtin, logDir: workspace.logs, luaFile: LexiconWorkspace.lua))
+            }
+            func frequency() throws -> Int64? {
+                let store = try workspace.openStore()
+                defer { store.close() }
+                return try store.allEntries().first { $0.pinyinNorm == "ni hao" && $0.text == "霓昊" }?.frequency
+            }
+            var engine = try await boot()
+            try #require(!engine.isSafeMode && engine.configuration.schemaSetID == .builtin)
+            engine.type("nihao")
+            #expect(engine.currentState.pageSize == 9, "noema_pinyin.custom.yaml was not migrated")
+            let served = candidates(engine, "nihao")
+            #expect(served.filter { $0 == "霓昊" }.count == 1, "\(served)")
+            #expect(LegacyRootMigrator.isMigrated(builtinDir: builtinDir))
+            #expect(try frequency() == 100)
+            let tsv = try String(contentsOf: builtinDir.appending(path: NoemaPaths.learnedTSVFileName), encoding: .utf8)
+            #expect(tsv == "nihao\t霓昊\t100\n")
+            let names = try FileManager.default.contentsOfDirectory(atPath: builtinDir.path)
+            #expect(!names.contains { $0.hasPrefix("evil") || $0.hasPrefix(".migrate.") }, "\(names)")
+            #expect(FileSafety.isRegularFile(root.appending(path: "noema_pinyin.custom.yaml")), "the root original is kept")
+            #expect(FileSafety.isRealDirectory(root.appending(path: "noema_pinyin.userdb")))
+
+            // Another set serves the migrated phrase from learning.sqlite.
+            let store = try workspace.openStore()
+            let report = try await engine.switchSchemaSet(
+                to: .rimeIce, sharedDataDir: workspace.schemaDir(.rimeIce), schemaID: "rime_ice_fixture",
+                learningStore: store, luaFile: nil)
+            store.close()
+            #expect(report.userDBFailure == nil)
+            #expect(candidates(engine, "nihao").contains("霓昊"))
+            try await engine.switchSchemaSet(to: .builtin, sharedDataDir: LexiconWorkspace.builtin, luaFile: LexiconWorkspace.lua)
+            engine.shutdown()
+            try FileManager.default.removeItem(at: NoemaPaths.activeSchemaSetURL(root: root))
+
+            // Idempotent: a marked boot skips; a retry after a crash before the marker keeps 100.
+            engine = try await boot()
+            #expect(!engine.isSafeMode)
+            #expect(try frequency() == 100)
+            engine.shutdown()
+            try FileManager.default.removeItem(at: LegacyRootMigrator.markerURL(builtinDir: builtinDir))
+            engine = try await boot()
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode && LegacyRootMigrator.isMigrated(builtinDir: builtinDir))
+            #expect(try frequency() == 100)
+            #expect(candidates(engine, "nihao").filter { $0 == "霓昊" }.count == 1)
+        }
+
+        /// A fresh root (no legacy files) is marked migrated on its first built-in boot and
+        /// gets no `learning.sqlite` from the migration.
+        @Test func freshRootIsMarkedMigratedWithoutALearningStore() async throws {
+            let workspace = try LexiconWorkspace()
+            let engine = try workspace.engine()
+            defer { engine.shutdown() }
+            #expect(!engine.isSafeMode)
+            #expect(LegacyRootMigrator.isMigrated(builtinDir: workspace.setDir(.builtin)))
+            #expect(!FileManager.default.fileExists(atPath: NoemaPaths.learningStoreURL(root: workspace.user).path))
+        }
+
         /// Under secure input nothing is learned: the shell passes every key through before
         /// the engine sees it, and the recorder drops commits on its own as well. The same
         /// keys with secure input off do write a row.
@@ -1508,8 +1641,8 @@ final class LexiconWorkspace {
         if !text.contains("汉语\t") {
             try (text + "汉语\than yu\t100000\n").write(to: dictionaryURL, atomically: true, encoding: .utf8)
         }
-        try replace(in: set, "\(schemaID).schema.yaml", "    - script_translator\n", with: """
-                - script_translator
+        // The shipped schema already lists `uniquifier`; `simplifier@cc` runs before it.
+        try replace(in: set, "\(schemaID).schema.yaml", "  filters:\n    - uniquifier\n", with: """
               filters:
                 - simplifier@cc
                 - uniquifier
@@ -1736,4 +1869,31 @@ func tree(_ directory: URL) throws -> [String: Data] {
         if FileSafety.isRegularFile(url) { result[relative] = try Data(contentsOf: url) }
     }
     return result
+}
+
+/// Imports `tsv` into the legacy root's `noema_pinyin.userdb` through librime's levers, with
+/// librime initialized on `root` as a pre-schema-set install ran it and no session open.
+@MainActor
+func importIntoLegacyUserDB(root: URL, logs: URL, _ tsv: String) throws {
+    let api = try #require(noema_rime_get_api()).pointee
+    let file = logs.appending(path: "legacy-import.tsv")
+    try tsv.write(to: file, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: file) }
+    var traits = RimeTraits()
+    noema_rime_traits_init(&traits)
+    let sources: [String] = [LexiconWorkspace.builtin.path, root.path, "Noema", "noema", "0", "rime.noema", logs.path]
+    let strings: [UnsafeMutablePointer<CChar>] = try sources.map { try #require(strdup($0)) }
+    defer { strings.forEach { free($0) } }
+    traits.shared_data_dir = UnsafePointer(strings[0])
+    traits.user_data_dir = UnsafePointer(strings[1])
+    traits.distribution_name = UnsafePointer(strings[2])
+    traits.distribution_code_name = UnsafePointer(strings[3])
+    traits.distribution_version = UnsafePointer(strings[4])
+    traits.app_name = UnsafePointer(strings[5])
+    traits.log_dir = UnsafePointer(strings[6])
+    traits.min_log_level = 2
+    api.initialize(&traits)
+    defer { api.finalize() }
+    let levers = try #require(noema_rime_get_levers_api())
+    #expect(levers.pointee.import_user_dict("noema_pinyin", file.path) == 1)
 }

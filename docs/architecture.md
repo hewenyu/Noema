@@ -42,7 +42,7 @@ Tests use Swift Testing only, one target per library (see `Package.swift`). `CRi
 
 `TypingEngine` is the synchronous, `@MainActor` boundary between the IMKit shell and an engine: `processKey(_:)` returns a `KeyHandlingResult` whose `committedText` and `handled` are independent. `RimeEngine` implements it:
 
-- **Boot** — claim the process-wide librime, take the `user_data_dir` lock and arm the `BootGuard` sentinel, prepare `build/` off the main actor, initialize, open a session on `schemaID`, then disarm.
+- **Boot** — claim librime, lock the root, arm `BootGuard`, copy legacy root data into `sets/builtin/`, prepare `build/` off the main actor, initialize, open a session on `schemaID`, then disarm.
 - **Deployment** — `build/` is trusted only when `DeployManifest.validated` matches a fresh SHA-256 inventory. `noema-rime-deployer` runs with a timeout in a locked staging directory; the result is re-validated and swapped in with `renamex_np(RENAME_SWAP)`, and any failure leaves `build/` unchanged ([`RimeEngine+Deploy.swift`](../Sources/NoemaEngine/RimeEngine+Deploy.swift)).
 - **Safe Mode** — any boot failure sets a `SafeModeReason`, releases librime, and answers every key with `handled: false`; `recoverFromSafeMode()` boots again.
 - **State** — every call drains `RimeCommit` and rebuilds `CompositionState`; offsets are UTF-16, and `generationID` strictly increases.

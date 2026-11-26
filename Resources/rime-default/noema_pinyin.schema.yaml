@@ -35,6 +35,10 @@ engine:
   translators:
     - punct_translator
     - script_translator
+  # One candidate per text: the userdb and `lua_translator@*noema_learned` may both
+  # offer a learned phrase.
+  filters:
+    - uniquifier
 
 speller:
   alphabet: zyxwvutsrqponmlkjihgfedcba

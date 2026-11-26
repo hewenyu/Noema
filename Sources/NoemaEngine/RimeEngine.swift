@@ -111,7 +111,8 @@ public struct RimeEngineConfiguration: Sendable, Hashable {
 /// Boot: claim the process-wide librime (a second live engine throws), take the
 /// user-data `flock`, arm the boot-guard sentinel, deploy if needed through the
 /// `noema-rime-deployer` subprocess (see `RimeEngine+Deploy.swift`), initialize, open a
-/// session on `schemaID`, then disarm. librime's deployer never runs in this process;
+/// session on `schemaID`, then disarm. A built-in boot first migrates a pre-schema-set root
+/// (`LegacyRootMigrator`). librime's deployer never runs in this process;
 /// `start(configuration:cancellation:)` waits for it off the main actor. Any refusal or failure on that path leaves the
 /// engine in Safe Mode: it releases librime, the lock, and the claim, makes no further
 /// librime calls, and answers every key with `handled: false` and `.safeMode`.
@@ -206,17 +207,18 @@ public final class RimeEngine: TypingEngine {
             engine.abandonBoot()
             throw .engineUnavailable(reason: "boot cancelled")
         }
-        let prepared = await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        let (prepared, migration) = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, LegacyRootMigrator.PendingMigration?), Never>) in
                 guard let group = cancellation.enterPrepare() else {
-                    continuation.resume(returning: false)
+                    continuation.resume(returning: (false, nil))
                     return
                 }
                 DispatchQueue.global(qos: .userInitiated).async {
+                    let migration = migrateLegacyRootFiles(configuration)
                     let ok = prepareBuild(configuration: configuration, cancellation: cancellation)
                     // Only after prepareBuild returned: its staging directory is gone.
                     cancellation.leavePrepare(group)
-                    continuation.resume(returning: ok)
+                    continuation.resume(returning: (ok, migration))
                 }
             }
         } onCancel: {
@@ -227,7 +229,7 @@ public final class RimeEngine: TypingEngine {
             engine.abandonBoot()
             throw .engineUnavailable(reason: "boot cancelled")
         }
-        engine.finishBoot(prepared: prepared)
+        engine.finishBoot(prepared: prepared, migration: migration)
         return engine
     }
 
@@ -371,7 +373,35 @@ public final class RimeEngine: TypingEngine {
 
     private func boot(clearingSentinel: Bool) {
         guard beginBoot(clearingSentinel: clearingSentinel) else { return }
-        finishBoot(prepared: Self.prepareBuild(configuration: configuration, cancellation: DeployCancellation()))
+        let migration = Self.migrateLegacyRootFiles(configuration)
+        finishBoot(
+            prepared: Self.prepareBuild(configuration: configuration, cancellation: DeployCancellation()), migration: migration)
+    }
+
+    /// Phase 1 of `LegacyRootMigrator` for a built-in boot, under the root lock and before
+    /// `prepareBuild`, so the first deployment compiles the migrated `*.custom.yaml`. Makes
+    /// no librime call.
+    nonisolated static func migrateLegacyRootFiles(_ configuration: RimeEngineConfiguration) -> LegacyRootMigrator.PendingMigration? {
+        guard configuration.schemaSetID == .builtin else { return nil }
+        return LegacyRootMigrator.migrateFilesIfNeeded(root: configuration.userDataDir, builtinDir: configuration.rimeUserDataDir)
+    }
+
+    /// Phase 2 of `LegacyRootMigrator`, in the quiescent window after `initialize` and before
+    /// the first session: merges the migrated Mandarin pinyin userdbs into `learning.sqlite`.
+    /// A failure is retried on the next boot and never blocks this one.
+    private func importLegacyUserDBs(_ migration: LegacyRootMigrator.PendingMigration?) {
+        guard let migration, configuration.schemaSetID == .builtin else { return }
+        let schemaID = configuration.schemaID
+        let primary = isMandarinPinyinSchema(schemaID: schemaID) ? userDictName(schemaID: schemaID) : nil
+        let names = migration.userDBs.filter { $0 == SchemaSetID.builtin.defaultSchemaID || $0 == primary }
+        if names.isEmpty {
+            if migration.filesComplete { LegacyRootMigrator.writeMarker(builtinDir: configuration.rimeUserDataDir) }
+            return
+        }
+        guard let levers = RimeUserDictLevers() else { return }
+        LegacyRootMigrator.importLegacyUserDBs(
+            names, filesComplete: migration.filesComplete, root: configuration.userDataDir,
+            builtinDir: configuration.rimeUserDataDir, levers: levers)
     }
 
     /// Creates the directories, takes the lock, and arms the sentinel. False means the
@@ -408,7 +438,7 @@ public final class RimeEngine: TypingEngine {
 
     /// After `prepareBuild`: initialize librime, open the session, and disarm, or enter
     /// Safe Mode with the sentinel left armed.
-    private func finishBoot(prepared: Bool) {
+    private func finishBoot(prepared: Bool, migration: LegacyRootMigrator.PendingMigration? = nil) {
         guard prepared else { return enterSafeMode(.engineInitFailed) }
         configuration.exportOpenCCDataDir()
         withTraits { traits in
@@ -416,6 +446,7 @@ public final class RimeEngine: TypingEngine {
             api.pointee.initialize(&traits)
         }
         resources.isInitialized = true
+        importLegacyUserDBs(migration)
         guard openSession() else { return enterSafeMode(.engineInitFailed) }
         resources.bootGuard.disarm()
         refreshState()
