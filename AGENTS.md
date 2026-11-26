@@ -11,12 +11,13 @@ README.md       what Noema is and where to start
 .agents/notes/  decision records: why, and what was given up (.agents/notes/README.md)
 docs/           architecture.md (current-state map), AGENTS.md (documentation standard)
 Package.swift   SwiftPM manifest (tools 6.2, macOS 26, Swift 6 mode)
-Sources/        CRime (C bridge), NoemaCore, NoemaEngine, NoemaText, NoemaIPC, noema-cli, NoemaIME, noema-rime-deployer
+Sources/        CRime (C bridge), NoemaCore, NoemaEngine, NoemaText, NoemaIPC, NoemaAgentCore, noema-cli, NoemaIME, NoemaAgent, noema-rime-deployer
 Tests/          Swift Testing suites; CRimeTests drive the real librime
 Resources/IME/  NoemaIME.app Info.plist template, entitlements, icon generator
+Resources/Agent/  Noema.app Info.plist template, LaunchAgent plist, entitlements
 Resources/rime-default/  built-in minimal pinyin schema (Rime shared_data_dir)
 vendor/         librime.lock: pinned librime, plugin, and Boost inputs
-scripts/build/  librime.sh (vendor-out/librime), bundle.sh + verify-bundle.sh (dist/NoemaIME.app)
+scripts/build/  librime.sh (vendor-out/librime), bundle.sh + verify-bundle.sh (dist/NoemaIME.app, dist/Noema.app)
 scripts/dev/    doctor.sh (toolchain check), test.sh (CLT Swift Testing wrapper)
 scripts/governance/  check.sh: doc budgets, note format, Markdown links, import boundaries
 .kiln/          Kiln CI workflow, merge gate, PR-review-only agent config
