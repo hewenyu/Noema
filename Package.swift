@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "noema-cli", targets: ["noema-cli"]),
         .executable(name: "NoemaIME", targets: ["NoemaIME"]),
         .executable(name: "noema-rime-deployer", targets: ["noema-rime-deployer"]),
+        .executable(name: "NoemaAgent", targets: ["NoemaAgent"]),
     ],
     targets: [
         // C bridge to the vendored librime built by scripts/build/librime.sh.
@@ -33,7 +34,9 @@ let package = Package(
         ),
         .target(name: "NoemaCore"),
         .target(name: "NoemaText"),
-        .target(name: "NoemaIPC"),
+        // IME <-> agent IPC: wire format, XPC transport, peer verification, and the IME's
+        // connection state machine. Zero TCC, like NoemaIME, which links it.
+        .target(name: "NoemaIPC", dependencies: ["NoemaCore"]),
         .target(name: "NoemaEngine", dependencies: ["CRime", "NoemaCore"]),
         .executableTarget(name: "noema-cli", dependencies: ["NoemaCore", "NoemaEngine"]),
         // Engine-independent IMKit shell logic: session coordination, NSEvent bridging, and
@@ -43,11 +46,18 @@ let package = Package(
         // NSPanel that implements CandidatePresenting. Zero TCC, like NoemaIME.
         .target(name: "NoemaUI", dependencies: ["NoemaCore", "NoemaIMEShell"]),
         // Input method executable bundled into NoemaIME.app by scripts/build/bundle.sh.
-        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaUI"]),
+        .executableTarget(name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaUI"]),
+        // The companion agent's logic: IPC service, LaunchAgent control, and the SwiftUI
+        // Settings window. Never linked into NoemaIME.
+        .target(name: "NoemaAgentCore", dependencies: ["NoemaCore", "NoemaIPC"]),
+        // The companion agent executable bundled into Noema.app; no librime.
+        .executableTarget(name: "NoemaAgent", dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore"]),
         // Isolated Rime deployment subprocess, bundled beside NoemaIME in Contents/MacOS.
         // RimeEngine runs it; librime's deployer never runs in the input method process.
         .executableTarget(name: "noema-rime-deployer", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
         .testTarget(name: "NoemaCoreTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaText"]),
+        // IPC wire format, state machine, real libxpc and SecCode, and the real NoemaAgent.
+        .testTarget(name: "NoemaIPCTests", dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore", "NoemaAgent"]),
         // Pure engine logic (key mapping, boot guard); never initializes librime.
         .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine"]),
         // NSEvent bridging and other shell logic that needs no engine.
@@ -59,7 +69,10 @@ let package = Package(
         // deployer RimeEngine spawns and the executables the end-to-end tests run.
         .testTarget(
             name: "CRimeTests",
-            dependencies: ["CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaUI", "noema-rime-deployer", "noema-cli", "NoemaIME"]
+            dependencies: [
+                "CRime", "NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaAgentCore", "NoemaUI",
+                "noema-rime-deployer", "noema-cli", "NoemaIME",
+            ]
         ),
     ],
     // Swift 6 language mode: complete strict-concurrency checking for every Swift target.

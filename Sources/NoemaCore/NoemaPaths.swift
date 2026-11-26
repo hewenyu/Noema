@@ -1,8 +1,8 @@
 import Foundation
 
-/// Identifiers and standard locations shared by `NoemaIME`, `noema-cli`, and tests.
-/// The identifiers mirror `Resources/IME/Info.plist.in`; `NoemaPathsAndLogTests` keeps
-/// them in step.
+/// Identifiers and standard locations shared by `NoemaIME`, `NoemaAgent`, `noema-cli`, and
+/// tests. The identifiers mirror `Resources/IME/Info.plist.in`, `Resources/Agent/Info.plist.in`,
+/// and `Resources/Agent/dev.noema.agent.plist`; `NoemaPathsAndLogTests` keeps them in step.
 public enum NoemaPaths {
     public static let imeBundleID = "dev.noema.inputmethod.NoemaIME"
     public static let imeConnectionName = "dev.noema.inputmethod.NoemaIME_Connection"
@@ -11,6 +11,17 @@ public enum NoemaPaths {
     public static let imeBundleName = "NoemaIME.app"
     public static let imeExecutableName = "NoemaIME"
     public static let rimeDefaultDirectoryName = "rime-default"
+
+    /// The companion agent `Noema.app` and its LaunchAgent (`SMAppService.agent`).
+    public static let agentBundleID = "dev.noema.agent"
+    public static let agentBundleName = "Noema.app"
+    public static let agentExecutableName = "NoemaAgent"
+    /// `Noema.app/Contents/Library/LaunchAgents/<name>`, registered with `SMAppService.agent(plistName:)`.
+    public static let agentLaunchAgentPlistName = "dev.noema.agent.plist"
+    /// The launchd Mach service `NoemaAgent` checks in and `NoemaIME` connects to.
+    public static let agentMachServiceName = "dev.noema.agent.ipc"
+    /// Darwin notification `NoemaAgent` posts once its listener is up; clients reconnect at once.
+    public static let agentReadyNotificationName = "dev.noema.agent.ready"
 
     /// `~/Library/Application Support/Noema/rime`: the single-writer Rime `user_data_dir`.
     public static func rimeUserDataDir(

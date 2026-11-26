@@ -1,12 +1,19 @@
+import Carbon.HIToolbox
 import Foundation
 import NoemaCore
 import NoemaEngine
 import NoemaIMEShell
+import NoemaIPC
 import NoemaUI
 
-/// Owns the one `RimeEngine` of the input method process and the coordinator every
-/// `NoemaInputController` shares. Until the engine is ready, and after `shutdown()`, the
-/// coordinator sees no engine and passes every key through.
+/// Owns the one `RimeEngine` of the input method process, the coordinator every
+/// `NoemaInputController` shares, and the agent connection. Until the engine is ready, and
+/// after `shutdown()`, the coordinator sees no engine and passes every key through.
+///
+/// The agent connection never affects typing: `RimeEngine` runs here on the main actor,
+/// composition changes leave through `CompositionIPCReporter` (fire-and-forget, nothing
+/// under secure input), and a dead or unreachable agent only moves `IPCConnectionManager`
+/// through `degraded`, `reconnecting`, and `circuitOpen`.
 @MainActor
 final class EngineHost {
     enum State {
@@ -42,8 +49,13 @@ final class EngineHost {
             coordinator?.changePage(backward: backward, expectedGenerationID: generation)
         }
         candidatePanel = panel
+        coordinator.onCompositionChange = { [unowned self] state in self.reporter?.report(state) }
         return coordinator
     }()
+
+    /// The agent connection, started by `startAgentConnection()` after launch.
+    private(set) var ipc: IPCConnectionManager?
+    private var reporter: CompositionIPCReporter?
 
     private init() {}
 
@@ -101,6 +113,7 @@ final class EngineHost {
         switch outcome {
         case .success(let engine):
             state = .ready(engine)
+            ipc?.setEngineMode(engine.safeModeReason == nil ? "rime" : "safeMode")
             if let reason = engine.safeModeReason {
                 log.error("RimeEngine is in Safe Mode: \(reason.rawValue, privacy: .public)")
             } else {
@@ -121,6 +134,7 @@ final class EngineHost {
     /// before the process exits. Idempotent.
     func shutdown(deployerGrace: Duration = .milliseconds(500)) {
         candidatePanel?.hide()
+        stopAgentConnection()
         switch state {
         case .unavailable:
             return
@@ -137,5 +151,48 @@ final class EngineHost {
             state = .unavailable("shut down")
             log.info("RimeEngine shut down")
         }
+    }
+
+    // MARK: - Agent connection
+
+    /// Connects to `NoemaAgent` off the main actor and returns at once. Idempotent; a no-op
+    /// after `shutdown()`.
+    func startAgentConnection() {
+        guard ipc == nil else { return }
+        if case .unavailable("shut down") = state { return }
+        let queue = DispatchQueue(label: "dev.noema.ipc.connection", qos: .utility)
+        let policy = PeerIdentityPolicy.resolved(
+            requested: .allowAdHocForTesting(signingIdentifiers: [NoemaPaths.agentBundleID]),
+            selfIdentity: SelfCodeIdentity.current())
+        let transport = XPCClientTransport(machService: NoemaPaths.agentMachServiceName, policy: policy, queue: queue)
+        let manager = IPCConnectionManager(
+            transport: transport,
+            client: .init(bundleID: NoemaPaths.imeBundleID, version: Self.clientVersion()),
+            queue: queue)
+        attachAgentConnection(manager, isSecureInputEnabled: { IsSecureEventInputEnabled() })
+        manager.start()
+    }
+
+    /// Wires `manager` to the coordinator's composition changes. The seam tests use to
+    /// attach a manager on a test transport.
+    func attachAgentConnection(_ manager: IPCConnectionManager, isSecureInputEnabled: @escaping @MainActor () -> Bool) {
+        ipc = manager
+        reporter = CompositionIPCReporter(manager: manager, isSecureInputEnabled: isSecureInputEnabled)
+        switch state {
+        case .ready(let engine): manager.setEngineMode(engine.safeModeReason == nil ? "rime" : "safeMode")
+        case .unavailable: manager.setEngineMode("unavailable")
+        case .uninitialized, .booting: manager.setEngineMode("booting")
+        }
+    }
+
+    /// Disconnects from the agent and cancels every XPC session before returning.
+    func stopAgentConnection() {
+        ipc?.stop()
+        ipc = nil
+        reporter = nil
+    }
+
+    private static func clientVersion() -> String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? NoemaVersion.current.description
     }
 }

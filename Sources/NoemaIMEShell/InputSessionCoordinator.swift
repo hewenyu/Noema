@@ -36,6 +36,11 @@ public final class InputSessionCoordinator {
     /// True while `activeClient` shows marked text the shell put there.
     public private(set) var hasMarkedText = false
 
+    /// Called with the engine's state after every result the shell applies (keys, panel
+    /// clicks, `commitComposition`). Never called on a secure-input path, which returns
+    /// before the engine is asked. `EngineHost` reports it to the agent (`NoemaIPC`).
+    public var onCompositionChange: (@MainActor (CompositionState) -> Void)?
+
     public init(
         engineProvider: @escaping @MainActor () -> (any TypingEngine)?,
         candidatePresenter: any CandidatePresenting = NoOpCandidatePresenter(),
@@ -97,6 +102,7 @@ public final class InputSessionCoordinator {
         if hasMarkedText && !didInsert { client.clearMarkedText() }
         hasMarkedText = false
         candidatePresenter.hide()
+        onCompositionChange?(engine.currentState)
     }
 
     /// IMKit hides the input method's windows (`hidePalettes`); the composition stays.
@@ -217,6 +223,7 @@ public final class InputSessionCoordinator {
     /// composition (marked text or panel preedit) or nothing.
     private func applyResult(_ result: KeyHandlingResult, to client: any TextInputClient) {
         let state = result.state
+        defer { onCompositionChange?(state) }
         if let committed = result.committedText, !committed.isEmpty {
             client.insertText(committed)
             // insertText replaced the marked text; no redundant empty setMarkedText.
