@@ -309,6 +309,43 @@ import Testing
         store.close()
     }
 
+    /// Codex PR #23 round 3 (Finding #3): re-copying an image whose full or thumbnail blob is
+    /// missing or corrupted on disk repairs both blobs instead of early-returning in dedup.
+    @Test func recopyingImageRepairsMissingOrCorruptedBlobs() throws {
+        let dir = try TemporaryDirectory()
+        defer { dir.cleanup() }
+        let keys = InMemoryClipboardKeyStore()
+        let store = try Self.open(dir, keys: keys)
+        let image = try ClipboardImageProcessor.process(TestImages.png(width: 80, height: 60, seed: 13))
+        let first = try store.insertImage(image, source: Self.source)
+        let digest = try #require(first.blobDigest)
+        let blobURL = try store.blobs.url(digest: digest, thumbnail: false)
+        let thumbURL = try store.blobs.url(digest: digest, thumbnail: true)
+        store.close()
+
+        // Delete the full blob file on disk and reopen.
+        try FileManager.default.removeItem(at: blobURL)
+        let reopened = try Self.open(dir, keys: keys)
+        #expect(!reopened.blobs.exists(digest: digest, thumbnail: false))
+        #expect(throws: ClipboardError.self) { _ = try reopened.useContent(id: first.id) }
+
+        // Re-copying the exact same image heals the missing full blob while preserving the row id.
+        let healed = try reopened.insertImage(image, source: Self.source)
+        #expect(healed.id == first.id && reopened.blobs.exists(digest: digest, thumbnail: false))
+        guard case .image(let png, let thumb, 80, 60) = try reopened.useContent(id: first.id) else {
+            Issue.record("repaired image did not decrypt")
+            return
+        }
+        #expect(png == image.pngData && thumb == image.thumbnailData)
+
+        // Corrupting the thumbnail blob is also healed on re-copy.
+        try Data("corrupt-thumb".utf8).write(to: thumbURL, options: .atomic)
+        #expect(throws: ClipboardError.decryptionFailed) { _ = try reopened.thumbnail(id: first.id) }
+        _ = try reopened.insertImage(image, source: Self.source)
+        #expect(try reopened.thumbnail(id: first.id) == image.thumbnailData)
+        reopened.close()
+    }
+
     @Test func imageByteQuotaEvictsOldestUnpinnedImages() throws {
         let dir = try TemporaryDirectory()
         defer { dir.cleanup() }

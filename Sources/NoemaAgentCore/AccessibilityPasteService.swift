@@ -16,6 +16,8 @@ public enum ClipboardPasteOutcome: Sendable, Hashable {
     case abortedFocusLost
     /// Secure input came on after the target was reactivated.
     case abortedSecureInput
+    /// Another process (or a newer paste-back) replaced the pasteboard before ⌘V was posted.
+    case abortedPasteboardChanged
 }
 
 /// The system calls a paste-back makes; tests substitute a spy.
@@ -81,12 +83,14 @@ public final class AccessibilityPasteService {
 
     public var isTrusted: Bool { driver.isAXTrusted() }
 
-    public func paste(into target: ClipboardSourceApp?) async -> ClipboardPasteOutcome {
+    public func paste(into target: ClipboardSourceApp?, verifyOwnership: @MainActor () -> Bool = { true }) async -> ClipboardPasteOutcome {
         guard let pid = target?.pid, pid > 0 else { return .copiedNoTarget }
+        guard verifyOwnership() else { return .abortedPasteboardChanged }
         driver.activate(pid: pid)
         guard driver.isAXTrusted() else { return .copiedNeedsAccessibility }
         var waited = 0
         while true {
+            guard verifyOwnership() else { return .abortedPasteboardChanged }
             let front = driver.frontmostPID()
             if front == pid { break }
             if let front, front != ownPID { return .abortedFocusLost }
@@ -96,6 +100,7 @@ public final class AccessibilityPasteService {
         }
         guard !driver.isSecureInputActive() else { return .abortedSecureInput }
         guard driver.frontmostPID() == pid else { return .abortedFocusLost }
+        guard verifyOwnership() else { return .abortedPasteboardChanged }
         driver.postCommandV()
         return .pasted
     }

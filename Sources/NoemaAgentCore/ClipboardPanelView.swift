@@ -88,6 +88,11 @@ struct ClipboardPanelView: View {
                         .background(.orange.opacity(0.18), in: Capsule())
                 }
                 Spacer()
+                if model.storeState == .keychainLocked {
+                    Button("重试解锁") { model.retryUnlock() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
                 if !model.isAccessibilityTrusted {
                     Button("打开辅助功能设置…") { model.openAccessibilitySettings() }
                         .buttonStyle(.link)

@@ -179,7 +179,14 @@ struct ClipboardSettingsSection: View {
     var body: some View {
         Section {
             LabeledContent("快捷键", value: "⇧⌘V，或 v 模式 v2")
-            LabeledContent("存储", value: storageTitle)
+            LabeledContent("存储") {
+                HStack {
+                    Text(storageTitle).foregroundStyle(.secondary)
+                    if clipboard.storeState == .keychainLocked {
+                        Button("重试解锁") { clipboard.retryUnlock() }
+                    }
+                }
+            }
             LabeledContent("剪贴板访问", value: clipboard.accessStatus.title)
             LabeledContent("辅助功能") {
                 HStack {

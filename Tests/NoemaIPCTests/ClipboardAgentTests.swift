@@ -51,6 +51,7 @@ final class SpyPasteboard: PasteboardReading {
         changeCount += 1
         let prepared = changeCount
         if writeBumpsTwice { changeCount += 1 }
+        if case .text(let text) = content { string = text }
         types = ["public.utf8-plain-text"] + markers.keys.sorted()
         return [prepared, changeCount]
     }
@@ -73,6 +74,10 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
     var frontmostAfterSleeps: [pid_t?] = []
     /// Secure input turns on as soon as the target is activated.
     var secureOnActivate = false
+    /// Optional hook invoked during `sleep(milliseconds:)` with the 1-based sleep count.
+    var onSleep: (@MainActor (Int) async -> Void)?
+    /// Optional hook invoked when `postCommandV()` fires.
+    var onPostCommandV: (() -> Void)?
     private(set) var activations: [pid_t] = []
     private(set) var posts = 0
     private(set) var sleeps = 0
@@ -86,9 +91,13 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
 
     func frontmostPID() -> pid_t? { frontmost }
     func isSecureInputActive() -> Bool { secure }
-    func postCommandV() { posts += 1 }
+    func postCommandV() {
+        posts += 1
+        onPostCommandV?()
+    }
     func sleep(milliseconds: Int) async {
         sleeps += 1
+        if let onSleep { await onSleep(sleeps) }
         if !frontmostAfterSleeps.isEmpty { frontmost = frontmostAfterSleeps.removeFirst() }
     }
 }
@@ -556,6 +565,113 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         #expect(controller.model.items.isEmpty)
 
         controller.hide(restoreFocus: false)
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 3 (Finding #1): if another process (or a concurrent paste-back)
+    /// replaces the pasteboard while waiting for the target app to become frontmost, auto-paste
+    /// must abort without posting ⌘V and inform the user explicitly.
+    @Test func pasteAbortsWhenPasteboardChangesDuringFocusWait() async throws {
+        let (store, root) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entryA = try store.insertText("selected-history-entry-A", source: AccessibilityPasteServiceTests.target)
+        let entryB = try store.insertText("selected-history-entry-B", source: AccessibilityPasteServiceTests.target)
+
+        let pasteboard = SpyPasteboard()
+        let driver = SpyPasteDriver()
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        driver.trusted = true
+        driver.frontmost = ownPID
+        driver.frontmostAfterSleeps = [AccessibilityPasteServiceTests.target.pid!]
+        var postedPayloads: [String] = []
+        driver.onPostCommandV = { [unowned pasteboard] in
+            if let text = pasteboard.string { postedPayloads.append(text) }
+        }
+
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: driver)
+        var toasts: [String] = []
+        history.onToast = { toasts.append($0) }
+        history.attach(.success(store))
+
+        // Scenario 1: external app replaces pasteboard during focus-wait sleep.
+        driver.onSleep = { [unowned pasteboard] _ in
+            pasteboard.copy("unrelated-new-copy")
+        }
+        let outcome = await history.use(id: entryA.id, mode: .paste, target: AccessibilityPasteServiceTests.target)
+        #expect(outcome == .abortedPasteboardChanged)
+        #expect(driver.posts == 0 && postedPayloads.isEmpty, "must never paste unrelated content")
+        #expect(toasts == [ClipboardHistoryController.pasteboardChangedToastMessage])
+        #expect(history.lastPasteOutcome == .abortedPasteboardChanged)
+
+        // Scenario 2: a concurrent newer `use()` supersedes an in-flight `use()`.
+        toasts.removeAll()
+        driver.frontmost = ownPID
+        driver.frontmostAfterSleeps = [AccessibilityPasteServiceTests.target.pid!]
+        var secondOutcome: ClipboardPasteOutcome?
+        driver.onSleep = { _ in
+            // While first `use(A)` is suspended inside sleep, user triggers `use(B)` which completes.
+            driver.onSleep = nil
+            driver.frontmost = AccessibilityPasteServiceTests.target.pid!
+            secondOutcome = await history.use(id: entryB.id, mode: .paste, target: AccessibilityPasteServiceTests.target)
+        }
+        let firstOutcome = await history.use(id: entryA.id, mode: .paste, target: AccessibilityPasteServiceTests.target)
+        #expect(firstOutcome == .abortedPasteboardChanged)
+        #expect(secondOutcome == .pasted)
+        #expect(driver.posts == 1 && postedPayloads == ["selected-history-entry-B"], "only the newer paste-back may post ⌘V")
+        #expect(history.lastPasteOutcome == .pasted && toasts.isEmpty)
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 3 (Finding #2): after a runtime keychain lock pauses capture,
+    /// manually unlocking the keychain and reopening the panel (without screen lock/unlock or
+    /// sleep/wake) recovers history and monitoring without retroactively capturing locked copies.
+    @Test func reopeningPanelAfterKeychainUnlockRecoversHistoryAndMonitoring() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "noema-clip-recover-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let keys = InMemoryClipboardKeyStore(isLocked: false)
+        let store = try ClipboardStore(directory: root.appending(path: "clipboard", directoryHint: .isDirectory), keyStore: keys)
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        _ = try store.insertText("existing before lock", source: nil)
+        history.panel.shouldOrderFront = false
+
+        // Runtime lock transitions to `.keychainLocked` and pauses monitoring.
+        keys.isLocked = true
+        history.verifyKeychainAccess()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(history.storeState == .keychainLocked && history.monitor.pauseReasons.contains(.keychainLocked))
+
+        // Copy made while locked must stay unrecorded even after recovery.
+        pasteboard.copy("copied during lock")
+        history.monitor.poll()
+        #expect(pasteboard.payloadReads == 0)
+
+        // User unlocks keychain (no screen-unlock / wake) and reopens the panel via ⇧⌘V / v2.
+        keys.isLocked = false
+        history.showPanel()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(history.storeState == .ready && !history.monitor.pauseReasons.contains(.keychainLocked))
+        #expect(history.panel.model.items.count == 1)
+
+        // Polling now skips the locked-period copy, then captures subsequent fresh copies.
+        history.monitor.poll()
+        history.waitForIngest()
+        #expect(pasteboard.payloadReads == 0 && store.itemCount == 1)
+
+        pasteboard.copy("fresh copy after recovery")
+        history.monitor.poll()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(store.itemCount == 2 && history.panel.model.items.count == 2)
+
+        history.panel.hide(restoreFocus: false)
         history.shutdown()
     }
 

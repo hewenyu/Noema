@@ -153,6 +153,36 @@ public final class ClipboardStore: @unchecked Sendable {
         return cipher == nil ? .keychainLocked : .ready
     }
 
+    /// Non-interactively verifies keychain access when `.ready`, or attempts to reload an
+    /// existing master key when `.keychainLocked` without ever prompting interactively or
+    /// creating a new key.
+    @discardableResult
+    public func tryUnlockNonInteractive() -> ClipboardStoreState {
+        lock.lock()
+        defer { lock.unlock() }
+        guard db != nil else { return .keychainLocked }
+        if cipher == nil {
+            do {
+                guard let key = try keyStore.loadExistingMasterKeyNonInteractive() else {
+                    return .keychainLocked
+                }
+                cipher = ClipboardCipher(masterKey: key)
+                hydrateLocked()
+            } catch {
+                lockLocked()
+                log.error("clipboard master key unavailable: \(String(describing: error), privacy: .public)")
+            }
+        } else {
+            do {
+                try keyStore.verifyMasterKeyAccess()
+            } catch {
+                lockLocked()
+                log.error("clipboard master key became unavailable: \(String(describing: error), privacy: .public)")
+            }
+        }
+        return cipher == nil ? .keychainLocked : .ready
+    }
+
     /// Re-verifies master-key availability against the key store: unlocks and rebuilds the
     /// `:memory:` search index when locked and now accessible; transitions to `.keychainLocked`
     /// and wipes the derived cipher, previews, and `:memory:` index if the keychain was locked
@@ -273,13 +303,10 @@ public final class ClipboardStore: @unchecked Sendable {
         let (db, index, cipher) = try ready()
         let digest = cipher.dedupHMAC(kind: .image, payload: image.pngData)
         if let existing = try existingID(db, kind: .image, dedup: digest) {
+            try ensureImageBlobsReadableLocked(cipher, image: image, digest: digest)
             return try bumpLocked(db, index, id: existing, source: source, now: now)
         }
-        let blobRowExists = try Self.scalarInt(db, "SELECT COUNT(*) FROM image_blobs WHERE sha256 = ?1", digest) > 0
-        if !blobRowExists || !blobs.exists(digest: digest, thumbnail: false) || !blobs.exists(digest: digest, thumbnail: true) {
-            try blobs.write(try cipher.sealBlob(image.pngData, digest: digest, thumbnail: false), digest: digest, thumbnail: false)
-            try blobs.write(try cipher.sealBlob(image.thumbnailData, digest: digest, thumbnail: true), digest: digest, thumbnail: true)
-        }
+        try ensureImageBlobsReadableLocked(cipher, image: image, digest: digest)
         let id = UUID().uuidString.lowercased()
         do {
             try Self.transaction(db) { () throws(ClipboardError) in
@@ -476,6 +503,28 @@ public final class ClipboardStore: @unchecked Sendable {
         guard let db, let index else { throw .closed }
         guard let cipher else { throw .storeLocked }
         return (db, index, cipher)
+    }
+
+    /// Ensures both the full PNG blob and thumbnail blob for `digest` exist on disk and
+    /// decrypt cleanly, rewriting whichever file is missing or corrupted from the freshly
+    /// captured `image`.
+    private func ensureImageBlobsReadableLocked(_ cipher: ClipboardCipher, image: ClipboardImage, digest: String) throws(ClipboardError) {
+        if !isBlobReadable(cipher, digest: digest, thumbnail: false) {
+            try blobs.write(try cipher.sealBlob(image.pngData, digest: digest, thumbnail: false), digest: digest, thumbnail: false)
+        }
+        if !isBlobReadable(cipher, digest: digest, thumbnail: true) {
+            try blobs.write(try cipher.sealBlob(image.thumbnailData, digest: digest, thumbnail: true), digest: digest, thumbnail: true)
+        }
+    }
+
+    private func isBlobReadable(_ cipher: ClipboardCipher, digest: String, thumbnail: Bool) -> Bool {
+        guard let sealed = try? blobs.read(digest: digest, thumbnail: thumbnail),
+              let plain = try? cipher.openBlob(sealed, digest: digest, thumbnail: thumbnail)
+        else { return false }
+        if !thumbnail {
+            return cipher.dedupHMAC(kind: .image, payload: plain) == digest
+        }
+        return true
     }
 
     /// Verifies `id` exists and, if unpinned, has not expired as of `now`. If an unpinned

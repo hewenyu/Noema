@@ -13,11 +13,19 @@ public protocol ClipboardKeyStore: Sendable {
     /// Non-interactively verifies that the master key is still readable (e.g. after a
     /// runtime keychain lock). Implementations must never create or replace a key here.
     func verifyMasterKeyAccess() throws(ClipboardError)
+
+    /// Non-interactively loads an existing master key without showing a modal prompt or
+    /// creating a new key. Returns `nil` only when no key exists yet (`errSecItemNotFound`).
+    func loadExistingMasterKeyNonInteractive() throws(ClipboardError) -> SymmetricKey?
 }
 
 public extension ClipboardKeyStore {
     func verifyMasterKeyAccess() throws(ClipboardError) {
         _ = try loadOrCreateMasterKey()
+    }
+
+    func loadExistingMasterKeyNonInteractive() throws(ClipboardError) -> SymmetricKey? {
+        try loadOrCreateMasterKey()
     }
 }
 
@@ -90,6 +98,10 @@ public struct KeychainClipboardKeyStore: ClipboardKeyStore {
         guard (try read(allowUI: false)) != nil else { throw .keychainFailure(errSecItemNotFound) }
     }
 
+    public func loadExistingMasterKeyNonInteractive() throws(ClipboardError) -> SymmetricKey? {
+        try read(allowUI: false)
+    }
+
     /// The stored key, nil only for `errSecItemNotFound`.
     private func read(allowUI: Bool = true) throws(ClipboardError) -> SymmetricKey? {
         var query = baseQuery
@@ -160,6 +172,15 @@ public final class InMemoryClipboardKeyStore: ClipboardKeyStore, @unchecked Send
         }
         guard let result else { throw .keychainLocked }
         return result
+    }
+
+    public func loadExistingMasterKeyNonInteractive() throws(ClipboardError) -> SymmetricKey? {
+        let result = state.withLock { state -> Result<SymmetricKey?, ClipboardError> in
+            state.loads += 1
+            guard !state.isLocked else { return .failure(.keychainLocked) }
+            return .success(state.key)
+        }
+        return try result.get()
     }
 }
 

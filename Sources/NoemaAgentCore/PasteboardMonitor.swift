@@ -148,6 +148,8 @@ public final class PasteboardMonitor {
     public private(set) var ignoredSelfChangeCounts: [Int] = []
     public private(set) var taintedChangeCounts: [Int] = []
     public var isRunning: Bool { pollTask != nil }
+    /// The pasteboard's live `changeCount` (metadata only; never reads a payload).
+    public var currentChangeCount: Int { reader.changeCount }
 
     private let reader: any PasteboardReading
     private var pollTask: Task<Void, Never>?

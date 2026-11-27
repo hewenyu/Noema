@@ -19,6 +19,7 @@ public final class ClipboardHistoryController {
 
     public static let customBlockedBundleIDsKey = "ClipboardCustomBlockedBundleIDs"
     public static let fallbackToastMessage = "已复制到剪贴板，请按 ⌘V 粘贴"
+    public static let pasteboardChangedToastMessage = "剪贴板已被其他应用更新，已取消自动粘贴"
 
     public private(set) var storeState: ClipboardStoreState?
     public private(set) var storeError: String?
@@ -43,6 +44,7 @@ public final class ClipboardHistoryController {
     @ObservationIgnored private let log = NoemaLog.agent("clipboard")
     @ObservationIgnored private var panelStorage: ClipboardPanelController?
     @ObservationIgnored private var changeObservers: [WeakChangeObserver] = []
+    @ObservationIgnored private var activePasteGeneration: UInt64 = 0
 
     private final class WeakChangeObserver {
         weak var owner: AnyObject?
@@ -171,6 +173,17 @@ public final class ClipboardHistoryController {
         }
     }
 
+    /// Non-interactively attempts to unlock a `.keychainLocked` store (e.g. when reopening the
+    /// panel or receiving `com.apple.security.keychain.unlock`) without ever showing a modal
+    /// keychain prompt or creating a new key.
+    public func tryUnlockNonInteractive() {
+        guard let store else { return }
+        ingestQueue.async { [weak self] in
+            _ = store.tryUnlockNonInteractive()
+            Task { @MainActor [weak self] in self?.refreshStatus() }
+        }
+    }
+
     // MARK: Capture
 
     private func ingest(_ capture: ClipboardCapture) {
@@ -216,28 +229,36 @@ public final class ClipboardHistoryController {
 
     /// Writes entry `id` to the pasteboard (as Noema's own paste-back), then pastes it into
     /// or reactivates `target`. Atomically rejects expired unpinned entries and locked-keychain
-    /// reads without touching the pasteboard or reviving their TTL.
+    /// reads without touching the pasteboard or reviving their TTL, and aborts `⌘V` if another
+    /// app or a newer paste-back replaces the pasteboard before the target gains focus.
     public func use(id: String, mode: PasteMode, target: ClipboardSourceApp?, now: Date = Date()) async -> ClipboardPasteOutcome? {
         guard let store, store.verifyKeychainAccess() == .ready, let content = try? store.useContent(id: id, now: now) else {
             refreshStatus()
             onToast("这条记录已过期或无法读取")
             return nil
         }
-        monitor.writeSelfPaste(content)
+        activePasteGeneration &+= 1
+        let pasteGeneration = activePasteGeneration
+        let writtenCount = monitor.writeSelfPaste(content)
         refreshStatus()
         let outcome: ClipboardPasteOutcome
         switch mode {
         case .paste:
-            outcome = await pasteService.paste(into: target)
+            outcome = await pasteService.paste(into: target) { [weak self] in
+                guard let self else { return false }
+                return self.activePasteGeneration == pasteGeneration && self.monitor.currentChangeCount == writtenCount
+            }
         case .copyOnly:
             if let pid = target?.pid { NSRunningApplication(processIdentifier: pid)?.activate() }
             outcome = .copiedNoTarget
         }
+        guard activePasteGeneration == pasteGeneration else { return outcome }
         lastPasteOutcome = outcome
         isAccessibilityTrusted = pasteService.isTrusted
         switch outcome {
         case .pasted: break
         case .copiedNeedsAccessibility, .abortedFocusLost, .abortedSecureInput: onToast(Self.fallbackToastMessage)
+        case .abortedPasteboardChanged: onToast(Self.pasteboardChangedToastMessage)
         case .copiedNoTarget: if mode == .copyOnly { onToast("已复制到剪贴板") } else { onToast(Self.fallbackToastMessage) }
         }
         return outcome
@@ -304,6 +325,7 @@ public final class ClipboardHistoryController {
             $0.retryUnlock()
         }
         observe(distributed, Notification.Name("com.apple.security.keychain.lock")) { $0.verifyKeychainAccess() }
+        observe(distributed, Notification.Name("com.apple.security.keychain.unlock")) { $0.tryUnlockNonInteractive() }
         observe(workspace, NSWorkspace.willSleepNotification) { $0.monitor.setPaused(.sleeping, true) }
         observe(workspace, NSWorkspace.didWakeNotification) {
             $0.monitor.setPaused(.sleeping, false)

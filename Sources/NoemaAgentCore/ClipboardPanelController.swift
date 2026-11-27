@@ -206,6 +206,10 @@ public final class ClipboardPanelModel {
         history?.openAccessibilitySettings()
     }
 
+    public func retryUnlock() {
+        history?.retryUnlock()
+    }
+
     public func close() { onClose(true) }
 }
 
@@ -292,6 +296,9 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
         model.showsActions = false
         model.selectedID = nil
         model.history?.refreshStatus()
+        if model.history?.storeState == .keychainLocked {
+            model.history?.tryUnlockNonInteractive()
+        }
         model.reload()
         model.openGeneration &+= 1
         isVisible = true

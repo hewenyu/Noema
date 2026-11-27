@@ -155,6 +155,30 @@ import Testing
         #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true, true, true] })
     }
 
+    @Test func loadExistingMasterKeyNonInteractiveNeverPromptsOrCreates() throws {
+        let fake = FakeKeychain()
+        let keyStore = KeychainClipboardKeyStore(backend: fake)
+
+        // Missing item returns nil without adding a key.
+        #expect(try keyStore.loadExistingMasterKeyNonInteractive() == nil)
+        #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true] })
+
+        // Locked keychain throws .keychainLocked without prompting or adding.
+        let stored = Data(repeating: 4, count: 32)
+        fake.state.withLockUnchecked {
+            $0.stored = stored
+            $0.copyStatus = errSecInteractionNotAllowed
+        }
+        #expect(throws: ClipboardError.keychainLocked) { _ = try keyStore.loadExistingMasterKeyNonInteractive() }
+        #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true, true] })
+
+        // Unlocked keychain returns the existing key non-interactively.
+        fake.state.withLockUnchecked { $0.copyStatus = errSecSuccess }
+        let loaded = try #require(try keyStore.loadExistingMasterKeyNonInteractive())
+        #expect(loaded.withUnsafeBytes { Data($0) } == stored)
+        #expect(fake.state.withLockUnchecked { $0.adds.isEmpty && $0.nonInteractiveFlags == [true, true, true] })
+    }
+
     @Test func inMemoryKeyStoreSimulatesALock() throws {
         let store = InMemoryClipboardKeyStore(isLocked: true)
         #expect(throws: ClipboardError.keychainLocked) { try store.loadOrCreateMasterKey() }
