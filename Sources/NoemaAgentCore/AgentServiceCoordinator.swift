@@ -286,6 +286,8 @@ public final class AgentStatusModel {
     public var lastLaunchAgentError: String?
     /// The "词库" section's model; the agent sets it once its IPC service exists.
     public var lexicon: LexiconController?
+    /// The "快速操作" section's clipboard history; the agent sets it once it starts.
+    public var clipboard: ClipboardHistoryController?
     /// Pushes changed settings to every IME (`AgentServiceCoordinator.updateSettings`); the
     /// agent sets it once its IPC service exists.
     @ObservationIgnored public var settingsUpdater: (@MainActor (AgentSettingsSnapshot) -> Void)?

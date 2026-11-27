@@ -60,9 +60,18 @@ let package = Package(
             name: "NoemaIME", dependencies: ["NoemaCore", "NoemaEngine", "NoemaIMEShell", "NoemaIPC", "NoemaLearning", "NoemaUI"]),
         // The companion agent's logic: IPC service, LaunchAgent control, and the SwiftUI
         // Settings window. Never linked into NoemaIME.
-        .target(name: "NoemaAgentCore", dependencies: ["NoemaCore", "NoemaIPC", "NoemaLearning", "NoemaLexiconAdmin"]),
+        // The clipboard history store: privacy filter, CryptoKit AES-GCM at rest, encrypted image
+        // blobs, and an in-memory FTS5 index. Agent only; never linked into NoemaIME.
+        .target(
+            name: "NoemaClipboardCore",
+            dependencies: ["NoemaCore"],
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
+        .target(
+            name: "NoemaAgentCore",
+            dependencies: ["NoemaCore", "NoemaIPC", "NoemaLearning", "NoemaLexiconAdmin", "NoemaClipboardCore"]),
         // The companion agent executable bundled into Noema.app; no librime.
-        .executableTarget(name: "NoemaAgent", dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore"]),
+        .executableTarget(name: "NoemaAgent", dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore", "NoemaClipboardCore"]),
         // Isolated Rime deployment subprocess, bundled beside NoemaIME in Contents/MacOS.
         // RimeEngine runs it; librime's deployer never runs in the input method process.
         .executableTarget(name: "noema-rime-deployer", dependencies: ["CRime", "NoemaCore", "NoemaEngine"]),
@@ -70,7 +79,11 @@ let package = Package(
         // IPC wire format, state machine, real libxpc and SecCode, and the real NoemaAgent.
         .testTarget(
             name: "NoemaIPCTests",
-            dependencies: ["NoemaCore", "NoemaIPC", "NoemaAgentCore", "NoemaAgent", "NoemaLearning", "NoemaLexiconAdmin"]),
+            dependencies: [
+                "NoemaCore", "NoemaIPC", "NoemaAgentCore", "NoemaAgent", "NoemaLearning", "NoemaLexiconAdmin", "NoemaClipboardCore",
+            ]),
+        // Privacy filter, tokenizer, CryptoKit, image guard, blob store, and the on-disk store.
+        .testTarget(name: "NoemaClipboardCoreTests", dependencies: ["NoemaClipboardCore", "NoemaCore"]),
         // Pure engine logic (key mapping, boot guard); never initializes librime.
         .testTarget(name: "NoemaEngineTests", dependencies: ["NoemaCore", "NoemaEngine", "NoemaLearning"]),
         // The SQLite learning store, its writer, and the learned-phrase TSV export.

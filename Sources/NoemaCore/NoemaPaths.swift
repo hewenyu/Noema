@@ -35,6 +35,24 @@ public enum NoemaPaths {
         homeDirectory.appending(path: "Library/Application Support/Noema/snippets.json")
     }
 
+    /// `~/Library/Application Support/Noema/clipboard`: the agent's encrypted clipboard
+    /// history (`0700`); never opened by `NoemaIME`.
+    public static func clipboardDir(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        homeDirectory.appending(path: "Library/Application Support/Noema/clipboard", directoryHint: .isDirectory)
+    }
+
+    public static let clipboardStoreFileName = "clipboard.sqlite"
+
+    /// `<root>/clipboard.sqlite`: item metadata and AES-GCM sealed text (WAL).
+    public static func clipboardStoreURL(root: URL = clipboardDir()) -> URL {
+        root.appending(path: clipboardStoreFileName)
+    }
+
+    /// `<root>/blobs/`: AES-GCM sealed images and thumbnails (`<sha256>.enc`, `<sha256>.thumb.enc`).
+    public static func clipboardBlobsDir(root: URL = clipboardDir()) -> URL {
+        root.appending(path: "blobs", directoryHint: .isDirectory)
+    }
+
     /// `~/Library/Logs/Noema`.
     public static func logDir(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         homeDirectory.appending(path: "Library/Logs/Noema", directoryHint: .isDirectory)

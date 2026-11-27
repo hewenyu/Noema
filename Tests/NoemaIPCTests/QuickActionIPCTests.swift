@@ -92,7 +92,7 @@ import Testing
 
     @MainActor
     @Test func toastNeverTakesFocusAndNamesTheMilestone() async throws {
-        #expect(QuickActionToastController.message(for: .clipboard) == "剪贴板将在 M3 推出")
+        #expect(QuickActionToastController.message(for: .clipboard) == "剪贴板")
         #expect(QuickActionToastController.message(for: .voiceInput) == "语音输入将在 M3 推出")
         #expect(QuickActionToastController.message(for: .translate) == "翻译将在 M4 推出")
         #expect(QuickActionToastController.message(for: .rewrite) == "改写将在 M4 推出")
@@ -101,8 +101,8 @@ import Testing
         let panel = toast.panelForTesting
         #expect(!panel.canBecomeKey && !panel.canBecomeMain)
         #expect(panel.styleMask.contains(.nonactivatingPanel) && panel.ignoresMouseEvents && !panel.hidesOnDeactivate)
-        toast.show(.clipboard)
-        #expect(toast.isVisible && toast.message == "剪贴板将在 M3 推出")
+        toast.show(.voiceInput)
+        #expect(toast.isVisible && toast.message == "语音输入将在 M3 推出")
         toast.show(.translate)
         #expect(toast.message == "翻译将在 M4 推出")
         toast.dismiss()

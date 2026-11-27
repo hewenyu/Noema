@@ -17,7 +17,8 @@ Noema is a Chinese input method for macOS 26+ on Apple Silicon (arm64), built fr
 | `Resources/rime-default`, `Resources/rime-lua` | The built-in pinyin schema `noema_pinyin` with OpenCC emoji data (`opencc/noema_emoji.*`); `noema_learned.lua`, the learned-phrase translator. |
 | `NoemaIMEShell` | Engine-independent IMKit logic: `InputSessionCoordinator` (see [Input method shell](#input-method-shell)), `NSEventKeyBridge`, and the `TextInputClient`, `CandidatePresenting`, and `VModePresenting` seams. Zero TCC. |
 | `NoemaUI` | The [candidate panel](#candidate-panel), which also shows [v-mode](#v-mode). Zero TCC. |
-| `NoemaAgentCore` | Agent logic without AppKit lifecycle: `AgentServiceCoordinator`, `LaunchAgentController`, `AgentStatusModel`, `LexiconController`, and the SwiftUI `SettingsRootView`. |
+| `NoemaClipboardCore` | [Clipboard history](#clipboard-history) storage and privacy filter; agent only. |
+| `NoemaAgentCore` | Agent logic without AppKit lifecycle: `AgentServiceCoordinator`, `LaunchAgentController`, `LexiconController`, the clipboard panel, and the SwiftUI `SettingsRootView`. |
 | `noema-cli` | Developer command line: `version`, `check-rime`, `install`, `reload`, `repl`, `lexicon list\|verify\|switch`. |
 | `noema-rime-deployer` | The only process that runs librime's deployer, into an empty staging directory; writes `build/.noema-deploy-manifest.json` ([header](../Sources/noema-rime-deployer/main.swift)). Ships in `NoemaIME.app`. |
 | `NoemaIME` | The process inside `NoemaIME.app`: `NoemaInputController`, `EngineHost` (the one `RimeEngine`, learning, schema switches, the agent connection), and the `IMKServer`. |
@@ -30,11 +31,11 @@ NoemaIME ────────────┬─> NoemaUI ─> NoemaIMEShell 
 noema-cli ───────────┼─> NoemaEngine ─> CRime ─> librime.1.dylib
 noema-rime-deployer ─┘        └─> NoemaLearning ─> NoemaText
 NoemaIME, NoemaAgent ─> NoemaIPC ─> NoemaCore <──────┘
-NoemaAgent ─> NoemaAgentCore ─> NoemaIPC, NoemaLexiconAdmin ─> NoemaLearning
+NoemaAgent ─> NoemaAgentCore ─> NoemaIPC, NoemaClipboardCore, NoemaLexiconAdmin ─> NoemaLearning
 noema-cli ─> NoemaLexiconAdmin
 ```
 
-Tests use Swift Testing, one target per library; `CRimeTests` (serialized suite `LibrimeSerializedTests`) holds every test that initializes librime and drives the real engine, deployer, XPC agent, and executables.
+Tests use Swift Testing, one target per library; `CRimeTests` holds every test that initializes librime and drives the real engine, deployer, XPC agent, and executables.
 
 ## Typing engine
 
@@ -49,10 +50,10 @@ Rationale: [process model note](../.agents/notes/proposed/architecture/2026-11-2
 
 ## Schema sets and learning
 
-One root, `~/Library/Application Support/Noema/rime/`, holds the `.noema-rime.lock`, `learning.sqlite`, and `active-schema-set.json`. Each `SchemaSetID` (`builtin`, `wanxiang`, `rime-ice`, `mint`) runs with its own librime `user_data_dir` `sets/<set>/` (`build/`, userdbs, `lua/noema_learned.lua`, `noema_learned.tsv`); downloads extract to `schemas/<set>/`, models to `models/`. `EngineHost` boots the recorded set if installed, falling back once to `builtin`.
+One root, `~/Library/Application Support/Noema/rime/`, holds the `.noema-rime.lock`, `learning.sqlite`, and `active-schema-set.json`. Each `SchemaSetID` runs with its own librime `user_data_dir` `sets/<set>/` (`build/`, userdbs, `lua/noema_learned.lua`, `noema_learned.tsv`); downloads extract to `schemas/<set>/`, models to `models/`. `EngineHost` boots the recorded set if installed, falling back once to `builtin`.
 
 - **Learning** — `RimeEngine.recordCommits` queues Han commits to `LearningStoreWriter`, never under secure input; it writes off the main actor and flushes before shutdown and switches. Keys are full pinyin, one syllable per Han character; unverifiable spellings, shape or non-Mandarin schemas, and reverse lookups are never learned.
-- **Switch** — `SchemaSetSwitcher` waits for idle, deploys and swaps librime off the main actor, and reports `pendingIdle`, `compiling`, `ready`, or `failed`. `UserDBGuardian` restores a corrupt userdb from a verified snapshot or the store and imports entries past its watermark in the dictionary's spelling; `noema_learned.tsv` is re-exported.
+- **Switch** — `SchemaSetSwitcher` waits for idle, deploys and swaps librime off the main actor, and reports its phase. `UserDBGuardian` restores a corrupt userdb from a verified snapshot or the store and imports entries past its watermark in the dictionary's spelling; `noema_learned.tsv` is re-exported.
 - **Agent** — Settings › 词库 (`LexiconController`) reads the inventory and the store read-only, installs from the bundled lockfile, and sends `switchSchemaSet`.
 
 Rationale: [lexicon note](../.agents/notes/implemented/architecture/2026-11-23-lexicon-canonical-and-userdb-isolation.md).
@@ -79,7 +80,7 @@ A plain `v` with no composition opens v-mode; once Rime composes, `v` is Rime's 
 
 ## Companion agent and IPC
 
-`Noema.app` is an `LSUIElement` menu bar app registered with `SMAppService.agent` from its embedded `Contents/Library/LaunchAgents/dev.noema.agent.plist`, which vends the Mach service `dev.noema.agent.ipc`. Its menu opens one reused settings window (基础设置, 快速操作, 词库, 其他); outside launchd it hands off to a running instance or stands by.
+`Noema.app` is an `LSUIElement` menu bar app registered with `SMAppService.agent` from its embedded `Contents/Library/LaunchAgents/dev.noema.agent.plist`, which vends the Mach service `dev.noema.agent.ipc`. Its menu opens the clipboard panel and one reused settings window; outside launchd it hands off to a running instance or stands by.
 
 `NoemaIPC` carries JSON `IPCEnvelope`s (protocol version, kind, sequence, optional `generationID`, at most 256 KiB) under key `e` of an XPC dictionary:
 
@@ -89,6 +90,10 @@ A plain `v` with no composition opens v-mode; once Rime composes, `v` is Rime's 
 
 Rationale: [XPC IPC note](../.agents/notes/implemented/architecture/2026-11-25-xpc-ipc-and-companion-agent.md).
 
+## Clipboard history
+
+Only the launchd-managed agent runs it: `PasteboardMonitor` polls `changeCount`, `ClipboardPrivacyFilter` rules on metadata before any read, and `ClipboardStore` keeps AES-GCM ciphertext under a login-keychain key with a `:memory:` FTS5 index. ⇧⌘V or `v2` opens the panel. Rationale: [clipboard note](../.agents/notes/implemented/architecture/2026-11-26-clipboard-history-and-panel.md).
+
 ## Build pipeline
 
 1. **librime** — `scripts/build/librime.sh` builds `vendor-out/librime/` from `vendor/librime.lock`; `--verify` requires an `@rpath` install name, system-only linkage, and arm64.
@@ -96,7 +101,7 @@ Rationale: [XPC IPC note](../.agents/notes/implemented/architecture/2026-11-25-x
 3. **Tests** — `scripts/dev/test.sh` refuses a stale `vendor-out/librime`, then runs `swift test` with the CommandLineTools `Testing.framework`.
 4. **Bundle** — [`scripts/build/bundle.sh`](../scripts/build/bundle.sh) assembles and signs each app in staging, then atomically publishes `NoemaIME.app` (with `rime-default/` and `rime-lua/`) and `Noema.app` (with `dictionaries.lock.json`, no librime, no rpath).
 5. **Signing** — inside-out, never `--deep`, with empty entitlements; a certificate SHA-1 adds Hardened Runtime and a secure timestamp; `-` signs ad-hoc.
-6. **Verification** — [`scripts/build/verify-bundle.sh`](../scripts/build/verify-bundle.sh) checks one app, or both in a directory; its header lists the checks.
+6. **Verification** — [`scripts/build/verify-bundle.sh`](../scripts/build/verify-bundle.sh) checks one app or both; its header lists the checks.
 
 ## Governance gates
 
@@ -105,11 +110,11 @@ Rationale: [XPC IPC note](../.agents/notes/implemented/architecture/2026-11-25-x
 - `verify-doc-budgets.mjs` — word ceilings from [`doc-budgets.manifest.json`](../scripts/governance/doc-budgets.manifest.json); with `--base`, no raised ceiling.
 - `verify-agent-notes.mjs` — note paths, the Status line, and required sections; with `--base`, frozen `archived/` and `rejected/` notes.
 - `verify-md-links.mjs` — every relative Markdown link and anchor resolves.
-- `check-imports.sh` — targets `NoemaIME` links use no networking, audio, AX, event-tap, pasteboard, screen-capture, or `NSExpression` API, nor `NoemaAgentCore` or `NoemaLexiconAdmin`; no Xcode-only artifact, XCTest, or `xcodebuild`; `CLAUDE.md` aliases; `.kiln/agent/config.yml` holds only `version` and `review`.
+- `check-imports.sh` — targets `NoemaIME` links use no TCC-gated, networking, keychain, or `NSExpression` API and no agent-only module ([header](../scripts/governance/check-imports.sh)); no Xcode-only artifact, XCTest, or `xcodebuild`; `CLAUDE.md` aliases; `.kiln/agent/config.yml` holds only `version` and `review`.
 
 ## Continuous integration
 
-Kiln runs `.kiln/workflows/ci.yml` for pushes and pull requests to `master`: `governance` (`check.sh`) and `rime-deps` (`librime.sh`, publishing `vendor-out/librime/`), then `test` (`test.sh`) and `bundle` (`bundle.sh --sign - --out dist`, then `verify-bundle.sh dist`). `.kiln/merge.yml` squash-merges once all four and `ai-review` pass. No CI job reads secrets or signing certificates.
+Kiln runs `.kiln/workflows/ci.yml` for pushes and pull requests to `master`: `governance` (`check.sh`) and `rime-deps` (`librime.sh`, publishing `vendor-out/librime/`), then `test` (`test.sh`) and `bundle` (`bundle.sh` and `verify-bundle.sh` on `dist`). `.kiln/merge.yml` squash-merges once all four and `ai-review` pass. No CI job reads secrets or signing certificates.
 
 ## Seams
 

@@ -64,7 +64,7 @@ public final class QuickActionToastController {
         panel.contentView = effect
     }
 
-    /// The text for `action`: `剪贴板将在 M3 推出` for an unimplemented action.
+    /// The text for `action`: `语音输入将在 M3 推出` for an unimplemented action.
     public static func message(for action: QuickActionID) -> String {
         if let milestone = action.plannedMilestone { return "\(action.title)将在 \(milestone) 推出" }
         return action.title
