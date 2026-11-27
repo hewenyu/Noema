@@ -4,8 +4,8 @@ import Carbon.HIToolbox
 import Foundation
 import NoemaClipboardCore
 
-/// How a paste-back ended. Every case but `.pasted` leaves the entry on the pasteboard
-/// for the user to paste with ⌘V.
+/// How a paste-back ended. Every case except `.pasted` and `.abortedPasteboardChanged`
+/// leaves the entry on the pasteboard for the user to paste with ⌘V.
 public enum ClipboardPasteOutcome: Sendable, Hashable {
     case pasted
     /// Accessibility is not granted: no keystroke is synthesized.

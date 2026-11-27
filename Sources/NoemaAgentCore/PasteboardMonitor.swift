@@ -21,6 +21,27 @@ public enum PasteboardAccessStatus: String, Sendable, Hashable {
     }
 }
 
+/// Outcome of writing a self-paste entry to the pasteboard.
+public struct PasteboardWriteResult: Sendable, Hashable {
+    /// Whether `writeObjects` succeeded AND our unique `self-paste` token was still present
+    /// at a stable `changeCount` immediately after writing.
+    public var owned: Bool
+    /// The verified `changeCount` when `owned` is true (`nil` if another process took over).
+    public var ownedChangeCount: Int?
+    /// `changeCount` values known to belong to our write (`prepared`, plus `ownedChangeCount`
+    /// only when ownership was verified). Never includes an unverified foreign `changeCount`.
+    public var ownChangeCounts: [Int]
+    /// The unique per-write token placed under `dev.noema.clipboard.self-paste`.
+    public var token: Data
+
+    public init(owned: Bool, ownedChangeCount: Int?, ownChangeCounts: [Int], token: Data) {
+        self.owned = owned
+        self.ownedChangeCount = ownedChangeCount
+        self.ownChangeCounts = ownChangeCounts
+        self.token = token
+    }
+}
+
 /// The general pasteboard and the facts the monitor checks around it. Metadata calls
 /// (`changeCount`, types, secure input, access behavior, frontmost app) never read a
 /// payload; `readString` and `readData` do, and run only after the privacy filter allows.
@@ -35,9 +56,13 @@ public protocol PasteboardReading: AnyObject {
     func frontmostSource() -> ClipboardSourceApp?
     func readString() -> String?
     func readData(forType type: String) -> Data?
-    /// Clears the pasteboard for this host only and writes one item: `content` plus every
-    /// `markers` type. Returns each `changeCount` the write produced.
-    func write(_ content: ClipboardEntryContent, markers: [String: Data]) -> [Int]
+    /// Clears the pasteboard for this host only, writes one item (`content` plus every
+    /// `markers` type), and verifies our unique self-paste marker is still present at a
+    /// stable `changeCount`.
+    func write(_ content: ClipboardEntryContent, markers: [String: Data]) -> PasteboardWriteResult
+    /// Confirms the pasteboard is still at `expectedChangeCount` and carries our exact
+    /// self-paste `token`.
+    func ownsSelfPaste(expectedChangeCount: Int, token: Data) -> Bool
 }
 
 /// `NSPasteboard.general`, `IsSecureEventInputEnabled()`, and `NSWorkspace`.
@@ -72,7 +97,8 @@ public final class SystemPasteboardReader: PasteboardReading {
     public func readString() -> String? { pasteboard.string(forType: .string) }
     public func readData(forType type: String) -> Data? { pasteboard.data(forType: NSPasteboard.PasteboardType(type)) }
 
-    public func write(_ content: ClipboardEntryContent, markers: [String: Data]) -> [Int] {
+    public func write(_ content: ClipboardEntryContent, markers: [String: Data]) -> PasteboardWriteResult {
+        let token = markers[ClipboardPrivacyFilter.selfPasteType] ?? Data()
         let prepared = pasteboard.prepareForNewContents(with: .currentHostOnly)
         let item = NSPasteboardItem()
         switch content {
@@ -82,8 +108,25 @@ public final class SystemPasteboardReader: PasteboardReading {
         for (type, data) in markers.sorted(by: { $0.key < $1.key }) {
             item.setData(data, forType: NSPasteboard.PasteboardType(type))
         }
-        pasteboard.writeObjects([item])
-        return [prepared, pasteboard.changeCount]
+        guard pasteboard.writeObjects([item]) else {
+            return PasteboardWriteResult(owned: false, ownedChangeCount: nil, ownChangeCounts: [prepared], token: token)
+        }
+        let afterWrite = pasteboard.changeCount
+        guard ownsSelfPaste(expectedChangeCount: afterWrite, token: token) else {
+            return PasteboardWriteResult(owned: false, ownedChangeCount: nil, ownChangeCounts: [prepared], token: token)
+        }
+        let ownCounts = afterWrite == prepared ? [prepared] : [prepared, afterWrite]
+        return PasteboardWriteResult(owned: true, ownedChangeCount: afterWrite, ownChangeCounts: ownCounts, token: token)
+    }
+
+    public func ownsSelfPaste(expectedChangeCount: Int, token: Data) -> Bool {
+        guard !token.isEmpty, pasteboard.changeCount == expectedChangeCount else { return false }
+        let markerType = NSPasteboard.PasteboardType(ClipboardPrivacyFilter.selfPasteType)
+        // Check metadata types first so a foreign pasteboard item is rejected without
+        // requesting any payload data from another process.
+        guard pasteboard.types?.contains(markerType) == true else { return false }
+        guard pasteboard.data(forType: markerType) == token else { return false }
+        return pasteboard.changeCount == expectedChangeCount
     }
 }
 
@@ -284,24 +327,33 @@ public final class PasteboardMonitor {
 
     /// Writes `content` for a paste-back with three guards against recording it again:
     /// a current-host-only pasteboard, `org.nspasteboard.TransientType` plus
-    /// `dev.noema.clipboard.self-paste` on the item, and the resulting `changeCount`s in
-    /// `ignoredSelfChangeCounts` and `lastSeenChangeCount` before this returns (the last
-    /// guard holds even when another app strips the custom types).
+    /// `dev.noema.clipboard.self-paste` (unique per write) on the item, and only the
+    /// verified `changeCount`s produced by our own write recorded in `ignoredSelfChangeCounts`
+    /// and `lastSeenChangeCount` before this returns (if another process overwrites the
+    /// pasteboard mid-write, `result.owned` is `false` and the foreign generation is never
+    /// claimed as our own).
     @discardableResult
-    public func writeSelfPaste(_ content: ClipboardEntryContent) -> Int {
-        let counts = reader.write(content, markers: [
+    public func writeSelfPaste(_ content: ClipboardEntryContent) -> PasteboardWriteResult {
+        let token = Data(UUID().uuidString.utf8)
+        let result = reader.write(content, markers: [
             ClipboardPrivacyFilter.transientType: Data(),
-            ClipboardPrivacyFilter.selfPasteType: Data(UUID().uuidString.utf8),
+            ClipboardPrivacyFilter.selfPasteType: token,
         ])
-        for count in counts where !ignoredSelfChangeCounts.contains(count) {
+        for count in result.ownChangeCounts where !ignoredSelfChangeCounts.contains(count) {
             ignoredSelfChangeCounts.append(count)
         }
         if ignoredSelfChangeCounts.count > Self.selfChangeCountLimit {
             ignoredSelfChangeCounts.removeFirst(ignoredSelfChangeCounts.count - Self.selfChangeCountLimit)
         }
-        let latest = counts.max() ?? reader.changeCount
-        lastSeenChangeCount = latest
-        return latest
+        if let ownedCount = result.ownedChangeCount {
+            lastSeenChangeCount = ownedCount
+        }
+        return result
+    }
+
+    /// Confirms the pasteboard still holds our verified self-paste generation and unique token.
+    public func ownsSelfPaste(expectedChangeCount: Int, token: Data) -> Bool {
+        reader.ownsSelfPaste(expectedChangeCount: expectedChangeCount, token: token)
     }
 
     private func taint(_ count: Int) {

@@ -70,6 +70,9 @@ public final class ClipboardPanelModel {
 
     @ObservationIgnored weak var history: ClipboardHistoryController?
     @ObservationIgnored var onClose: (_ restoreFocus: Bool) -> Void = { _ in }
+    /// Invoked after every `reload()` so the panel controller reschedules expiry refreshes
+    /// whenever visible items change (search, filter, pin toggle, history updates, or show).
+    @ObservationIgnored var onReload: () -> Void = {}
     @ObservationIgnored private var contentCache: [String: ClipboardEntryContent] = [:]
     @ObservationIgnored private var imageCache: [String: NSImage] = [:]
 
@@ -114,8 +117,10 @@ public final class ClipboardPanelModel {
         }
         revealedIDs.formIntersection(liveIDs)
         let ordered = orderedItems
-        if let selectedID, ordered.contains(where: { $0.id == selectedID }) { return }
-        selectedID = ordered.first?.id
+        if selectedID == nil || !ordered.contains(where: { $0.id == selectedID }) {
+            selectedID = ordered.first?.id
+        }
+        onReload()
     }
 
     public func moveSelection(_ delta: Int) {
@@ -253,6 +258,7 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
         panel.delegate = self
         panel.onCancel = { [weak self] in self?.hide(restoreFocus: true) }
         model.onClose = { [weak self] restore in self?.hide(restoreFocus: restore) }
+        model.onReload = { [weak self] in self?.scheduleNextExpiryRefresh() }
 
         let hosting = NSHostingView(rootView: ClipboardPanelView(model: model))
         hosting.translatesAutoresizingMaskIntoConstraints = true
@@ -295,14 +301,13 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
         model.filter = .all
         model.showsActions = false
         model.selectedID = nil
-        model.history?.refreshStatus()
-        if model.history?.storeState == .keychainLocked {
-            model.history?.tryUnlockNonInteractive()
-        }
+        model.clearCaches()
+        // Reconcile keychain availability (both `.ready` -> `.keychainLocked` and
+        // `.keychainLocked` -> `.ready`) non-interactively before exposing any history.
+        model.history?.reconcileKeychainAccessNow()
+        isVisible = true
         model.reload()
         model.openGeneration &+= 1
-        isVisible = true
-        scheduleNextExpiryRefresh()
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         if let visible = screen?.visibleFrame {
             let size = Self.panelSize
@@ -336,7 +341,6 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
     private func handleHistoryChange() {
         if isVisible {
             model.reload()
-            scheduleNextExpiryRefresh()
         } else {
             model.clearCaches()
         }
@@ -358,7 +362,6 @@ public final class ClipboardPanelController: NSObject, NSWindowDelegate {
             try? await Task.sleep(for: .seconds(clamped))
             guard !Task.isCancelled, let self, self.isVisible else { return }
             self.model.reload()
-            self.scheduleNextExpiryRefresh()
         }
     }
 

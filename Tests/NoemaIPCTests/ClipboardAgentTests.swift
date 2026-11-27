@@ -21,6 +21,10 @@ final class SpyPasteboard: PasteboardReading {
     private(set) var writes: [(ClipboardEntryContent, [String: Data])] = []
     /// When true, a write produces two change counts (prepare, then write).
     var writeBumpsTwice = true
+    /// When true, simulates another process overwriting the pasteboard mid-write.
+    var simulateWritePreemption = false
+    /// Live self-paste token on the pasteboard (cleared when another app calls `copy`).
+    var currentSelfPasteToken: Data?
 
     var payloadReads: Int { stringReads + dataReads.count }
 
@@ -46,14 +50,30 @@ final class SpyPasteboard: PasteboardReading {
         return data[type]
     }
 
-    func write(_ content: ClipboardEntryContent, markers: [String: Data]) -> [Int] {
+    func write(_ content: ClipboardEntryContent, markers: [String: Data]) -> PasteboardWriteResult {
+        let token = markers[ClipboardPrivacyFilter.selfPasteType] ?? Data()
         writes.append((content, markers))
         changeCount += 1
         let prepared = changeCount
+        if simulateWritePreemption {
+            // Another process replaces the pasteboard before our write completes/verifies.
+            changeCount += 1
+            string = "external unrelated content"
+            types = ["public.utf8-plain-text"]
+            currentSelfPasteToken = nil
+            return PasteboardWriteResult(owned: false, ownedChangeCount: nil, ownChangeCounts: [prepared], token: token)
+        }
         if writeBumpsTwice { changeCount += 1 }
         if case .text(let text) = content { string = text }
         types = ["public.utf8-plain-text"] + markers.keys.sorted()
-        return [prepared, changeCount]
+        currentSelfPasteToken = token
+        let ownCounts = changeCount == prepared ? [prepared] : [prepared, changeCount]
+        return PasteboardWriteResult(owned: true, ownedChangeCount: changeCount, ownChangeCounts: ownCounts, token: token)
+    }
+
+    func ownsSelfPaste(expectedChangeCount: Int, token: Data) -> Bool {
+        guard !token.isEmpty, changeCount == expectedChangeCount else { return false }
+        return types.contains(ClipboardPrivacyFilter.selfPasteType) && currentSelfPasteToken == token
     }
 
     /// Simulates a user copy.
@@ -62,6 +82,7 @@ final class SpyPasteboard: PasteboardReading {
         string = text
         self.types = types
         self.items = items
+        currentSelfPasteToken = nil
     }
 }
 
@@ -161,13 +182,15 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         #expect(captured == 1)
     }
 
-    @Test func selfPasteNeverLoops() {
+    @Test func selfPasteNeverLoops() throws {
         let pasteboard = SpyPasteboard()
         let monitor = PasteboardMonitor(reader: pasteboard)
         var captured = 0
         monitor.onCapture = { _ in captured += 1 }
-        let count = monitor.writeSelfPaste(.text("from history"))
+        let result = monitor.writeSelfPaste(.text("from history"))
+        let count = try #require(result.ownedChangeCount)
         let markers = pasteboard.writes.first?.1 ?? [:]
+        #expect(result.owned)
         #expect(markers.keys.sorted() == ["dev.noema.clipboard.self-paste", "org.nspasteboard.TransientType"])
         #expect(markers["org.nspasteboard.TransientType"] == Data() && markers["dev.noema.clipboard.self-paste"]?.count == 36)
         #expect(count == pasteboard.changeCount && monitor.lastSeenChangeCount == count)
@@ -672,6 +695,130 @@ final class SpyPasteDriver: AccessibilityPasteDriver {
         #expect(store.itemCount == 2 && history.panel.model.items.count == 2)
 
         history.panel.hide(restoreFocus: false)
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 4 (Finding #1 — HIGH): if another writer overwrites the pasteboard
+    /// during `writeSelfPaste`, ownership verification rejects the write, never registers the
+    /// foreign `changeCount` as self-paste, and never posts ⌘V with foreign content.
+    @Test func writePreemptionAbortsPasteAndNeverClaimsForeignChangeCount() async throws {
+        let (store, root) = try Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entry = try store.insertText("selected-history-entry", source: AccessibilityPasteServiceTests.target)
+
+        // Deterministic spy preemption test.
+        let pasteboard = SpyPasteboard()
+        pasteboard.simulateWritePreemption = true
+        let driver = SpyPasteDriver()
+        driver.trusted = true
+        driver.frontmost = AccessibilityPasteServiceTests.target.pid!
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: driver)
+        var toasts: [String] = []
+        history.onToast = { toasts.append($0) }
+        history.attach(.success(store))
+
+        let outcome = await history.use(id: entry.id, mode: .paste, target: AccessibilityPasteServiceTests.target)
+        #expect(outcome == .abortedPasteboardChanged)
+        #expect(driver.posts == 0, "preempted write must never post ⌘V")
+        #expect(toasts == [ClipboardHistoryController.pasteboardChangedToastMessage])
+        #expect(!history.monitor.ignoredSelfChangeCounts.contains(pasteboard.changeCount), "foreign changeCount must never be claimed as self-paste")
+        history.shutdown()
+
+        // Real named NSPasteboard verification (never touches `.general`): confirms
+        // `SystemPasteboardReader.write` + `ownsSelfPaste` verify the unique token and reject
+        // any foreign overwrite immediately.
+        let pbName = NSPasteboard.Name("dev.noema.test.ownership.\(UUID().uuidString)")
+        let namedPB = NSPasteboard(name: pbName)
+        defer { namedPB.releaseGlobally() }
+        let reader = SystemPasteboardReader(pasteboard: namedPB)
+        let writeOK = reader.write(.text("history-payload"), markers: [
+            ClipboardPrivacyFilter.transientType: Data(),
+            ClipboardPrivacyFilter.selfPasteType: Data(UUID().uuidString.utf8),
+        ])
+        #expect(writeOK.owned && writeOK.ownedChangeCount == namedPB.changeCount)
+        #expect(reader.ownsSelfPaste(expectedChangeCount: try #require(writeOK.ownedChangeCount), token: writeOK.token))
+        // Foreign write replaces pasteboard -> `ownsSelfPaste` immediately returns false.
+        namedPB.clearContents()
+        namedPB.setString("external unrelated content", forType: .string)
+        #expect(!reader.ownsSelfPaste(expectedChangeCount: try #require(writeOK.ownedChangeCount), token: writeOK.token))
+        #expect(!reader.ownsSelfPaste(expectedChangeCount: namedPB.changeCount, token: writeOK.token), "foreign changeCount lacks our unique token")
+    }
+
+    /// Codex PR #23 round 4 (Finding #2 — MEDIUM): opening the panel while cached state is
+    /// still `.ready` re-verifies keychain access non-interactively before showing any history,
+    /// immediately transitioning to `.keychainLocked` and clearing items/caches if revoked.
+    @Test func openingReadyPanelReverifiesRevokedKeychainSynchronously() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "noema-clip-reverify-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let keys = InMemoryClipboardKeyStore(isLocked: false)
+        let store = try ClipboardStore(directory: root.appending(path: "clipboard", directoryHint: .isDirectory), keyStore: keys)
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        let saved = try store.insertText("secret before silent lock", source: nil)
+        history.panel.shouldOrderFront = false
+        #expect(history.storeState == .ready)
+
+        // Keychain becomes locked without a notification and without any new pasteboard copy.
+        keys.isLocked = true
+        history.showPanel()
+        #expect(history.storeState == .keychainLocked && store.state == .keychainLocked)
+        #expect(history.panel.model.items.isEmpty, "panel must not expose stale history when keychain is locked")
+        #expect(history.panel.model.content(for: saved) == nil)
+        #expect(history.monitor.pauseReasons.contains(.keychainLocked))
+
+        history.panel.hide(restoreFocus: false)
+        history.shutdown()
+    }
+
+    /// Codex PR #23 round 4 (Finding #3 — MEDIUM): switching filter or search query in an open
+    /// panel reschedules the expiry refresh task so newly visible short-TTL entries disappear
+    /// automatically when they expire without waiting for periodic purge.
+    @Test func switchingFilterOrSearchReschedulesExpiryRefresh() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "noema-clip-filter-ttl-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let quota = ClipboardStorageQuota(sensitiveTTLSeconds: 0.25)
+        let store = try ClipboardStore(
+            directory: root.appending(path: "clipboard", directoryHint: .isDirectory),
+            keyStore: InMemoryClipboardKeyStore(), quota: quota)
+        let pasteboard = SpyPasteboard()
+        let history = ClipboardHistoryController(reader: pasteboard, pasteDriver: SpyPasteDriver())
+        history.attach(.success(store))
+
+        let pinned = try store.insertText("keep pinned", source: nil)
+        try store.setPinned(id: pinned.id, pinned: true)
+
+        let controller = ClipboardPanelController(history: history, frontmost: { nil })
+        controller.shouldOrderFront = false
+        controller.show()
+        // Switch to `.pinned` so the upcoming unpinned sensitive entry is hidden when captured.
+        controller.model.filter = .pinned
+        controller.model.reload()
+        #expect(controller.model.items.map(\.id) == [pinned.id])
+
+        // Capture a sensitive short-TTL entry while the panel is filtered to `.pinned`.
+        let shortToken = "token " + "sk" + "-" + String(repeating: "r", count: 22)
+        pasteboard.copy(shortToken)
+        history.monitor.poll()
+        history.waitForIngest()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(controller.model.items.map(\.id) == [pinned.id])
+
+        // Switch back to `.all` (same call path as SwiftUI `.onChange(of: model.filter)`).
+        controller.model.filter = .all
+        controller.model.reload()
+        #expect(controller.model.items.count == 2)
+        let sensitiveItem = try #require(controller.model.items.first { $0.id != pinned.id })
+        _ = controller.model.content(for: sensitiveItem)
+
+        // Wait past the 250 ms TTL without triggering `purgeExpired` or `refreshStatus`.
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(controller.model.items.map(\.id) == [pinned.id], "expired item must be removed automatically after filter change")
+        #expect(controller.model.content(for: sensitiveItem) == nil)
+
+        controller.hide(restoreFocus: false)
         history.shutdown()
     }
 

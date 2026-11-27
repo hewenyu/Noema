@@ -173,15 +173,27 @@ public final class ClipboardHistoryController {
         }
     }
 
-    /// Non-interactively attempts to unlock a `.keychainLocked` store (e.g. when reopening the
-    /// panel or receiving `com.apple.security.keychain.unlock`) without ever showing a modal
-    /// keychain prompt or creating a new key.
+    /// Non-interactively attempts to unlock a `.keychainLocked` store (e.g. on
+    /// `com.apple.security.keychain.unlock`) or verify a `.ready` store without ever showing
+    /// a modal keychain prompt or creating a new key.
     public func tryUnlockNonInteractive() {
         guard let store else { return }
         ingestQueue.async { [weak self] in
             _ = store.tryUnlockNonInteractive()
             Task { @MainActor [weak self] in self?.refreshStatus() }
         }
+    }
+
+    /// Synchronously reconciles keychain access on `@MainActor` via the non-interactive probe
+    /// (`LAContext.interactionNotAllowed = true`, never prompts or creates a key) before the
+    /// panel exposes any history: transitions `.ready` -> `.keychainLocked` immediately if
+    /// access was revoked without a notification, and recovers `.keychainLocked` -> `.ready`
+    /// immediately once the user unlocked the keychain.
+    public func reconcileKeychainAccessNow() {
+        if let store {
+            _ = store.tryUnlockNonInteractive()
+        }
+        refreshStatus()
     }
 
     // MARK: Capture
@@ -239,14 +251,23 @@ public final class ClipboardHistoryController {
         }
         activePasteGeneration &+= 1
         let pasteGeneration = activePasteGeneration
-        let writtenCount = monitor.writeSelfPaste(content)
+        let writeResult = monitor.writeSelfPaste(content)
         refreshStatus()
+        guard writeResult.owned, let writtenCount = writeResult.ownedChangeCount else {
+            if activePasteGeneration == pasteGeneration {
+                lastPasteOutcome = .abortedPasteboardChanged
+                isAccessibilityTrusted = pasteService.isTrusted
+                onToast(Self.pasteboardChangedToastMessage)
+            }
+            return .abortedPasteboardChanged
+        }
         let outcome: ClipboardPasteOutcome
         switch mode {
         case .paste:
             outcome = await pasteService.paste(into: target) { [weak self] in
                 guard let self else { return false }
-                return self.activePasteGeneration == pasteGeneration && self.monitor.currentChangeCount == writtenCount
+                return self.activePasteGeneration == pasteGeneration
+                    && self.monitor.ownsSelfPaste(expectedChangeCount: writtenCount, token: writeResult.token)
             }
         case .copyOnly:
             if let pid = target?.pid { NSRunningApplication(processIdentifier: pid)?.activate() }
